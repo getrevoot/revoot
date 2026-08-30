@@ -1214,13 +1214,9 @@ fn execute_tool(
                     now_millis,
                 )
                 .map_err(map_repository_error)?;
-            if result.truncated {
-                push_omission(
-                    evidence,
-                    "file-list",
-                    AgentOmissionReason::InventoryIncomplete,
-                );
-            }
+            // `truncated` is scoped to the model's requested result count, not
+            // the trusted checkout inventory. The model can refine the prefix;
+            // only acquisition-time inventory gaps are global omissions.
             serde_json::to_value(result).map_err(|_| internal())?
         }
         "read_file" => {
@@ -1927,7 +1923,7 @@ mod tests {
             tool_response(
                 "1",
                 "list_files",
-                json!({"prefix": "src", "max_results": 20}),
+                json!({"prefix": "src", "max_results": 1}),
             ),
             tool_response("2", "show_diff", json!({"path": "src/changed.rs"})),
             tool_response(
