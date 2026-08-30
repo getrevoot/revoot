@@ -19,6 +19,6 @@ test executes an exact tool-call/post-tool round trip through
 `mise run test:providers:live`. Unknown model IDs never silently replace the
 configured model.
 
-New adapters implement revoot_core::provider::ProviderAdapter and reuse the
+New adapters implement `revoot_core::provider::ProviderAdapter` and reuse the
 shared request, response, usage, cancellation, and payload-free error types.
 They must not add provider wire types to the agent or findings domains.

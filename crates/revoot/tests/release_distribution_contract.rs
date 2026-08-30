@@ -45,22 +45,27 @@ fn preview_workflow_publishes_branch_images_for_dogfooding() {
 }
 
 #[test]
-fn readme_leads_with_the_versioned_container_image() {
+fn readme_prioritizes_ci_and_documents_distributions() {
     let root = workspace();
     let readme = fs::read_to_string(root.join("README.md")).expect("README");
-    let docker = readme
-        .find("## Run with Docker")
-        .expect("Docker quickstart");
+    let ci = readme
+        .find("## Add Revoot to Your CI")
+        .expect("CI quickstart");
+    let local = readme
+        .find("## Running Revoot locally")
+        .expect("local usage section");
     let development = readme.find("## Development").expect("development section");
 
-    assert!(docker < development);
-    assert!(readme.contains("ghcr.io/getrevoot/revoot:0.1.0 review"));
+    assert!(ci < local);
+    assert!(local < development);
+    assert!(readme.contains("ghcr.io/getrevoot/revoot:latest review"));
     assert!(readme.contains("$PWD:/workspace:ro"));
     assert!(readme.contains("https://github.com/getrevoot/revoot/releases"));
     assert!(readme.contains("revoot-linux-amd64.tar.gz"));
     assert!(readme.contains("revoot-linux-arm64.tar.gz"));
     assert!(readme.contains("revoot-macos-arm64.tar.gz"));
     assert!(readme.contains("SHA256SUMS"));
+    assert!(readme.contains("logo-dark.svg"));
     assert!(!readme.contains("mise use --global"));
 }
 
