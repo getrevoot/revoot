@@ -11,7 +11,7 @@ Install the pinned toolchain and run the required checks:
 
 ```sh
 mise install
-mise run ci
+mise run verify
 ```
 
 Use stable Rust 2024, keep Clippy clean with warnings denied, prefer maintained

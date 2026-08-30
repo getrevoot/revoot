@@ -47,7 +47,7 @@ Keep changes portable across the supported distribution targets:
 Run the standard suite before considering a change complete:
 
 ```sh
-mise run ci
+mise run verify
 ```
 
 For packaging-related changes, also run:

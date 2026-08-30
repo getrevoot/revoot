@@ -28,7 +28,7 @@ jobs:
           install: true
           cache: true
       - run: mise run release:version
-      - run: mise run ci
+      - run: mise run verify
 
   package-linux:
     name: Package Linux artifacts

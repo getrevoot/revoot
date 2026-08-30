@@ -29,7 +29,7 @@ still appear in the generated changelog.
 Before tagging, run:
 
 ```sh
-mise run ci
+mise run verify
 mise run package:linux
 mise run package:macos
 mise run release:checksums

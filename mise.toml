@@ -83,8 +83,8 @@ cargo install --locked --path crates/revoot --root "$revoot_install_root"
 description = "Generate and verify checksums for the complete local archive set"
 run = "bash scripts/generate-release-checksums.sh"
 
-[tasks.ci]
-description = "Run all CI checks"
+[tasks.verify]
+description = "Run all required validation checks"
 run = [
   { task = "fmt" },
   { task = "check" },
