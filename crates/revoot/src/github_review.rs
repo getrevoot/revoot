@@ -682,6 +682,25 @@ pub async fn publish_github_findings(
             _ => return Err(GitHubReviewError::PublicationAmbiguous),
         }
     }
+    for lineage in fixed_lineages {
+        let thread = prior_review
+            .discussions()
+            .iter()
+            .find(|discussion| {
+                discussion.source == PriorReviewSource::Revoot
+                    && discussion.state != PriorReviewState::Resolved
+                    && discussion
+                        .lineage
+                        .as_ref()
+                        .is_some_and(|marker| marker.lineage_sha256 == *lineage)
+            })
+            .ok_or(GitHubReviewError::PublicationAmbiguous)?;
+        ensure_fresh(client, context).await?;
+        set_thread_resolved(client, &thread.thread_id, true).await?;
+        evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
+        evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
+        evidence.superseded_comments = evidence.superseded_comments.saturating_add(1);
+    }
     for comment in comments.iter().filter(|comment| comment.user.id == bot.id) {
         if comment.lineage_id().is_some_and(|lineage| {
             prior_review.discussions().iter().any(|discussion| {
@@ -701,21 +720,17 @@ pub async fn publish_github_findings(
         {
             continue;
         }
-        if let Some(lineage) = comment.lineage_id()
-            && fixed_lineages.contains(&lineage)
-            && let Some(thread) = prior_review.discussions().iter().find(|discussion| {
-                discussion.source == PriorReviewSource::Revoot
-                    && discussion.state != PriorReviewState::Resolved
-                    && discussion
-                        .lineage
-                        .as_ref()
-                        .is_some_and(|marker| marker.lineage_sha256 == lineage)
-            })
-        {
-            ensure_fresh(client, context).await?;
-            set_thread_resolved(client, &thread.thread_id, true).await?;
-            evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
-            evidence.superseded_comments = evidence.superseded_comments.saturating_add(1);
+        if comment.lineage_id().is_some_and(|lineage| {
+            fixed_lineages.contains(&lineage)
+                || prior_review.discussions().iter().any(|discussion| {
+                    discussion.source == PriorReviewSource::Revoot
+                        && discussion.state != PriorReviewState::Resolved
+                        && discussion
+                            .lineage
+                            .as_ref()
+                            .is_some_and(|marker| marker.lineage_sha256 == lineage)
+                })
+        }) {
             continue;
         }
         let Some(marker) = comment.marker() else {
@@ -1252,7 +1267,7 @@ mod tests {
             Sha256Digest::of_bytes(b"evidence"),
         );
         let body = format!(
-            "finding\n{}\n<!-- revoot:v1 scope={} fingerprint={} kind=inline -->",
+            "finding\n{}\n<!-- revoot:v1 scope={} fingerprint={} kind=inline -->\n\n_This finding was superseded by a later Revoot review._\n<!-- revoot:superseded -->",
             lineage_marker.render(),
             "a".repeat(64),
             "b".repeat(64)
@@ -1280,7 +1295,7 @@ mod tests {
             );
             write_json(
                 &mut inventory,
-                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot"}, "repository": {"pullRequest": {
+                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot", "databaseId": 7}, "repository": {"pullRequest": {
                     "reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_thread",
@@ -1379,7 +1394,7 @@ mod tests {
             );
             write_json(
                 &mut inventory,
-                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot"}, "repository": {"pullRequest": {
+                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot", "databaseId": 7}, "repository": {"pullRequest": {
                     "reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_human",

@@ -79,7 +79,7 @@ use crate::review_checkpoint::{
 };
 use crate::review_engine::{
     IndependentReviewBrief, MonotonicClock, PriorFindingDisposition, PriorFindingDispositionKind,
-    ReviewEngineLimits, ReviewEngineRequest, ReviewReport, run_review,
+    ReviewAnchor, ReviewEngineLimits, ReviewEngineRequest, ReviewReport, run_review,
 };
 use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
@@ -514,14 +514,22 @@ impl PreparedReview {
         omissions
     }
 
-    fn anchor_paths(
+    fn review_anchors(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, RepositoryRelativePath>, Diagnostic> {
+    ) -> Result<std::collections::BTreeMap<String, ReviewAnchor>, Diagnostic> {
         self.anchors()
             .iter()
             .map(|anchor| {
                 RepositoryRelativePath::try_from(anchor.path.new_path.as_str().to_owned())
-                    .map(|path| (anchor.id.as_str().to_owned(), path))
+                    .map(|path| {
+                        (
+                            anchor.id.as_str().to_owned(),
+                            ReviewAnchor {
+                                path,
+                                position: anchor.position,
+                            },
+                        )
+                    })
                     .map_err(|_| {
                         diagnostic(
                             ErrorCode::ContractInvalid,
@@ -967,7 +975,7 @@ async fn execute_prepared_review(
             toolbox,
             history,
             prior_review: prepared.prior_review(),
-            anchor_paths: prepared.anchor_paths()?,
+            anchors: prepared.review_anchors()?,
             review_brief,
             repository_guidance: guidance,
             initial_omissions,
@@ -1086,6 +1094,40 @@ fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
     }
 }
 
+fn minimum_review_risk(
+    findings: &[RankedFinding],
+    selection: &CanonicalSelection,
+) -> (RiskLevel, &'static str) {
+    if findings
+        .iter()
+        .any(|finding| finding.severity == Severity::Critical)
+    {
+        (
+            RiskLevel::Critical,
+            "Confirmed critical review evidence affects a material behavior or safety boundary.",
+        )
+    } else if findings
+        .iter()
+        .any(|finding| finding.severity == Severity::High)
+    {
+        (
+            RiskLevel::High,
+            "Confirmed review evidence affects a material behavior or safety boundary.",
+        )
+    } else if selection.selected_high_signal_files > 0
+        || findings
+            .iter()
+            .any(|finding| finding.severity == Severity::Medium)
+    {
+        (
+            RiskLevel::Moderate,
+            "The change touches a high-signal surface or has confirmed material review evidence.",
+        )
+    } else {
+        (RiskLevel::Low, "")
+    }
+}
+
 fn canonicalize_report(
     report: ReviewReport,
     issued: &IssuedWorkUnitAnchors,
@@ -1126,28 +1168,7 @@ fn canonicalize_report(
         })?;
     let repository_suppressions_applied =
         apply_repository_suppressions(&mut ranked.findings, repository_policy);
-    let (minimum_risk, minimum_basis) = if ranked
-        .findings
-        .iter()
-        .any(|finding| matches!(finding.severity, Severity::Critical | Severity::High))
-    {
-        (
-            RiskLevel::High,
-            "Confirmed review evidence affects a material behavior or safety boundary.",
-        )
-    } else if selection.selected_high_signal_files > 0
-        || ranked
-            .findings
-            .iter()
-            .any(|finding| finding.severity == Severity::Medium)
-    {
-        (
-            RiskLevel::Moderate,
-            "The change touches a high-signal surface or has confirmed material review evidence.",
-        )
-    } else {
-        (RiskLevel::Low, "")
-    };
+    let (minimum_risk, minimum_basis) = minimum_review_risk(&ranked.findings, &selection);
     if overview.overall_risk < minimum_risk {
         overview.overall_risk = minimum_risk;
         minimum_basis.clone_into(&mut overview.overall_basis);
@@ -2197,15 +2218,11 @@ fn agent_limits(
     let max_model_requests = u32_value(resolution, "budget.max_model_requests")?;
     let engine_limits = ReviewEngineLimits::default();
     let request_count = u64::from(max_model_requests);
-    let max_files = config_unsigned(resolution, "budget.max_files")?;
-    let max_bytes = config_unsigned(resolution, "budget.max_input_bytes")?;
     let max_findings = u32_value(resolution, "budget.max_findings")?;
     let deadline_seconds = config_unsigned(resolution, "budget.deadline_seconds")?;
     Ok(AgentBudgetLimits {
         max_turns: max_model_requests,
         max_model_requests,
-        max_repository_files: max_files,
-        max_repository_bytes: max_bytes,
         max_candidate_findings: max_findings,
         max_elapsed_millis: deadline_seconds.saturating_mul(1_000),
         max_input_tokens: request_count.saturating_mul(engine_limits.max_conversation_bytes),
@@ -2752,23 +2769,27 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use revoot_core::{
-        AgentBudgetUsage, AnchorId, FindingCategory, MergeRequestIid, PullRequestNumber,
-        RankedFinding, Severity, Sha256Digest,
+        AgentBudgetLimits, AgentBudgetUsage, AnchorId, FindingCategory, MergeRequestIid,
+        PullRequestNumber, RankedFinding, Severity, Sha256Digest,
     };
 
-    use crate::config::{RepositoryReviewPolicy, RepositorySuppression};
+    use crate::config::{
+        RepositoryReviewPolicy, RepositorySuppression, resolve_review_configuration,
+    };
+    use crate::review_overview::RiskLevel;
 
     use super::{
         CanonicalPublication, CanonicalReviewReport, CanonicalSelection, OutputFormat,
-        REPORT_SCHEMA_VERSION, ReviewOutput, apply_repository_suppressions, fork_behavior,
-        parse_args, parse_private_cidr, select_model, validate_bound_job_url,
-        write_report_atomically,
+        REPORT_SCHEMA_VERSION, ReviewOutput, agent_limits, apply_repository_suppressions,
+        fork_behavior, minimum_review_risk, parse_args, parse_private_cidr, partition_limits,
+        select_model, validate_bound_job_url, write_report_atomically,
     };
 
     static LOCAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -2815,6 +2836,39 @@ mod tests {
                 .status()
                 .expect("git")
                 .success()
+        );
+    }
+
+    #[test]
+    fn changed_file_selection_limits_do_not_cap_repository_exploration() {
+        let repository = CleanLocalRepository::new();
+        let resolved = resolve_review_configuration(
+            &repository.0,
+            None,
+            None,
+            [
+                (OsString::from("REVOOT_MAX_FILES"), OsString::from("1")),
+                (
+                    OsString::from("REVOOT_MAX_INPUT_BYTES"),
+                    OsString::from("1"),
+                ),
+            ],
+        )
+        .expect("configuration resolves");
+
+        let selection = partition_limits(&resolved.effective).expect("selection limits");
+        assert_eq!(selection.max_files, 1);
+        assert_eq!(selection.max_total_bytes, 1);
+
+        let exploration = agent_limits(&resolved.effective).expect("agent limits");
+        let defaults = AgentBudgetLimits::default();
+        assert_eq!(
+            exploration.max_repository_files,
+            defaults.max_repository_files
+        );
+        assert_eq!(
+            exploration.max_repository_bytes,
+            defaults.max_repository_bytes
         );
     }
 
@@ -3005,6 +3059,31 @@ mod tests {
         assert_eq!(apply_repository_suppressions(&mut findings, &policy), 1);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].finding_key, retained);
+    }
+
+    #[test]
+    fn confirmed_finding_severity_sets_the_minimum_overall_risk() {
+        let finding = |severity| RankedFinding {
+            work_unit_id: "unit".to_owned(),
+            anchor_id: AnchorId::try_from(format!("ga1_{}", "a".repeat(64))).unwrap(),
+            severity,
+            confidence_percent: 95,
+            category: FindingCategory::Correctness,
+            finding_key: Sha256Digest::try_from("b".repeat(64)).unwrap(),
+            content_digest: Sha256Digest::try_from("c".repeat(64)).unwrap(),
+            lineage_id: None,
+            rendered_body: "bounded finding".to_owned(),
+        };
+        let selection = CanonicalSelection::default();
+
+        assert_eq!(
+            minimum_review_risk(&[finding(Severity::Critical)], &selection).0,
+            RiskLevel::Critical
+        );
+        assert_eq!(
+            minimum_review_risk(&[finding(Severity::High)], &selection).0,
+            RiskLevel::High
+        );
     }
 
     #[cfg(unix)]

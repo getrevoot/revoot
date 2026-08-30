@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
 use revoot_core::{
-    AgentBudgetError, AgentOmission, AgentOmissionReason, AgentProviderTurnError, AgentRun,
-    AgentRunError, AgentTool, AgentTurnPurpose, CancellationToken, CandidateAdmission,
-    CandidateAdmissionError, CandidateAdmissionHook, CandidateSubmission,
-    CandidateSuppressionReason, DirectProviderErrorKind as ProviderErrorKind, ExecutionFact,
-    ExecutionGraph, ExecutionGraphError, ExecutionGraphLimits, ExecutionGraphPlan,
+    AgentBudgetDimension, AgentBudgetError, AgentOmission, AgentOmissionReason,
+    AgentProviderTurnError, AgentRun, AgentRunError, AgentTool, AgentTurnPurpose, AnchorPosition,
+    CancellationToken, CandidateAdmission, CandidateAdmissionError, CandidateAdmissionHook,
+    CandidateSubmission, CandidateSuppressionReason, DirectProviderErrorKind as ProviderErrorKind,
+    ExecutionFact, ExecutionGraph, ExecutionGraphError, ExecutionGraphLimits, ExecutionGraphPlan,
     ExecutionGraphSummary, ExecutionGraphUsage, ExecutionNodeContribution, ExecutionNodeId,
     ExecutionNodeKind, ExecutionNodeSpec, FindingsEnvelope, InventoryCoverage, LineRange,
     ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestReservation,
@@ -29,7 +29,7 @@ use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 /// Version of the trusted reviewer policy used in quality evidence.
-pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v7";
+pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v10";
 
 const SYSTEM_PROMPT: &str = r"You are Revoot, one automatic code reviewer.
 Implementation and review are separate jobs, even when agents perform both.
@@ -75,10 +75,14 @@ invariant materially harder to preserve. Do not request abstraction for
 anticipated reuse or decomposition without a demonstrated benefit. Do not
 submit acronym-based, generic stylistic, naming, formatting, preference, praise,
 or diff-narration comments. State the observable impact, the improvement, and
-the repository evidence connecting it to the changed line. Challenge each
+the repository evidence connecting it to the changed line. Treat explanation
+and evidence as complementary parts of one published comment: explanation states
+the impact and improvement, while evidence supplies concrete repository-specific
+proof without restating the explanation. Challenge each
 hypothesis before calling submit_candidate_finding. Before submitting, call
 show_diff for every changed path that anchors a finding and inspect relevant
-repository context with read_file or search. If a candidate is suppressed
+repository context with read_file or search. Use only an exact anchor ID
+returned by show_diff; never invent or derive one. If a candidate is suppressed
 because evidence is missing, obtain that evidence and resubmit it once; do not
 merely repeat the candidate.
 Silence is correct when no well-supported improvement remains. Risk describes
@@ -186,8 +190,10 @@ pub struct ReviewEngineRequest {
     /// Comment bodies are untrusted data; ownership and state are trusted host
     /// projections established by the acquisition controller.
     pub prior_review: PriorReviewContext,
-    /// Trusted mapping from opaque candidate anchors to their changed checkout paths.
-    pub anchor_paths: BTreeMap<String, RepositoryRelativePath>,
+    /// Trusted catalog of opaque candidate anchors and their changed coordinates.
+    /// The matching subset is returned with `show_diff` so the model can use an
+    /// exact allowlisted anchor instead of inventing one.
+    pub anchors: BTreeMap<String, ReviewAnchor>,
     /// Fresh, trusted change context. This is intentionally not a reusable
     /// implementer conversation or general model-message history.
     pub review_brief: IndependentReviewBrief,
@@ -198,6 +204,13 @@ pub struct ReviewEngineRequest {
     /// The model cannot remove or downgrade these facts.
     pub initial_omissions: Vec<AgentOmission>,
     pub limits: ReviewEngineLimits,
+}
+
+/// Model-visible location for one trusted candidate anchor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAnchor {
+    pub path: RepositoryRelativePath,
+    pub position: AnchorPosition,
 }
 
 /// Stable, JSON-report-friendly engine evidence.
@@ -276,12 +289,30 @@ pub enum ReviewEngineErrorKind {
     Internal,
 }
 
+/// Closed, payload-free reason a review budget stopped execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewBudgetDimension {
+    Turns,
+    ModelRequests,
+    ToolCalls,
+    RepositoryFiles,
+    RepositoryBytes,
+    InputTokens,
+    OutputTokens,
+    Cost,
+    CandidateFindings,
+    ElapsedTime,
+    ConversationBytes,
+    ToolResultBytes,
+}
+
 /// A bounded failure with no source, prompt, response body, URL, or credential.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReviewEngineError {
     pub kind: ReviewEngineErrorKind,
     pub provider_kind: Option<ProviderErrorKind>,
     pub provider_status: Option<u16>,
+    pub budget_dimension: Option<ReviewBudgetDimension>,
 }
 
 impl ReviewEngineError {
@@ -290,6 +321,7 @@ impl ReviewEngineError {
             kind,
             provider_kind: None,
             provider_status: None,
+            budget_dimension: None,
         }
     }
 
@@ -298,6 +330,16 @@ impl ReviewEngineError {
             kind: ReviewEngineErrorKind::Provider,
             provider_kind: Some(kind),
             provider_status: status,
+            budget_dimension: None,
+        }
+    }
+
+    const fn budget(dimension: ReviewBudgetDimension) -> Self {
+        Self {
+            kind: ReviewEngineErrorKind::Budget,
+            provider_kind: None,
+            provider_status: None,
+            budget_dimension: Some(dimension),
         }
     }
 }
@@ -321,11 +363,22 @@ impl fmt::Display for ReviewEngineError {
                 None => formatter.write_str("automatic review provider failed"),
             };
         }
+        if self.kind == ReviewEngineErrorKind::Budget {
+            return match self.budget_dimension {
+                Some(dimension) => write!(
+                    formatter,
+                    "automatic review exhausted the {} budget",
+                    budget_dimension_label(dimension)
+                ),
+                None => formatter.write_str("automatic review exhausted a configured budget"),
+            };
+        }
         formatter.write_str(match self.kind {
             ReviewEngineErrorKind::InvalidRequest => "automatic review request is invalid",
             ReviewEngineErrorKind::Cancelled => "automatic review was cancelled",
-            ReviewEngineErrorKind::Budget => "automatic review exhausted a configured budget",
-            ReviewEngineErrorKind::Provider => unreachable!("handled above"),
+            ReviewEngineErrorKind::Budget | ReviewEngineErrorKind::Provider => {
+                unreachable!("handled above")
+            }
             ReviewEngineErrorKind::ProviderContract => {
                 "automatic review provider violated the response contract"
             }
@@ -340,6 +393,23 @@ impl fmt::Display for ReviewEngineError {
             }
             ReviewEngineErrorKind::Internal => "automatic review failed internally",
         })
+    }
+}
+
+const fn budget_dimension_label(dimension: ReviewBudgetDimension) -> &'static str {
+    match dimension {
+        ReviewBudgetDimension::Turns => "turn count",
+        ReviewBudgetDimension::ModelRequests => "model request count",
+        ReviewBudgetDimension::ToolCalls => "tool call count",
+        ReviewBudgetDimension::RepositoryFiles => "repository file count",
+        ReviewBudgetDimension::RepositoryBytes => "repository byte",
+        ReviewBudgetDimension::InputTokens => "input token",
+        ReviewBudgetDimension::OutputTokens => "output token",
+        ReviewBudgetDimension::Cost => "cost",
+        ReviewBudgetDimension::CandidateFindings => "candidate finding count",
+        ReviewBudgetDimension::ElapsedTime => "elapsed time",
+        ReviewBudgetDimension::ConversationBytes => "conversation size",
+        ReviewBudgetDimension::ToolResultBytes => "tool result size",
     }
 }
 
@@ -378,7 +448,7 @@ struct RestrainedAdmission<'a> {
     minimum_confidence_percent: u8,
     inspected_repository_context: bool,
     inspected_diff_paths: &'a BTreeSet<RepositoryRelativePath>,
-    anchor_paths: &'a BTreeMap<String, RepositoryRelativePath>,
+    anchors: &'a BTreeMap<String, ReviewAnchor>,
     prior_review: &'a PriorReviewContext,
     prior_review_cursor: usize,
 }
@@ -394,9 +464,9 @@ impl CandidateAdmissionHook for RestrainedAdmission<'_> {
             );
         }
         if candidate.findings.iter().any(|finding| {
-            self.anchor_paths
+            self.anchors
                 .get(&finding.anchor_id)
-                .is_none_or(|path| !self.inspected_diff_paths.contains(path))
+                .is_none_or(|anchor| !self.inspected_diff_paths.contains(&anchor.path))
         }) {
             return CandidateAdmission::Suppress(CandidateSuppressionReason::DiffEvidenceMissing);
         }
@@ -651,7 +721,7 @@ pub async fn run_review(
                 &prior_review,
                 &cancellation,
                 clock.now_millis(),
-                &request.anchor_paths,
+                &request.anchors,
                 request.limits,
                 &mut summary,
                 &mut evidence,
@@ -801,7 +871,7 @@ fn validate_request(request: &ReviewEngineRequest) -> Result<(), ReviewEngineErr
         || request.limits.max_conversation_bytes == 0
         || request.limits.max_tool_result_bytes == 0
         || !(1..=100).contains(&request.limits.minimum_confidence_percent)
-        || request.anchor_paths.is_empty()
+        || request.anchors.is_empty()
     {
         return Err(ReviewEngineError::new(
             ReviewEngineErrorKind::InvalidRequest,
@@ -873,7 +943,7 @@ fn model_tools(history_available: bool, prior_review_available: bool) -> Vec<Mod
         ),
         model_tool(
             "show_diff",
-            "Show the exact changed-file diff that seeds review scope and anchors.",
+            "Show the exact changed-file diff and the trusted anchor IDs for its changed lines. Use an exact returned anchor_id for candidate findings.",
             object_schema(&["path"]),
         ),
     ];
@@ -936,7 +1006,7 @@ fn submission_tools() -> [ModelTool; 2] {
                             "additionalProperties": false,
                             "properties": {
                                 "anchor_id": {"type": "string", "minLength": 1, "maxLength": 128},
-                                "severity": {"enum": ["critical", "high", "medium", "low"]},
+                                "severity": {"enum": ["critical", "high", "medium", "low", "info"]},
                                 "confidence_percent": {"type": "integer", "minimum": 0, "maximum": 100},
                                 "category": {"enum": ["correctness", "security", "reliability", "performance", "maintainability"]},
                                 "title": {"type": "string", "minLength": 1, "maxLength": 160},
@@ -961,7 +1031,7 @@ fn submission_tools() -> [ModelTool; 2] {
                 "additionalProperties": false,
                 "properties": {
                     "summary": {"type": "string", "minLength": 1, "maxLength": 1200},
-                    "overall_risk": {"enum": ["low", "moderate", "high"]},
+                    "overall_risk": {"enum": ["low", "moderate", "high", "critical"]},
                     "overall_basis": {"type": "string", "minLength": 1, "maxLength": 320},
                     "risks": {
                         "type": "array",
@@ -971,7 +1041,7 @@ fn submission_tools() -> [ModelTool; 2] {
                             "additionalProperties": false,
                             "properties": {
                                 "area": {"type": "string", "minLength": 1, "maxLength": 64},
-                                "risk": {"enum": ["moderate", "high"]},
+                                "risk": {"enum": ["moderate", "high", "critical"]},
                                 "basis": {"type": "string", "minLength": 1, "maxLength": 320}
                             },
                             "required": ["area", "risk", "basis"]
@@ -1120,7 +1190,7 @@ fn execute_tool(
     prior_review: &PriorReviewContext,
     cancellation: &CancellationToken,
     now_millis: u64,
-    anchor_paths: &BTreeMap<String, RepositoryRelativePath>,
+    anchors: &BTreeMap<String, ReviewAnchor>,
     limits: ReviewEngineLimits,
     summary: &mut Option<ReviewOverview>,
     evidence: &mut EngineEvidence,
@@ -1144,13 +1214,9 @@ fn execute_tool(
                     now_millis,
                 )
                 .map_err(map_repository_error)?;
-            if result.truncated {
-                push_omission(
-                    evidence,
-                    "file-list",
-                    AgentOmissionReason::InventoryIncomplete,
-                );
-            }
+            // `truncated` is scoped to the model's requested result count, not
+            // the trusted checkout inventory. The model can refine the prefix;
+            // only acquisition-time inventory gaps are global omissions.
             serde_json::to_value(result).map_err(|_| internal())?
         }
         "read_file" => {
@@ -1210,8 +1276,25 @@ fn execute_tool(
             let result = toolbox
                 .show_diff(&path, run.budget_mut(), cancellation, now_millis)
                 .map_err(map_repository_error)?;
-            evidence.inspected_diff_paths.insert(path);
-            serde_json::to_value(result).map_err(|_| internal())?
+            evidence.inspected_diff_paths.insert(path.clone());
+            let changed_line_anchors = anchors
+                .iter()
+                .filter(|(_, anchor)| {
+                    anchor.path == path
+                        && !matches!(anchor.position, AnchorPosition::Context { .. })
+                })
+                .map(|(anchor_id, anchor)| {
+                    json!({
+                        "anchor_id": anchor_id,
+                        "position": anchor.position,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "path": result.path,
+                "content": result.content,
+                "changed_line_anchors": changed_line_anchors,
+            })
         }
         "list_change_commits" => {
             ensure_allowed(run, AgentTool::ListChangeCommits)?;
@@ -1273,7 +1356,7 @@ fn execute_tool(
                 minimum_confidence_percent: limits.minimum_confidence_percent,
                 inspected_repository_context: evidence.inspected_repository_context,
                 inspected_diff_paths: &evidence.inspected_diff_paths,
-                anchor_paths,
+                anchors,
                 prior_review,
                 prior_review_cursor: evidence.prior_review_cursor,
             };
@@ -1366,7 +1449,9 @@ fn strict_input<T: for<'de> Deserialize<'de>>(input: Value) -> Result<T, ReviewE
 fn encode_tool_result(value: &Value, maximum: u64) -> Result<String, ReviewEngineError> {
     let encoded = serde_json::to_string(value).map_err(|_| internal())?;
     if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > maximum {
-        return Err(ReviewEngineError::new(ReviewEngineErrorKind::Budget));
+        return Err(ReviewEngineError::budget(
+            ReviewBudgetDimension::ToolResultBytes,
+        ));
     }
     Ok(encoded)
 }
@@ -1383,7 +1468,9 @@ fn enforce_conversation_bound(
         .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
         .map_err(|_| internal())?;
     if message_bytes.saturating_add(tool_bytes) > maximum {
-        Err(ReviewEngineError::new(ReviewEngineErrorKind::Budget))
+        Err(ReviewEngineError::budget(
+            ReviewBudgetDimension::ConversationBytes,
+        ))
     } else {
         Ok(())
     }
@@ -1443,8 +1530,37 @@ fn map_agent_error(error: AgentRunError) -> ReviewEngineError {
     }
 }
 
-fn map_budget_error(_error: AgentBudgetError) -> ReviewEngineError {
-    ReviewEngineError::new(ReviewEngineErrorKind::Budget)
+fn map_budget_error(error: AgentBudgetError) -> ReviewEngineError {
+    match error {
+        AgentBudgetError::Exhausted(dimension)
+        | AgentBudgetError::ReservationExceeded(dimension) => {
+            ReviewEngineError::budget(map_budget_dimension(dimension))
+        }
+        AgentBudgetError::InvalidLimits(_) => {
+            ReviewEngineError::new(ReviewEngineErrorKind::InvalidRequest)
+        }
+        AgentBudgetError::ClockRegression
+        | AgentBudgetError::ModelRequestInFlight
+        | AgentBudgetError::NoModelRequestInFlight
+        | AgentBudgetError::ModelRequestMismatch => {
+            ReviewEngineError::new(ReviewEngineErrorKind::Internal)
+        }
+    }
+}
+
+const fn map_budget_dimension(dimension: AgentBudgetDimension) -> ReviewBudgetDimension {
+    match dimension {
+        AgentBudgetDimension::Turns => ReviewBudgetDimension::Turns,
+        AgentBudgetDimension::ModelRequests => ReviewBudgetDimension::ModelRequests,
+        AgentBudgetDimension::ToolCalls => ReviewBudgetDimension::ToolCalls,
+        AgentBudgetDimension::RepositoryFiles => ReviewBudgetDimension::RepositoryFiles,
+        AgentBudgetDimension::RepositoryBytes => ReviewBudgetDimension::RepositoryBytes,
+        AgentBudgetDimension::InputTokens => ReviewBudgetDimension::InputTokens,
+        AgentBudgetDimension::OutputTokens => ReviewBudgetDimension::OutputTokens,
+        AgentBudgetDimension::Cost => ReviewBudgetDimension::Cost,
+        AgentBudgetDimension::CandidateFindings => ReviewBudgetDimension::CandidateFindings,
+        AgentBudgetDimension::ElapsedTime => ReviewBudgetDimension::ElapsedTime,
+    }
 }
 
 fn map_repository_error(error: RepositoryToolError) -> ReviewEngineError {
@@ -1690,7 +1806,13 @@ mod tests {
             toolbox,
             history: None,
             prior_review: PriorReviewContext::default(),
-            anchor_paths: BTreeMap::from([("ga1_fixture".to_owned(), path("src/changed.rs"))]),
+            anchors: BTreeMap::from([(
+                "ga1_fixture".to_owned(),
+                ReviewAnchor {
+                    path: path("src/changed.rs"),
+                    position: AnchorPosition::addition(1).expect("valid anchor position"),
+                },
+            )]),
             review_brief: IndependentReviewBrief::try_new(
                 "Review unit-1 at anchor ga1_fixture.".to_owned(),
             )
@@ -1801,7 +1923,7 @@ mod tests {
             tool_response(
                 "1",
                 "list_files",
-                json!({"prefix": "src", "max_results": 20}),
+                json!({"prefix": "src", "max_results": 1}),
             ),
             tool_response("2", "show_diff", json!({"path": "src/changed.rs"})),
             tool_response(
@@ -1870,6 +1992,17 @@ mod tests {
             request.messages.iter().any(|message| {
                 message.content.iter().any(|content| {
                     matches!(content, ModelContent::ToolResult { content, .. } if content.contains("src/dependency.rs"))
+                })
+            })
+        }));
+        assert!(requests.iter().any(|request| {
+            request.messages.iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(content, ModelContent::ToolResult { content, .. }
+                        if content.contains("changed_line_anchors")
+                            && content.contains("ga1_fixture")
+                            && content.contains("\"kind\":\"addition\"")
+                            && content.contains("\"new_line\":1"))
                 })
             })
         }));
@@ -2161,8 +2294,10 @@ mod tests {
         let provider = ScriptedProvider::new(exploration_script(Some(verified_candidate(94))));
         let mut review_request = request(&fixture, &cancellation, AgentBudgetLimits::default());
         review_request
-            .anchor_paths
-            .insert("ga1_fixture".to_owned(), path("src/dependency.rs"));
+            .anchors
+            .get_mut("ga1_fixture")
+            .expect("fixture anchor")
+            .path = path("src/dependency.rs");
         let report = run_review(
             &provider,
             review_request,
@@ -2262,6 +2397,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "automatic review provider failed (rate limit or API credits exhausted; check provider usage and billing; HTTP 429)"
+        );
+
+        let error = map_budget_error(AgentBudgetError::Exhausted(
+            AgentBudgetDimension::RepositoryFiles,
+        ));
+        assert_eq!(
+            error.to_string(),
+            "automatic review exhausted the repository file count budget"
+        );
+
+        let error = enforce_conversation_bound(&[], &[], 0)
+            .expect_err("zero conversation budget must fail");
+        assert_eq!(
+            error.to_string(),
+            "automatic review exhausted the conversation size budget"
         );
     }
 }

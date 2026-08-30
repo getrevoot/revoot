@@ -25,7 +25,7 @@
         ],
         "properties": {
           "anchor_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
           "confidence_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
           "category": { "enum": ["correctness", "security", "reliability", "performance", "maintainability"] },
           "title": { "type": "string", "minLength": 1, "maxLength": 160 },
