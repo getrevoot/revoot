@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Shared mise verification
+    name: Build and test
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -31,7 +31,7 @@ jobs:
           version: 2026.8.5
           install: true
           cache: true
-      - name: Run the shared verification suite
+      - name: Run CI checks
         run: mise run ci
         env:
           CARGO_INCREMENTAL: "0"

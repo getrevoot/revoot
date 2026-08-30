@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   publish:
+    name: Build and publish image
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
@@ -33,11 +34,13 @@ jobs:
       IMAGE: ghcr.io/${{ github.repository }}
       SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
           ref: ${{ env.SOURCE_SHA }}
-      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+      - name: Install toolchain
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
         with:
           version: 2026.8.5
           install: true
