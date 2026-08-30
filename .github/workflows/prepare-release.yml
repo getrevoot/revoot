@@ -32,4 +32,5 @@ jobs:
       - name: Open or update release pull request
         run: mise run release:pr
         env:
+          # release-plz CLI maps --git-token to GIT_TOKEN.
           GIT_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || github.token }}

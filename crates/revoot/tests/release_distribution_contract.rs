@@ -45,7 +45,7 @@ fn release_preparation_is_manual_and_updates_a_pull_request() {
     assert!(pipeline.contains("contents: write"));
     assert!(pipeline.contains("pull-requests: write"));
     assert!(pipeline.contains("mise run release:pr"));
-    assert!(pipeline.contains("secrets.RELEASE_PLZ_TOKEN || github.token"));
+    assert!(pipeline.contains("GIT_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || github.token }}"));
 }
 
 #[test]
