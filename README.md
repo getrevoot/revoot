@@ -13,41 +13,35 @@ lines. A clean review is a successful result.
 
 > Revoot is pre-1.0. Interfaces may change between minor releases.
 
-## Install
+## Run with Docker
 
-With [mise](https://mise.jdx.dev/):
-
-```sh
-mise use --global github:getrevoot/revoot@0.1.0
-```
-
-Or install from a checkout:
+The versioned container image is the simplest way to run Revoot. Set one
+provider key, mount the repository read-only, and start a review:
 
 ```sh
-mise install
-cargo install --locked --path crates/revoot
+export OPENAI_API_KEY=...
+
+docker run --rm \
+  --volume "$PWD:/workspace:ro" \
+  --workdir /workspace \
+  --env OPENAI_API_KEY \
+  ghcr.io/getrevoot/revoot:0.1.0 review
 ```
 
-Release archives support Linux AMD64, Linux ARM64, and Apple Silicon macOS. A
-multi-architecture image is published at `ghcr.io/getrevoot/revoot`.
-
-## Review local changes
-
-Set one provider key and run the review:
-
-```sh
-export ANTHROPIC_API_KEY=...
-# or: export OPENAI_API_KEY=...
-
-revoot review
-```
+For Claude, set and pass `ANTHROPIC_API_KEY` instead. The image supports Linux
+AMD64 and ARM64; native Linux and Apple Silicon macOS archives are also attached
+to each GitHub release.
 
 Revoot reviews committed branch changes, staged and unstaged edits, and
 non-ignored untracked files. It infers the default branch; use `--base` to
 override it:
 
 ```sh
-revoot review --base origin/release
+docker run --rm \
+  --volume "$PWD:/workspace:ro" \
+  --workdir /workspace \
+  --env OPENAI_API_KEY \
+  ghcr.io/getrevoot/revoot:0.1.0 review --base origin/release
 ```
 
 Revoot does not modify the checkout or execute repository code. Reviewed code
@@ -70,13 +64,15 @@ For GitHub Actions:
 
 ```sh
 mkdir -p .github/workflows
-revoot init github > .github/workflows/revoot.yml
+docker run --rm ghcr.io/getrevoot/revoot:0.1.0 init github \
+  > .github/workflows/revoot.yml
 ```
 
 For GitLab CI:
 
 ```sh
-revoot init gitlab > revoot-review.yml
+docker run --rm ghcr.io/getrevoot/revoot:0.1.0 init gitlab \
+  > revoot-review.yml
 ```
 
 Add the generated file to the repository, configure `ANTHROPIC_API_KEY` or
@@ -92,9 +88,15 @@ self-managed hosts.
 Existing pull and merge requests can also be reviewed directly:
 
 ```sh
-REVOOT_GITHUB_TOKEN=... revoot review --pr 42
-REVOOT_GITLAB_TOKEN=... revoot review --mr 42
+docker run --rm \
+  --volume "$PWD:/workspace:ro" \
+  --workdir /workspace \
+  --env OPENAI_API_KEY \
+  --env REVOOT_GITHUB_TOKEN \
+  ghcr.io/getrevoot/revoot:0.1.0 review --pr 42
 ```
+
+For GitLab, pass `REVOOT_GITLAB_TOKEN` and use `review --mr 42` instead.
 
 ### No duplicate review threads
 

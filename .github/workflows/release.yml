@@ -168,14 +168,8 @@ jobs:
         with:
           name: image-digest
           path: dist
-      - name: Prepare release assets
-        env:
-          REVOOT_RELEASE_VERSION: ${{ github.ref_name }}
-        run: |
-          REVOOT_RELEASE_VERSION=${REVOOT_RELEASE_VERSION#v}
-          export REVOOT_RELEASE_VERSION
-          mise run release:checksums
-          mise run release:package-manager-manifests
+      - name: Prepare release checksums
+        run: mise run release:checksums
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -188,8 +182,6 @@ jobs:
             dist/revoot-*.tar.gz
             dist/SHA256SUMS
             dist/image-digest.txt
-            dist/package-managers/revoot.mise.toml
-            dist/package-managers/revoot.rb
           )
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber

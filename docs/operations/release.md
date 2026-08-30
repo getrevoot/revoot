@@ -2,8 +2,7 @@
 
 GitHub is the source, container registry, and release host. Pushing an exact
 semantic-version tag runs CI, builds the supported archives and container
-images, generates checksums and package-manager metadata, and publishes the
-release.
+images, generates checksums, and publishes the release.
 
 ## Prepare a release
 
@@ -31,9 +30,9 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow publishes Linux and macOS archives, `SHA256SUMS`, generated
-mise and Homebrew metadata, and a multi-architecture image at
-`ghcr.io/getrevoot/revoot`. Stable releases also update the `latest` image tag.
+The release workflow publishes Linux and macOS archives, `SHA256SUMS`, and a
+multi-architecture image at `ghcr.io/getrevoot/revoot`. Stable releases also
+update the `latest` image tag.
 
 If a workflow job fails, correct the problem and rerun it. Do not move an
 already-published version tag to a different commit.

@@ -74,15 +74,6 @@ cargo install --locked --path crates/revoot --root "$revoot_install_root"
 description = "Generate and verify checksums for the complete local archive set"
 run = "bash scripts/generate-release-checksums.sh"
 
-[tasks."release:package-manager-manifests"]
-description = "Generate pinned mise and Homebrew release metadata"
-run = '''
-set -eu
-: "${REVOOT_RELEASE_VERSION:?set REVOOT_RELEASE_VERSION}"
-bash scripts/generate-package-manager-manifests.sh \
-  "$REVOOT_RELEASE_VERSION" dist/package-managers
-'''
-
 [tasks.ci]
 description = "Run all CI checks"
 run = [
