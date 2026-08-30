@@ -94,6 +94,7 @@ mod tests {
         assert!(workflow.contains("head.repo.full_name == github.repository"));
         assert!(workflow.contains("REVOOT_PUBLICATION_ENABLED: \"true\""));
         assert!(!workflow.contains("pull_request_target"));
+        assert!(!workflow.contains("workflow_run"));
         assert!(!workflow.contains("@main"));
     }
 

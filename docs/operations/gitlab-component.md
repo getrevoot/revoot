@@ -9,6 +9,13 @@ fixture changes, and `templates/review/template.yml`. The template runs the
 released `ghcr.io/getrevoot/revoot` image. Each component release pins the exact
 image digest produced by the corresponding GitHub release.
 
+The job defaults to GitLab's always-defined `.post` stage, so it remains valid
+when a project has custom stages. Its empty `needs` list starts review
+immediately alongside other CI work instead of waiting for the pipeline to
+finish. Pass job names through the `needs` input when review should wait for
+specific checks. A pipeline containing no ordinary-stage jobs does not run
+`.post` jobs; a Revoot-only pipeline should override `stage` to `test`.
+
 The acceptance pipeline exercises:
 
 - merge-request discovery and exact diff acquisition;

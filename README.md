@@ -60,6 +60,8 @@ to the relevant changed line. Revoot also maintains one compact summary in the
 pull or merge request description, covering the implementation, overall risk,
 material concerns, and validation gaps.
 
+The generated review job starts alongside other CI checks by default.
+
 As new commits are pushed, Revoot updates that summary in place and reconciles
 the existing line comments with the latest code. The review evolves with the
 change instead of appending a disconnected report on every run.

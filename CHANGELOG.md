@@ -28,6 +28,8 @@ versions follow Semantic Versioning.
   images.
 - Version-lockstep release checks, consistent command-group help, and release
   installation guidance.
+- CI reviews start alongside other checks by default, using GitLab's `.post`
+  stage without depending on a project's custom stage list.
 
 ### Removed
 

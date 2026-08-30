@@ -55,6 +55,8 @@ fn gitlab_is_a_component_fixture_not_a_source_mirror() {
         .expect("GitLab component policy must be readable");
 
     assert!(template.contains("ghcr.io/getrevoot/revoot:"));
+    assert!(template.contains("default: .post"));
+    assert!(template.contains("needs: $[[ inputs.needs ]]"));
     assert!(!template.contains("registry.gitlab.com/revoot"));
     assert!(documentation.contains("not a mirror"));
     assert!(documentation.contains("GitHub remains authoritative"));

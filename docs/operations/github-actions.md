@@ -21,6 +21,13 @@ and `pull-requests: write`, checks out the exact pull-request head with persiste
 credentials disabled, and invokes the single `revoot review --ci` operation.
 All referenced actions are pinned to full commit IDs.
 
+The generated workflow starts alongside other pull-request workflows. GitHub
+has no repository-wide final stage, and dependencies cannot cross workflow
+files. To run Revoot after particular checks, place its job in the same workflow
+and add those job names with `needs`; use `if: ${{ !cancelled() }}` if review
+should still run when a prerequisite fails. The generated workflow does not use
+the privileged `workflow_run` event.
+
 The default skips fork pull requests because GitHub does not expose ordinary
 repository secrets to untrusted fork workflows. `--fork-behavior report-only`
 removes the same-repository condition, but the runner still needs a safely

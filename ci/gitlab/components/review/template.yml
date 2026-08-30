@@ -1,8 +1,12 @@
 spec:
   inputs:
     stage:
-      default: test
-      description: Existing pipeline stage for the review job.
+      default: .post
+      description: Pipeline stage used to group the review job.
+    needs:
+      type: array
+      default: []
+      description: Jobs that must finish before review; empty starts immediately.
     image:
       default: ghcr.io/getrevoot/revoot:0.1.0
       description: Versioned Revoot image tag or immutable digest.
@@ -22,6 +26,7 @@ spec:
 
 revoot-review:
   stage: $[[ inputs.stage ]]
+  needs: $[[ inputs.needs ]]
   interruptible: true
   resource_group: revoot-$CI_PROJECT_ID-$CI_MERGE_REQUEST_IID
   image:
