@@ -669,12 +669,13 @@ pub fn run(
         args.github_repository.clone(),
     ))?;
     emit_report(&args, &provider, &model, &report)?;
+    if report.publication.reason == Some("github_thread_resolution_unavailable") {
+        eprintln!(
+            "GitHub did not permit automatic review-thread resolution. Revoot preserved the finding lifecycle in the evolving overview; resolve conversations manually or configure an optional GitHub App."
+        );
+    }
     if report.publication_failed() {
-        if report.publication.reason == Some("github_thread_resolution_unavailable") {
-            eprintln!(
-                "Revoot could not resolve a GitHub review thread. Configure a masked REVOOT_GITHUB_TOKEN with pull-request read/write access; GitHub's built-in Actions token cannot perform this mutation."
-            );
-        } else if let Some(reason) = report.publication.reason {
+        if let Some(reason) = report.publication.reason {
             eprintln!("Revoot publication failed ({reason}); see the review report for details.");
         }
         return Ok(3);
@@ -1853,7 +1854,8 @@ async fn publish_github_review(
     };
     CanonicalPublication {
         state: "completed",
-        reason: None,
+        reason: (evidence.deferred_thread_resolutions != 0)
+            .then_some("github_thread_resolution_unavailable"),
         actions_confirmed: evidence
             .actions_confirmed
             .saturating_add(u32::from(overview.is_some())),
@@ -1866,7 +1868,7 @@ async fn publish_github_review(
 
 const fn github_publication_failure_reason(error: GitHubReviewError) -> &'static str {
     match error {
-        GitHubReviewError::ThreadResolution => "github_thread_resolution_unavailable",
+        GitHubReviewError::ThreadResolution => "github_thread_resolution_failed",
         GitHubReviewError::PublicationStale
         | GitHubReviewError::IdentityMismatch
         | GitHubReviewError::CheckoutHeadMismatch

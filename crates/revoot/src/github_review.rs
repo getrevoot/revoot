@@ -550,6 +550,20 @@ pub struct GitHubPublicationEvidence {
     pub mutation_attempts: u32,
     pub superseded_comments: u32,
     pub reopened_threads: u32,
+    pub deferred_thread_resolutions: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThreadResolutionOutcome {
+    Updated,
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+struct GraphQlError {
+    message: String,
+    #[serde(rename = "type")]
+    kind: Option<String>,
 }
 
 /// Reconcile and publish Revoot-owned GitHub review comments.
@@ -601,6 +615,7 @@ pub async fn publish_github_findings(
         .filter_map(|item| finding_lineage_id(&item.body))
         .collect::<BTreeSet<_>>();
     let mut evidence = GitHubPublicationEvidence::default();
+    let mut thread_resolution_available = true;
     for publication in &prepared {
         let exact_matches = comments
             .iter()
@@ -630,10 +645,15 @@ pub async fn publish_github_findings(
             evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
             evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
             if thread.state != PriorReviewState::Resolved {
-                ensure_fresh(client, context).await?;
-                set_thread_resolved(client, &thread.thread_id, true).await?;
-                evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
-                evidence.superseded_comments = evidence.superseded_comments.saturating_add(1);
+                reconcile_thread_resolution(
+                    client,
+                    context,
+                    &thread.thread_id,
+                    true,
+                    &mut thread_resolution_available,
+                    &mut evidence,
+                )
+                .await?;
             }
             continue;
         }
@@ -668,10 +688,15 @@ pub async fn publish_github_findings(
                                 .is_some_and(|marker| marker.lineage_sha256 == lineage)
                     })
                 {
-                    ensure_fresh(client, context).await?;
-                    set_thread_resolved(client, &thread.thread_id, false).await?;
-                    evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
-                    evidence.reopened_threads = evidence.reopened_threads.saturating_add(1);
+                    reconcile_thread_resolution(
+                        client,
+                        context,
+                        &thread.thread_id,
+                        false,
+                        &mut thread_resolution_available,
+                        &mut evidence,
+                    )
+                    .await?;
                 }
                 evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
             }
@@ -697,11 +722,15 @@ pub async fn publish_github_findings(
                         .is_some_and(|marker| marker.lineage_sha256 == *lineage)
             })
             .ok_or(GitHubReviewError::PublicationAmbiguous)?;
-        ensure_fresh(client, context).await?;
-        set_thread_resolved(client, &thread.thread_id, true).await?;
-        evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
-        evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
-        evidence.superseded_comments = evidence.superseded_comments.saturating_add(1);
+        reconcile_thread_resolution(
+            client,
+            context,
+            &thread.thread_id,
+            true,
+            &mut thread_resolution_available,
+            &mut evidence,
+        )
+        .await?;
     }
     for comment in comments.iter().filter(|comment| comment.user.id == bot.id) {
         if comment.lineage_id().is_some_and(|lineage| {
@@ -749,6 +778,39 @@ pub async fn publish_github_findings(
     Ok(evidence)
 }
 
+async fn reconcile_thread_resolution(
+    client: &GitHubClient,
+    context: &GitHubReviewContext,
+    thread_id: &str,
+    resolved: bool,
+    available: &mut bool,
+    evidence: &mut GitHubPublicationEvidence,
+) -> Result<(), GitHubReviewError> {
+    if !*available {
+        evidence.deferred_thread_resolutions =
+            evidence.deferred_thread_resolutions.saturating_add(1);
+        return Ok(());
+    }
+    ensure_fresh(client, context).await?;
+    evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
+    match set_thread_resolved(client, thread_id, resolved).await? {
+        ThreadResolutionOutcome::Updated => {
+            evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
+            if resolved {
+                evidence.superseded_comments = evidence.superseded_comments.saturating_add(1);
+            } else {
+                evidence.reopened_threads = evidence.reopened_threads.saturating_add(1);
+            }
+        }
+        ThreadResolutionOutcome::Unavailable => {
+            *available = false;
+            evidence.deferred_thread_resolutions =
+                evidence.deferred_thread_resolutions.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
 fn occurrence_needs_current_anchor(
     context: &GitHubReviewContext,
     publication: &revoot_core::PreparedPublication,
@@ -779,12 +841,12 @@ async fn set_thread_resolved(
     client: &GitHubClient,
     thread_id: &str,
     resolved: bool,
-) -> Result<(), GitHubReviewError> {
+) -> Result<ThreadResolutionOutcome, GitHubReviewError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Envelope {
         data: Option<Data>,
-        errors: Option<Vec<serde_json::Value>>,
+        errors: Option<Vec<GraphQlError>>,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -816,11 +878,10 @@ async fn set_thread_resolved(
         .await?;
     let envelope: Envelope =
         serde_json::from_slice(&response.body).map_err(|_| GitHubReviewError::ThreadResolution)?;
-    if envelope
-        .errors
-        .as_ref()
-        .is_some_and(|errors| !errors.is_empty())
-    {
+    if let Some(errors) = envelope.errors.as_ref().filter(|errors| !errors.is_empty()) {
+        if errors.iter().all(thread_resolution_denied) {
+            return Ok(ThreadResolutionOutcome::Unavailable);
+        }
         return Err(GitHubReviewError::ThreadResolution);
     }
     let thread = envelope
@@ -837,7 +898,15 @@ async fn set_thread_resolved(
     if thread.id != thread_id || thread.is_resolved != resolved {
         return Err(GitHubReviewError::ThreadResolution);
     }
-    Ok(())
+    Ok(ThreadResolutionOutcome::Updated)
+}
+
+fn thread_resolution_denied(error: &GraphQlError) -> bool {
+    error.kind.as_deref() == Some("FORBIDDEN")
+        || error
+            .message
+            .to_ascii_lowercase()
+            .starts_with("resource not accessible by")
 }
 
 async fn authenticated_user(client: &GitHubClient) -> Result<GitHubUser, GitHubReviewError> {
@@ -1386,7 +1455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inaccessible_thread_mutation_has_a_distinct_failure() {
+    async fn inaccessible_thread_mutation_is_reported_as_unavailable() {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("listener");
@@ -1416,10 +1485,117 @@ mod tests {
         assert_eq!(
             set_thread_resolved(&client, "PRRT_thread", true)
                 .await
-                .expect_err("the integration cannot resolve this thread"),
+                .expect("permission denial is a supported outcome"),
+            ThreadResolutionOutcome::Unavailable
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unexpected_thread_mutation_failure_remains_fatal() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut mutation, _) = listener.accept().await.unwrap();
+            assert!(
+                read_request(&mut mutation)
+                    .await
+                    .starts_with(b"POST /graphql ")
+            );
+            write_json(
+                &mut mutation,
+                &serde_json::json!({
+                    "data": {"resolveReviewThread": null},
+                    "errors": [{"message": "An unexpected mutation failure occurred"}]
+                }),
+            )
+            .await;
+        });
+        let client = GitHubClient::new_for_loopback(
+            GitHubToken::new(b"test-token".to_vec()).unwrap(),
+            address,
+        )
+        .unwrap();
+
+        assert_eq!(
+            set_thread_resolved(&client, "PRRT_thread", true)
+                .await
+                .expect_err("unexpected failures must stop publication"),
             GitHubReviewError::ThreadResolution
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_resolution_is_deferred_without_stopping_publication() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            assert!(
+                read_request(&mut fresh)
+                    .await
+                    .starts_with(b"GET /repos/acme/widgets/pulls/7 ")
+            );
+            write_json(&mut fresh, &pull_body("author text")).await;
+
+            let (mut mutation, _) = listener.accept().await.unwrap();
+            assert!(
+                read_request(&mut mutation)
+                    .await
+                    .starts_with(b"POST /graphql ")
+            );
+            write_json(
+                &mut mutation,
+                &serde_json::json!({
+                    "data": {"resolveReviewThread": null},
+                    "errors": [{
+                        "message": "Resource not accessible by integration",
+                        "type": "FORBIDDEN"
+                    }]
+                }),
+            )
+            .await;
+        });
+        let client = GitHubClient::new_for_loopback(
+            GitHubToken::new(b"test-token".to_vec()).unwrap(),
+            address,
+        )
+        .unwrap();
+        let mut available = true;
+        let mut evidence = GitHubPublicationEvidence::default();
+
+        reconcile_thread_resolution(
+            &client,
+            &review_context(),
+            "PRRT_thread",
+            true,
+            &mut available,
+            &mut evidence,
+        )
+        .await
+        .expect("permission denial must not stop publication");
+        reconcile_thread_resolution(
+            &client,
+            &review_context(),
+            "PRRT_other",
+            true,
+            &mut available,
+            &mut evidence,
+        )
+        .await
+        .expect("later resolutions are deferred without another API call");
+
+        server.await.unwrap();
+        assert!(!available);
+        assert_eq!(evidence.mutation_attempts, 1);
+        assert_eq!(evidence.actions_confirmed, 0);
+        assert_eq!(evidence.superseded_comments, 0);
+        assert_eq!(evidence.deferred_thread_resolutions, 2);
     }
 
     #[tokio::test]

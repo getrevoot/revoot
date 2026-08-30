@@ -101,9 +101,9 @@ Store these as CI secrets, not repository variables or `.revoot.toml` values.
 | `ANTHROPIC_API_KEY` | Anthropic provider credential. |
 | `OPENAI_API_KEY` | OpenAI provider credential. |
 | `REVOOT_MODEL_TOKEN` | Compatibility alias for `OPENAI_API_KEY`; setting both is rejected. |
-| `REVOOT_GITHUB_TOKEN` | User or bot PAT with pull-request read/write access; enables automatic thread resolution and is preferred over `GH_TOKEN`, then `GITHUB_TOKEN`. |
+| `REVOOT_GITHUB_TOKEN` | Optional short-lived token from a dedicated automation identity, preferably a repository-installed GitHub App; enables automatic thread resolution and is preferred over `GH_TOKEN`, then `GITHUB_TOKEN`. Do not use a developer PAT for durable CI automation. |
 | `GH_TOKEN` | GitHub CLI-compatible token; used when `REVOOT_GITHUB_TOKEN` is absent. |
-| `GITHUB_TOKEN` | GitHub Actions token fallback; publishes comments and summaries but cannot resolve or reopen threads. |
+| `GITHUB_TOKEN` | GitHub Actions token fallback; completes publication, state tracking, and duplicate prevention. If GitHub denies automatic resolve or reopen mutations, Revoot records the non-fatal limitation and preserves lifecycle state in the overview. |
 | `REVOOT_GITLAB_TOKEN` | GitLab private token with read and write access; highest precedence. |
 | `GITLAB_TOKEN` | GitLab private token used when `REVOOT_GITLAB_TOKEN` is absent. |
 | `REVOOT_GITLAB_BEARER_TOKEN` | GitLab OAuth bearer token used when private-token variables are absent. |
