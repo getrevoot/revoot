@@ -29,7 +29,7 @@ use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 /// Version of the trusted reviewer policy used in quality evidence.
-pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v6";
+pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v7";
 
 const SYSTEM_PROMPT: &str = r"You are Revoot, one automatic code reviewer.
 Implementation and review are separate jobs, even when agents perform both.
