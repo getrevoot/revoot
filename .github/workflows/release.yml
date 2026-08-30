@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   verify:
+    name: Validate release
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -30,6 +31,7 @@ jobs:
       - run: mise run ci
 
   package-linux:
+    name: Package Linux artifacts
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -51,6 +53,7 @@ jobs:
           retention-days: 7
 
   package-macos:
+    name: Package macOS artifact
     needs: verify
     runs-on: macos-15
     timeout-minutes: 120
@@ -72,6 +75,7 @@ jobs:
           retention-days: 7
 
   publish-image-architecture:
+    name: Publish image (${{ matrix.architecture }})
     needs: package-linux
     strategy:
       fail-fast: true
@@ -113,6 +117,7 @@ jobs:
           docker push "$IMAGE:$IMAGE_TAG"
 
   publish-image:
+    name: Publish multi-architecture image
     needs: publish-image-architecture
     runs-on: ubuntu-latest
     permissions:
@@ -143,6 +148,7 @@ jobs:
           retention-days: 7
 
   release:
+    name: Publish GitHub release
     needs: [package-linux, package-macos, publish-image]
     runs-on: ubuntu-latest
     permissions:
@@ -190,6 +196,7 @@ jobs:
           fi
 
   publish-latest:
+    name: Update latest image tag
     if: ${{ !contains(github.ref_name, '-') }}
     needs: release
     runs-on: ubuntu-latest
