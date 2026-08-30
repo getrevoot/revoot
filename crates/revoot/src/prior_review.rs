@@ -136,6 +136,7 @@ pub async fn acquire_github_prior_review(
     let mut discussions = Vec::new();
     let mut after: Option<String> = None;
     let mut authenticated_login: Option<String> = None;
+    let mut authenticated_user_id: Option<u64> = None;
     for _ in 0..MAX_PAGES {
         let response = client
             .graphql(&json!({
@@ -157,13 +158,16 @@ pub async fn acquire_github_prior_review(
         let data = envelope.data.ok_or(PriorReviewAcquisitionError::Wire)?;
         let viewer = data.viewer.ok_or(PriorReviewAcquisitionError::Identity)?;
         if viewer.login.is_empty()
+            || viewer.database_id == 0
             || authenticated_login
                 .as_ref()
                 .is_some_and(|login| login != &viewer.login)
+            || authenticated_user_id.is_some_and(|id| id != viewer.database_id)
         {
             return Err(PriorReviewAcquisitionError::Identity);
         }
-        let authenticated_login = authenticated_login.get_or_insert(viewer.login);
+        authenticated_login.get_or_insert(viewer.login);
+        let authenticated_user_id = *authenticated_user_id.get_or_insert(viewer.database_id);
         let connection = data
             .repository
             .and_then(|repository| repository.pull_request)
@@ -172,7 +176,7 @@ pub async fn acquire_github_prior_review(
         for thread in connection.nodes {
             discussions.push(github_discussion(
                 thread,
-                authenticated_login,
+                authenticated_user_id,
                 current_head,
             )?);
         }
@@ -193,7 +197,7 @@ pub async fn acquire_github_prior_review(
 
 fn github_discussion(
     thread: GitHubReviewThread,
-    authenticated_login: &str,
+    authenticated_user_id: u64,
     current_head: &revoot_core::GitSha,
 ) -> Result<PriorReviewDiscussion, PriorReviewAcquisitionError> {
     if thread.comments.page_info.has_next_page {
@@ -202,7 +206,7 @@ fn github_discussion(
     let Some(root) = thread.comments.nodes.first() else {
         return Err(PriorReviewAcquisitionError::Wire);
     };
-    let owned = github_source(root.author.as_ref(), authenticated_login)
+    let owned = github_source(root.author.as_ref(), authenticated_user_id)
         == PriorReviewSource::Revoot
         && publication_marker(&root.body).is_some();
     let fallback_head = root
@@ -222,7 +226,7 @@ fn github_discussion(
             .skip(1)
             .map(|comment| RawReply {
                 comment_id: comment.database_id.to_string(),
-                source: github_source(comment.author.as_ref(), authenticated_login),
+                source: github_source(comment.author.as_ref(), authenticated_user_id),
                 body: &comment.body,
                 created_at: comment.created_at.as_deref(),
                 updated_at: comment.updated_at.as_deref(),
@@ -249,7 +253,7 @@ fn github_discussion(
         body,
         replies,
         resolution: thread.is_resolved.then(|| PriorReviewResolution {
-            source: github_source(thread.resolved_by.as_ref(), authenticated_login),
+            source: github_source(thread.resolved_by.as_ref(), authenticated_user_id),
             resolved_at: None,
         }),
         lineage,
@@ -324,8 +328,8 @@ fn bounded_text(value: &str, maximum: usize) -> String {
     value[..end].to_owned()
 }
 
-fn github_source(author: Option<&GitHubActor>, authenticated_login: &str) -> PriorReviewSource {
-    if author.is_some_and(|author| author.login == authenticated_login) {
+fn github_source(author: Option<&GitHubActor>, authenticated_user_id: u64) -> PriorReviewSource {
+    if author.is_some_and(|author| author.database_id == Some(authenticated_user_id)) {
         PriorReviewSource::Revoot
     } else {
         PriorReviewSource::Other
@@ -333,7 +337,7 @@ fn github_source(author: Option<&GitHubActor>, authenticated_login: &str) -> Pri
 }
 
 const GITHUB_REVIEW_THREADS_QUERY: &str = r"query RevootReviewThreads($owner: String!, $name: String!, $number: Int!, $after: String) {
-  viewer { login }
+  viewer { login databaseId }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $after) {
@@ -342,14 +346,18 @@ const GITHUB_REVIEW_THREADS_QUERY: &str = r"query RevootReviewThreads($owner: St
           isResolved
           isOutdated
           originalLine
-          resolvedBy { login }
+          resolvedBy { login databaseId }
           path
           line
           comments(first: 100) {
             nodes {
               databaseId
               body
-              author { login }
+              author {
+                login
+                ... on Bot { databaseId }
+                ... on User { databaseId }
+              }
               originalCommit { oid }
               createdAt
               updatedAt
@@ -366,6 +374,8 @@ const GITHUB_REVIEW_THREADS_QUERY: &str = r"query RevootReviewThreads($owner: St
 #[derive(Deserialize)]
 struct GitHubViewer {
     login: String,
+    #[serde(rename = "databaseId")]
+    database_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -431,8 +441,9 @@ struct GitHubReviewComment {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GitHubActor {
-    login: String,
+    database_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -490,7 +501,7 @@ mod tests {
             write_json(
                 &mut graphql,
                 &json!({
-                    "data": {"viewer": {"login": "revoot-bot"}, "repository": {"pullRequest": {"reviewThreads": {
+                    "data": {"viewer": {"login": "github-actions[bot]", "databaseId": 7}, "repository": {"pullRequest": {"reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_thread",
                             "isResolved": true,
@@ -503,7 +514,7 @@ mod tests {
                                 "nodes": [{
                                     "databaseId": 9,
                                     "body": body,
-                                    "author": {"login": "revoot-bot", "databaseId": 7},
+                                    "author": {"login": "github-actions", "databaseId": 7},
                                     "originalCommit": {"oid": "a".repeat(40)},
                                     "createdAt": "2026-08-29T10:00:00Z",
                                     "updatedAt": "2026-08-29T10:00:00Z"

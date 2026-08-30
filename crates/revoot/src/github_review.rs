@@ -1280,7 +1280,7 @@ mod tests {
             );
             write_json(
                 &mut inventory,
-                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot"}, "repository": {"pullRequest": {
+                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot", "databaseId": 7}, "repository": {"pullRequest": {
                     "reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_thread",
@@ -1379,7 +1379,7 @@ mod tests {
             );
             write_json(
                 &mut inventory,
-                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot"}, "repository": {"pullRequest": {
+                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot", "databaseId": 7}, "repository": {"pullRequest": {
                     "reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_human",
