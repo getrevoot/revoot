@@ -278,6 +278,7 @@ pub enum ReviewEngineErrorKind {
 pub struct ReviewEngineError {
     pub kind: ReviewEngineErrorKind,
     pub provider_kind: Option<ProviderErrorKind>,
+    pub provider_status: Option<u16>,
 }
 
 impl ReviewEngineError {
@@ -285,13 +286,15 @@ impl ReviewEngineError {
         Self {
             kind,
             provider_kind: None,
+            provider_status: None,
         }
     }
 
-    const fn provider(kind: ProviderErrorKind) -> Self {
+    const fn provider(kind: ProviderErrorKind, status: Option<u16>) -> Self {
         Self {
             kind: ReviewEngineErrorKind::Provider,
             provider_kind: Some(kind),
+            provider_status: status,
         }
     }
 }
@@ -300,11 +303,18 @@ impl fmt::Display for ReviewEngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.kind == ReviewEngineErrorKind::Provider {
             return match self.provider_kind {
-                Some(kind) => write!(
-                    formatter,
-                    "automatic review provider failed ({})",
-                    provider_error_label(kind)
-                ),
+                Some(kind) => match self.provider_status {
+                    Some(status) => write!(
+                        formatter,
+                        "automatic review provider failed ({}; HTTP {status})",
+                        provider_error_label(kind)
+                    ),
+                    None => write!(
+                        formatter,
+                        "automatic review provider failed ({})",
+                        provider_error_label(kind)
+                    ),
+                },
                 None => formatter.write_str("automatic review provider failed"),
             };
         }
@@ -1389,7 +1399,9 @@ fn outcome_usage(outcome: &ReviewOutcome) -> revoot_core::AgentBudgetUsage {
 
 fn map_provider_turn_error(error: AgentProviderTurnError) -> ReviewEngineError {
     match error {
-        AgentProviderTurnError::Provider(error) => ReviewEngineError::provider(error.kind()),
+        AgentProviderTurnError::Provider(error) => {
+            ReviewEngineError::provider(error.kind(), error.status_code())
+        }
         AgentProviderTurnError::Agent(error) => map_agent_error(error),
         AgentProviderTurnError::InvalidRequest(_)
         | AgentProviderTurnError::AdapterMismatch
@@ -2200,10 +2212,10 @@ mod tests {
 
     #[test]
     fn errors_do_not_retain_provider_or_tool_payloads() {
-        let error = ReviewEngineError::provider(ProviderErrorKind::Authentication);
+        let error = ReviewEngineError::provider(ProviderErrorKind::Authentication, Some(401));
         assert_eq!(
             error.to_string(),
-            "automatic review provider failed (authentication)"
+            "automatic review provider failed (authentication; HTTP 401)"
         );
         let encoded = format!("{error:?}");
         assert!(!encoded.contains("token"));
