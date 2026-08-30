@@ -5,6 +5,7 @@
 pub mod completion;
 pub mod config;
 pub mod credentials;
+pub mod dogfood_metrics;
 pub mod egress_setup;
 mod embedded_git;
 pub mod git_history;
