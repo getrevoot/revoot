@@ -1073,6 +1073,40 @@ fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
     }
 }
 
+fn minimum_review_risk(
+    findings: &[RankedFinding],
+    selection: &CanonicalSelection,
+) -> (RiskLevel, &'static str) {
+    if findings
+        .iter()
+        .any(|finding| finding.severity == Severity::Critical)
+    {
+        (
+            RiskLevel::Critical,
+            "Confirmed critical review evidence affects a material behavior or safety boundary.",
+        )
+    } else if findings
+        .iter()
+        .any(|finding| finding.severity == Severity::High)
+    {
+        (
+            RiskLevel::High,
+            "Confirmed review evidence affects a material behavior or safety boundary.",
+        )
+    } else if selection.selected_high_signal_files > 0
+        || findings
+            .iter()
+            .any(|finding| finding.severity == Severity::Medium)
+    {
+        (
+            RiskLevel::Moderate,
+            "The change touches a high-signal surface or has confirmed material review evidence.",
+        )
+    } else {
+        (RiskLevel::Low, "")
+    }
+}
+
 fn canonicalize_report(
     report: ReviewReport,
     issued: &IssuedWorkUnitAnchors,
@@ -1113,28 +1147,7 @@ fn canonicalize_report(
         })?;
     let repository_suppressions_applied =
         apply_repository_suppressions(&mut ranked.findings, repository_policy);
-    let (minimum_risk, minimum_basis) = if ranked
-        .findings
-        .iter()
-        .any(|finding| matches!(finding.severity, Severity::Critical | Severity::High))
-    {
-        (
-            RiskLevel::High,
-            "Confirmed review evidence affects a material behavior or safety boundary.",
-        )
-    } else if selection.selected_high_signal_files > 0
-        || ranked
-            .findings
-            .iter()
-            .any(|finding| finding.severity == Severity::Medium)
-    {
-        (
-            RiskLevel::Moderate,
-            "The change touches a high-signal surface or has confirmed material review evidence.",
-        )
-    } else {
-        (RiskLevel::Low, "")
-    };
+    let (minimum_risk, minimum_basis) = minimum_review_risk(&ranked.findings, &selection);
     if overview.overall_risk < minimum_risk {
         overview.overall_risk = minimum_risk;
         minimum_basis.clone_into(&mut overview.overall_basis);
@@ -2741,12 +2754,13 @@ mod tests {
     use crate::config::{
         RepositoryReviewPolicy, RepositorySuppression, resolve_review_configuration,
     };
+    use crate::review_overview::RiskLevel;
 
     use super::{
         CanonicalPublication, CanonicalReviewReport, CanonicalSelection, OutputFormat,
         REPORT_SCHEMA_VERSION, ReviewOutput, agent_limits, apply_repository_suppressions,
-        fork_behavior, parse_args, parse_private_cidr, partition_limits, select_model,
-        validate_bound_job_url, write_report_atomically,
+        fork_behavior, minimum_review_risk, parse_args, parse_private_cidr, partition_limits,
+        select_model, validate_bound_job_url, write_report_atomically,
     };
 
     static LOCAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -3016,6 +3030,31 @@ mod tests {
         assert_eq!(apply_repository_suppressions(&mut findings, &policy), 1);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].finding_key, retained);
+    }
+
+    #[test]
+    fn confirmed_finding_severity_sets_the_minimum_overall_risk() {
+        let finding = |severity| RankedFinding {
+            work_unit_id: "unit".to_owned(),
+            anchor_id: AnchorId::try_from(format!("ga1_{}", "a".repeat(64))).unwrap(),
+            severity,
+            confidence_percent: 95,
+            category: FindingCategory::Correctness,
+            finding_key: Sha256Digest::try_from("b".repeat(64)).unwrap(),
+            content_digest: Sha256Digest::try_from("c".repeat(64)).unwrap(),
+            lineage_id: None,
+            rendered_body: "bounded finding".to_owned(),
+        };
+        let selection = CanonicalSelection::default();
+
+        assert_eq!(
+            minimum_review_risk(&[finding(Severity::Critical)], &selection).0,
+            RiskLevel::Critical
+        );
+        assert_eq!(
+            minimum_review_risk(&[finding(Severity::High)], &selection).0,
+            RiskLevel::High
+        );
     }
 
     #[cfg(unix)]
