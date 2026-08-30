@@ -133,19 +133,9 @@ pub async fn acquire_github_prior_review(
     pull_request_number: revoot_core::PullRequestNumber,
     current_head: &revoot_core::GitSha,
 ) -> Result<PriorReviewContext, PriorReviewAcquisitionError> {
-    let authenticated: GitHubViewer = serde_json::from_slice(
-        &client
-            .get(None, &["user"], &[])
-            .await
-            .map_err(|_| PriorReviewAcquisitionError::Transport)?
-            .body,
-    )
-    .map_err(|_| PriorReviewAcquisitionError::Identity)?;
-    if authenticated.login.is_empty() {
-        return Err(PriorReviewAcquisitionError::Identity);
-    }
     let mut discussions = Vec::new();
     let mut after: Option<String> = None;
+    let mut authenticated_login: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let response = client
             .graphql(&json!({
@@ -164,16 +154,25 @@ pub async fn acquire_github_prior_review(
         if envelope.errors.is_some() {
             return Err(PriorReviewAcquisitionError::Wire);
         }
-        let connection = envelope
-            .data
-            .and_then(|data| data.repository)
+        let data = envelope.data.ok_or(PriorReviewAcquisitionError::Wire)?;
+        let viewer = data.viewer.ok_or(PriorReviewAcquisitionError::Identity)?;
+        if viewer.login.is_empty()
+            || authenticated_login
+                .as_ref()
+                .is_some_and(|login| login != &viewer.login)
+        {
+            return Err(PriorReviewAcquisitionError::Identity);
+        }
+        let authenticated_login = authenticated_login.get_or_insert(viewer.login);
+        let connection = data
+            .repository
             .and_then(|repository| repository.pull_request)
             .map(|pull| pull.review_threads)
             .ok_or(PriorReviewAcquisitionError::Wire)?;
         for thread in connection.nodes {
             discussions.push(github_discussion(
                 thread,
-                &authenticated.login,
+                authenticated_login,
                 current_head,
             )?);
         }
@@ -334,6 +333,7 @@ fn github_source(author: Option<&GitHubActor>, authenticated_login: &str) -> Pri
 }
 
 const GITHUB_REVIEW_THREADS_QUERY: &str = r"query RevootReviewThreads($owner: String!, $name: String!, $number: Int!, $after: String) {
+  viewer { login }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $after) {
@@ -376,6 +376,7 @@ struct GitHubGraphQlEnvelope {
 
 #[derive(Deserialize)]
 struct GitHubGraphQlData {
+    viewer: Option<GitHubViewer>,
     repository: Option<GitHubGraphQlRepository>,
 }
 
@@ -483,18 +484,13 @@ mod tests {
             "c".repeat(64)
         );
         let server = tokio::spawn(async move {
-            let (mut user, _) = listener.accept().await.unwrap();
-            let request = read_request(&mut user).await;
-            assert!(request.starts_with(b"GET /user "));
-            write_json(&mut user, &json!({"id": 7, "login": "revoot-bot"})).await;
-
             let (mut graphql, _) = listener.accept().await.unwrap();
             let request = read_request(&mut graphql).await;
             assert!(request.starts_with(b"POST /graphql "));
             write_json(
                 &mut graphql,
                 &json!({
-                    "data": {"repository": {"pullRequest": {"reviewThreads": {
+                    "data": {"viewer": {"login": "revoot-bot"}, "repository": {"pullRequest": {"reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_thread",
                             "isResolved": true,

@@ -820,8 +820,22 @@ async fn set_thread_resolved(
 }
 
 async fn authenticated_user(client: &GitHubClient) -> Result<GitHubUser, GitHubReviewError> {
-    let response = client.get(None, &["user"], &[]).await?;
-    serde_json::from_slice(&response.body).map_err(|_| GitHubReviewError::PublicationInventory)
+    let response = client
+        .graphql(&serde_json::json!({
+            "query": "query RevootViewer { viewer { databaseId } }"
+        }))
+        .await?;
+    let envelope: GitHubViewerEnvelope = serde_json::from_slice(&response.body)
+        .map_err(|_| GitHubReviewError::PublicationInventory)?;
+    let user = envelope
+        .errors
+        .is_none()
+        .then_some(envelope.data)
+        .flatten()
+        .map(|data| data.viewer.database_id)
+        .filter(|id| *id > 0)
+        .ok_or(GitHubReviewError::PublicationInventory)?;
+    Ok(GitHubUser { id: user })
 }
 
 async fn list_comments(
@@ -985,6 +999,23 @@ struct GitHubFile {
 #[derive(Clone, Debug, Deserialize)]
 struct GitHubUser {
     id: u64,
+}
+
+#[derive(Deserialize)]
+struct GitHubViewerEnvelope {
+    data: Option<GitHubViewerData>,
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Deserialize)]
+struct GitHubViewerData {
+    viewer: GitHubViewerUser,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubViewerUser {
+    database_id: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1241,18 +1272,6 @@ mod tests {
         }])
         .unwrap();
         let server = tokio::spawn(async move {
-            let (mut inventory_user, _) = listener.accept().await.unwrap();
-            assert!(
-                read_request(&mut inventory_user)
-                    .await
-                    .starts_with(b"GET /user ")
-            );
-            write_json(
-                &mut inventory_user,
-                &serde_json::json!({"id": 7, "login": "revoot-bot"}),
-            )
-            .await;
-
             let (mut inventory, _) = listener.accept().await.unwrap();
             assert!(
                 read_request(&mut inventory)
@@ -1261,7 +1280,7 @@ mod tests {
             );
             write_json(
                 &mut inventory,
-                &serde_json::json!({"data": {"repository": {"pullRequest": {
+                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot"}, "repository": {"pullRequest": {
                     "reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_thread",
@@ -1290,8 +1309,12 @@ mod tests {
             .await;
 
             let (mut user, _) = listener.accept().await.unwrap();
-            assert!(read_request(&mut user).await.starts_with(b"GET /user "));
-            write_json(&mut user, &serde_json::json!({"id": 7})).await;
+            assert!(read_request(&mut user).await.starts_with(b"POST /graphql "));
+            write_json(
+                &mut user,
+                &serde_json::json!({"data": {"viewer": {"databaseId": 7}}}),
+            )
+            .await;
 
             let (mut comments, _) = listener.accept().await.unwrap();
             let request = read_request(&mut comments).await;
@@ -1348,10 +1371,6 @@ mod tests {
             .expect("listener");
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut user, _) = listener.accept().await.unwrap();
-            assert!(read_request(&mut user).await.starts_with(b"GET /user "));
-            write_json(&mut user, &serde_json::json!({"login": "revoot-bot"})).await;
-
             let (mut inventory, _) = listener.accept().await.unwrap();
             assert!(
                 read_request(&mut inventory)
@@ -1360,7 +1379,7 @@ mod tests {
             );
             write_json(
                 &mut inventory,
-                &serde_json::json!({"data": {"repository": {"pullRequest": {
+                &serde_json::json!({"data": {"viewer": {"login": "revoot-bot"}, "repository": {"pullRequest": {
                     "reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_human",
