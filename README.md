@@ -2,6 +2,10 @@
 
 **Independent review for agent-written code.**
 
+**Bring your own keys:** use your Anthropic API key for Claude or your OpenAI
+API key for Codex. Revoot calls the model directly from your machine or CI
+runner—there is no Revoot service or hosted control plane.
+
 Revoot gives every change a fresh reviewer whose job is to make the
 implementation better. It reviews a local branch, GitHub pull request, or
 GitLab merge request; investigates the full checked-out repository; and reports
@@ -12,8 +16,7 @@ complexity, reliability, security, performance, compatibility, or missing
 tests. Revoot is not limited to proving that code is broken. It asks whether the
 change is the best version of itself for the codebase it is joining.
 
-It is an open-source Rust CLI. It runs locally or in your CI job, uses your
-chosen model provider, and requires no Revoot service or hosted control plane.
+It is an open-source Rust CLI that runs locally or in your CI job.
 
 > Revoot is pre-1.0. The product contract is taking shape, but releases and
 > compatibility guarantees are not yet stable.
