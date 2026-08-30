@@ -82,7 +82,9 @@ revoot init gitlab > revoot-review.yml
 Add the generated file to the repository, configure `ANTHROPIC_API_KEY` or
 `OPENAI_API_KEY` as a CI secret, and follow the generated instructions. On
 GitHub, optional Actions variables named `REVOOT_PROVIDER` and `REVOOT_MODEL`
-override the generated `auto` defaults. See the
+override the generated `auto` defaults. The
+[configuration reference](docs/configuration.md) lists every supported
+environment and CI variable, including defaults and precedence. See the
 [GitHub](docs/operations/github-actions.md) and
 [GitLab](docs/operations/gitlab-component.md) guides for permissions and
 self-managed hosts.
@@ -129,8 +131,8 @@ paths = ["src/payments/**"]
 focus = ["authorization", "idempotency"]
 ```
 
-See the [configuration reference](docs/configuration.md) for repository fields,
-every supported environment variable, defaults, credentials, and precedence.
+The [configuration reference](docs/configuration.md) also covers repository
+fields, guidance, budgets, and finding suppressions.
 
 Use `revoot review --help` for command options and `--format json` for
 machine-readable output.
