@@ -76,8 +76,11 @@ anticipated reuse or decomposition without a demonstrated benefit. Do not
 submit acronym-based, generic stylistic, naming, formatting, preference, praise,
 or diff-narration comments. State the observable impact, the improvement, and
 the repository evidence connecting it to the changed line. Challenge each
-hypothesis before calling
-submit_candidate_finding.
+hypothesis before calling submit_candidate_finding. Before submitting, call
+show_diff for every changed path that anchors a finding and inspect relevant
+repository context with read_file or search. If a candidate is suppressed
+because evidence is missing, obtain that evidence and resubmit it once; do not
+merely repeat the candidate.
 Silence is correct when no well-supported improvement remains. Risk describes
 the change surface, not the number or severity of findings. The final overview
 must summarize implementation consequences without retelling the author's
@@ -382,15 +385,20 @@ struct RestrainedAdmission<'a> {
 
 impl CandidateAdmissionHook for RestrainedAdmission<'_> {
     fn admit(&self, candidate: &FindingsEnvelope) -> CandidateAdmission {
-        if self.prior_review_cursor != self.prior_review.discussions().len()
-            || !self.inspected_repository_context
-            || candidate.findings.iter().any(|finding| {
-                self.anchor_paths
-                    .get(&finding.anchor_id)
-                    .is_none_or(|path| !self.inspected_diff_paths.contains(path))
-            })
-        {
-            return CandidateAdmission::Suppress(CandidateSuppressionReason::Policy);
+        if self.prior_review_cursor != self.prior_review.discussions().len() {
+            return CandidateAdmission::Suppress(CandidateSuppressionReason::PriorReviewIncomplete);
+        }
+        if !self.inspected_repository_context {
+            return CandidateAdmission::Suppress(
+                CandidateSuppressionReason::RepositoryContextMissing,
+            );
+        }
+        if candidate.findings.iter().any(|finding| {
+            self.anchor_paths
+                .get(&finding.anchor_id)
+                .is_none_or(|path| !self.inspected_diff_paths.contains(path))
+        }) {
+            return CandidateAdmission::Suppress(CandidateSuppressionReason::DiffEvidenceMissing);
         }
         let owned_lineages = self.prior_review.owned_lineages();
         if candidate.findings.iter().any(|finding| {
@@ -399,7 +407,7 @@ impl CandidateAdmissionHook for RestrainedAdmission<'_> {
                 .as_ref()
                 .is_some_and(|lineage| !owned_lineages.contains(lineage))
         }) {
-            return CandidateAdmission::Suppress(CandidateSuppressionReason::Policy);
+            return CandidateAdmission::Suppress(CandidateSuppressionReason::LineageNotOwned);
         }
         if candidate
             .findings
@@ -1281,7 +1289,11 @@ fn execute_tool(
                 CandidateSubmission::Suppressed(reason) => {
                     evidence.suppressed_candidates =
                         evidence.suppressed_candidates.saturating_add(1);
-                    json!({"status": "suppressed", "reason": suppression_code(reason)})
+                    json!({
+                        "status": "suppressed",
+                        "reason": suppression_code(reason),
+                        "retryable": suppression_retryable(reason),
+                    })
                 }
             }
         }
@@ -1497,9 +1509,22 @@ const fn suppression_code(reason: CandidateSuppressionReason) -> &'static str {
     match reason {
         CandidateSuppressionReason::BelowConfidenceThreshold => "below_confidence_threshold",
         CandidateSuppressionReason::UnsupportedCategory => "unsupported_category",
+        CandidateSuppressionReason::PriorReviewIncomplete => "prior_review_incomplete",
+        CandidateSuppressionReason::RepositoryContextMissing => "repository_context_missing",
+        CandidateSuppressionReason::DiffEvidenceMissing => "diff_evidence_missing",
+        CandidateSuppressionReason::LineageNotOwned => "lineage_not_owned",
         CandidateSuppressionReason::Policy => "policy",
         CandidateSuppressionReason::Duplicate => "duplicate",
     }
+}
+
+const fn suppression_retryable(reason: CandidateSuppressionReason) -> bool {
+    matches!(
+        reason,
+        CandidateSuppressionReason::PriorReviewIncomplete
+            | CandidateSuppressionReason::RepositoryContextMissing
+            | CandidateSuppressionReason::DiffEvidenceMissing
+    )
 }
 
 const fn tool_contract() -> ReviewEngineError {
@@ -2149,6 +2174,16 @@ mod tests {
         assert!(matches!(report.outcome, ReviewOutcome::NoFindings { .. }));
         assert_eq!(report.admitted_candidates, 0);
         assert_eq!(report.suppressed_candidates, 1);
+        let requests = provider.requests.lock().expect("request lock");
+        assert!(requests.iter().any(|request| {
+            request.messages.iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(content, ModelContent::ToolResult { content, is_error: false, .. }
+                        if content.contains("diff_evidence_missing")
+                            && content.contains("\"retryable\":true"))
+                })
+            })
+        }));
     }
 
     #[tokio::test]

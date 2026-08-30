@@ -568,6 +568,10 @@ pub enum CandidateAdmission {
 pub enum CandidateSuppressionReason {
     BelowConfidenceThreshold,
     UnsupportedCategory,
+    PriorReviewIncomplete,
+    RepositoryContextMissing,
+    DiffEvidenceMissing,
+    LineageNotOwned,
     Policy,
     Duplicate,
 }
