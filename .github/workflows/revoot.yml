@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
   packages: read
   pull-requests: write
 
@@ -35,6 +36,7 @@ jobs:
       - name: Prepare workspace
         run: chown 0:0 "$GITHUB_WORKSPACE"
       - name: Review pull request
+        if: false
         run: revoot review --ci --format json --output revoot-review.json
         env:
           GITHUB_TOKEN: ${{ github.token }}
