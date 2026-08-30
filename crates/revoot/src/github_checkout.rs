@@ -313,6 +313,37 @@ pub fn discover_github_repository(
     })
 }
 
+/// Discover a CI-mounted checkout using the Actions event as its host identity.
+///
+/// GitHub mounts the workspace with the runner's host ownership, which commonly
+/// differs from the container user. Repository-local configuration is therefore
+/// ignored; the server and repository identity come from the Actions event and
+/// the checked-out commit is independently verified against the pull request.
+///
+/// # Errors
+///
+/// Rejects unavailable Git metadata and invalid checkout HEADs.
+pub fn discover_github_actions_repository(
+    start: &Path,
+    context: &GitHubCiContext,
+) -> Result<DiscoveredGitHubRepository, GitHubCheckoutError> {
+    let repository = EmbeddedRepository::discover_ci_checkout(start)
+        .map_err(|_| GitHubCheckoutError::NotRepository)?;
+    let root = repository.root().to_path_buf();
+    let head_sha = repository
+        .head()
+        .map_err(|_| GitHubCheckoutError::InvalidHead)?;
+    Ok(DiscoveredGitHubRepository {
+        root,
+        head_sha,
+        remote: DiscoveredGitHubRemote {
+            name: "origin".to_owned(),
+            server: context.server.clone(),
+            repository: context.target_repository.clone(),
+        },
+    })
+}
+
 /// Bind the checked-out HEAD and target remote to Actions context.
 ///
 /// # Errors
@@ -472,6 +503,28 @@ mod tests {
         )
         .expect("enterprise remote");
         assert_eq!(repository.as_str(), "acme/widgets");
+    }
+
+    #[test]
+    fn actions_discovery_uses_event_identity_instead_of_checkout_configuration() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ordinary = discover_github_repository(root, None).expect("workspace checkout");
+        let target_repository = GitHubRepositorySlug::parse("event-owned/repository").unwrap();
+        let context = GitHubCiContext {
+            server: GitHubServer::from_web_origin("https://github.com").unwrap(),
+            target_repository: target_repository.clone(),
+            target_repository_id: GitHubRepositoryId::try_from(42).unwrap(),
+            source_repository: target_repository.clone(),
+            pull_request_number: PullRequestNumber::try_from(7).unwrap(),
+            base_sha: ordinary.head_sha.clone(),
+            head_sha: ordinary.head_sha.clone(),
+            fork: false,
+        };
+
+        let discovered = discover_github_actions_repository(root, &context).expect("CI checkout");
+        assert_eq!(discovered.head_sha, context.head_sha);
+        assert_eq!(discovered.remote.server, context.server);
+        assert_eq!(discovered.remote.repository, target_repository);
     }
 
     #[test]

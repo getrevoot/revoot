@@ -56,12 +56,21 @@ pub(crate) struct EmbeddedRepository {
 
 impl EmbeddedRepository {
     pub(crate) fn discover(start: &Path) -> Result<Self, EmbeddedGitError> {
-        let repository = gix::discover_opts(
-            start,
-            gix::discover::upwards::Options::default(),
-            safe_open_options(),
-        )
-        .map_err(|_| EmbeddedGitError::RepositoryUnavailable)?;
+        Self::discover_with_options(start, safe_open_options())
+    }
+
+    /// Open a CI-mounted checkout without trusting repository-local configuration.
+    pub(crate) fn discover_ci_checkout(start: &Path) -> Result<Self, EmbeddedGitError> {
+        Self::discover_with_options(start, safe_open_options().bail_if_untrusted(false))
+    }
+
+    fn discover_with_options(
+        start: &Path,
+        options: gix::open::Options,
+    ) -> Result<Self, EmbeddedGitError> {
+        let repository =
+            gix::discover_opts(start, gix::discover::upwards::Options::default(), options)
+                .map_err(|_| EmbeddedGitError::RepositoryUnavailable)?;
         let root = repository
             .workdir()
             .ok_or(EmbeddedGitError::RepositoryUnavailable)?

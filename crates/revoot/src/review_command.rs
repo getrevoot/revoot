@@ -33,7 +33,7 @@ use crate::egress_setup::{authorize_configured_provider, authorize_standard_prov
 use crate::git_history::GitHistoryToolbox;
 use crate::github_checkout::{
     DiscoveredGitHubRepository, GitHubCiContext, GitHubRepositorySlug, GitHubServer,
-    classify_github_actions, discover_github_repository,
+    classify_github_actions, discover_github_actions_repository, discover_github_repository,
 };
 use crate::github_review::{
     GitHubReviewContext, GitHubReviewContextOptions, acquire_github_review_context,
@@ -673,8 +673,10 @@ async fn run_async(
         .as_ref()
         .map(|context| &context.server)
         .or(configured_github_server.as_ref());
-    let discovered_github =
-        discover_github_repository(current_directory, expected_github_server).ok();
+    let discovered_github = github_ci.as_ref().map_or_else(
+        || discover_github_repository(current_directory, expected_github_server).ok(),
+        |context| discover_github_actions_repository(current_directory, context).ok(),
+    );
     let origin_policy = GitLabOriginPolicy::default();
     let gitlab_ci = classify_gitlab_ci_environment(string_environment.clone(), &origin_policy);
     let gitlab_ci_active = !matches!(gitlab_ci, revoot_core::GitLabCiContext::Missing { .. });
