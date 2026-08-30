@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
 use revoot_core::{
-    AgentBudgetError, AgentOmission, AgentOmissionReason, AgentProviderTurnError, AgentRun,
-    AgentRunError, AgentTool, AgentTurnPurpose, CancellationToken, CandidateAdmission,
-    CandidateAdmissionError, CandidateAdmissionHook, CandidateSubmission,
-    CandidateSuppressionReason, DirectProviderErrorKind as ProviderErrorKind, ExecutionFact,
-    ExecutionGraph, ExecutionGraphError, ExecutionGraphLimits, ExecutionGraphPlan,
+    AgentBudgetDimension, AgentBudgetError, AgentOmission, AgentOmissionReason,
+    AgentProviderTurnError, AgentRun, AgentRunError, AgentTool, AgentTurnPurpose,
+    CancellationToken, CandidateAdmission, CandidateAdmissionError, CandidateAdmissionHook,
+    CandidateSubmission, CandidateSuppressionReason, DirectProviderErrorKind as ProviderErrorKind,
+    ExecutionFact, ExecutionGraph, ExecutionGraphError, ExecutionGraphLimits, ExecutionGraphPlan,
     ExecutionGraphSummary, ExecutionGraphUsage, ExecutionNodeContribution, ExecutionNodeId,
     ExecutionNodeKind, ExecutionNodeSpec, FindingsEnvelope, InventoryCoverage, LineRange,
     ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestReservation,
@@ -276,12 +276,30 @@ pub enum ReviewEngineErrorKind {
     Internal,
 }
 
+/// Closed, payload-free reason a review budget stopped execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewBudgetDimension {
+    Turns,
+    ModelRequests,
+    ToolCalls,
+    RepositoryFiles,
+    RepositoryBytes,
+    InputTokens,
+    OutputTokens,
+    Cost,
+    CandidateFindings,
+    ElapsedTime,
+    ConversationBytes,
+    ToolResultBytes,
+}
+
 /// A bounded failure with no source, prompt, response body, URL, or credential.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReviewEngineError {
     pub kind: ReviewEngineErrorKind,
     pub provider_kind: Option<ProviderErrorKind>,
     pub provider_status: Option<u16>,
+    pub budget_dimension: Option<ReviewBudgetDimension>,
 }
 
 impl ReviewEngineError {
@@ -290,6 +308,7 @@ impl ReviewEngineError {
             kind,
             provider_kind: None,
             provider_status: None,
+            budget_dimension: None,
         }
     }
 
@@ -298,6 +317,16 @@ impl ReviewEngineError {
             kind: ReviewEngineErrorKind::Provider,
             provider_kind: Some(kind),
             provider_status: status,
+            budget_dimension: None,
+        }
+    }
+
+    const fn budget(dimension: ReviewBudgetDimension) -> Self {
+        Self {
+            kind: ReviewEngineErrorKind::Budget,
+            provider_kind: None,
+            provider_status: None,
+            budget_dimension: Some(dimension),
         }
     }
 }
@@ -321,11 +350,22 @@ impl fmt::Display for ReviewEngineError {
                 None => formatter.write_str("automatic review provider failed"),
             };
         }
+        if self.kind == ReviewEngineErrorKind::Budget {
+            return match self.budget_dimension {
+                Some(dimension) => write!(
+                    formatter,
+                    "automatic review exhausted the {} budget",
+                    budget_dimension_label(dimension)
+                ),
+                None => formatter.write_str("automatic review exhausted a configured budget"),
+            };
+        }
         formatter.write_str(match self.kind {
             ReviewEngineErrorKind::InvalidRequest => "automatic review request is invalid",
             ReviewEngineErrorKind::Cancelled => "automatic review was cancelled",
-            ReviewEngineErrorKind::Budget => "automatic review exhausted a configured budget",
-            ReviewEngineErrorKind::Provider => unreachable!("handled above"),
+            ReviewEngineErrorKind::Budget | ReviewEngineErrorKind::Provider => {
+                unreachable!("handled above")
+            }
             ReviewEngineErrorKind::ProviderContract => {
                 "automatic review provider violated the response contract"
             }
@@ -340,6 +380,23 @@ impl fmt::Display for ReviewEngineError {
             }
             ReviewEngineErrorKind::Internal => "automatic review failed internally",
         })
+    }
+}
+
+const fn budget_dimension_label(dimension: ReviewBudgetDimension) -> &'static str {
+    match dimension {
+        ReviewBudgetDimension::Turns => "turn count",
+        ReviewBudgetDimension::ModelRequests => "model request count",
+        ReviewBudgetDimension::ToolCalls => "tool call count",
+        ReviewBudgetDimension::RepositoryFiles => "repository file count",
+        ReviewBudgetDimension::RepositoryBytes => "repository byte",
+        ReviewBudgetDimension::InputTokens => "input token",
+        ReviewBudgetDimension::OutputTokens => "output token",
+        ReviewBudgetDimension::Cost => "cost",
+        ReviewBudgetDimension::CandidateFindings => "candidate finding count",
+        ReviewBudgetDimension::ElapsedTime => "elapsed time",
+        ReviewBudgetDimension::ConversationBytes => "conversation size",
+        ReviewBudgetDimension::ToolResultBytes => "tool result size",
     }
 }
 
@@ -1366,7 +1423,9 @@ fn strict_input<T: for<'de> Deserialize<'de>>(input: Value) -> Result<T, ReviewE
 fn encode_tool_result(value: &Value, maximum: u64) -> Result<String, ReviewEngineError> {
     let encoded = serde_json::to_string(value).map_err(|_| internal())?;
     if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > maximum {
-        return Err(ReviewEngineError::new(ReviewEngineErrorKind::Budget));
+        return Err(ReviewEngineError::budget(
+            ReviewBudgetDimension::ToolResultBytes,
+        ));
     }
     Ok(encoded)
 }
@@ -1383,7 +1442,9 @@ fn enforce_conversation_bound(
         .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
         .map_err(|_| internal())?;
     if message_bytes.saturating_add(tool_bytes) > maximum {
-        Err(ReviewEngineError::new(ReviewEngineErrorKind::Budget))
+        Err(ReviewEngineError::budget(
+            ReviewBudgetDimension::ConversationBytes,
+        ))
     } else {
         Ok(())
     }
@@ -1443,8 +1504,37 @@ fn map_agent_error(error: AgentRunError) -> ReviewEngineError {
     }
 }
 
-fn map_budget_error(_error: AgentBudgetError) -> ReviewEngineError {
-    ReviewEngineError::new(ReviewEngineErrorKind::Budget)
+fn map_budget_error(error: AgentBudgetError) -> ReviewEngineError {
+    match error {
+        AgentBudgetError::Exhausted(dimension)
+        | AgentBudgetError::ReservationExceeded(dimension) => {
+            ReviewEngineError::budget(map_budget_dimension(dimension))
+        }
+        AgentBudgetError::InvalidLimits(_) => {
+            ReviewEngineError::new(ReviewEngineErrorKind::InvalidRequest)
+        }
+        AgentBudgetError::ClockRegression
+        | AgentBudgetError::ModelRequestInFlight
+        | AgentBudgetError::NoModelRequestInFlight
+        | AgentBudgetError::ModelRequestMismatch => {
+            ReviewEngineError::new(ReviewEngineErrorKind::Internal)
+        }
+    }
+}
+
+const fn map_budget_dimension(dimension: AgentBudgetDimension) -> ReviewBudgetDimension {
+    match dimension {
+        AgentBudgetDimension::Turns => ReviewBudgetDimension::Turns,
+        AgentBudgetDimension::ModelRequests => ReviewBudgetDimension::ModelRequests,
+        AgentBudgetDimension::ToolCalls => ReviewBudgetDimension::ToolCalls,
+        AgentBudgetDimension::RepositoryFiles => ReviewBudgetDimension::RepositoryFiles,
+        AgentBudgetDimension::RepositoryBytes => ReviewBudgetDimension::RepositoryBytes,
+        AgentBudgetDimension::InputTokens => ReviewBudgetDimension::InputTokens,
+        AgentBudgetDimension::OutputTokens => ReviewBudgetDimension::OutputTokens,
+        AgentBudgetDimension::Cost => ReviewBudgetDimension::Cost,
+        AgentBudgetDimension::CandidateFindings => ReviewBudgetDimension::CandidateFindings,
+        AgentBudgetDimension::ElapsedTime => ReviewBudgetDimension::ElapsedTime,
+    }
 }
 
 fn map_repository_error(error: RepositoryToolError) -> ReviewEngineError {
@@ -2262,6 +2352,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "automatic review provider failed (rate limit or API credits exhausted; check provider usage and billing; HTTP 429)"
+        );
+
+        let error = map_budget_error(AgentBudgetError::Exhausted(
+            AgentBudgetDimension::RepositoryFiles,
+        ));
+        assert_eq!(
+            error.to_string(),
+            "automatic review exhausted the repository file count budget"
+        );
+
+        let error = enforce_conversation_bound(&[], &[], 0)
+            .expect_err("zero conversation budget must fail");
+        assert_eq!(
+            error.to_string(),
+            "automatic review exhausted the conversation size budget"
         );
     }
 }
