@@ -408,6 +408,27 @@ impl PreparedReview {
         }
     }
 
+    fn commit_url(&self) -> Option<String> {
+        match self {
+            Self::GitLab(prepared) => {
+                let repository = &prepared.context.checkout.repository;
+                Some(format!(
+                    "{}/{}/-/commit/{}",
+                    repository.remote.origin.as_str(),
+                    repository.remote.project_path.as_str(),
+                    self.head_sha().as_str()
+                ))
+            }
+            Self::GitHub(prepared) => Some(format!(
+                "{}/{}/commit/{}",
+                prepared.context.repository.remote.server.web_origin,
+                prepared.context.repository.remote.repository.as_str(),
+                self.head_sha().as_str()
+            )),
+            Self::Local(_) => None,
+        }
+    }
+
     fn manifest_sha256(&self) -> &revoot_core::Sha256Digest {
         match &self.partition().snapshot {
             ReviewSnapshotIdentity::GitLab(identity) => &identity.exact_diff_manifest_sha256,
@@ -1713,6 +1734,7 @@ async fn publish_prepared_review(
         provider,
         model,
         prepared.head_sha(),
+        prepared.commit_url().as_deref(),
         job_url,
         checkpoint,
     ) {
@@ -1810,15 +1832,22 @@ fn render_overview(
     provider: &str,
     model: &str,
     head_sha: &GitSha,
+    commit_url: Option<&str>,
     job_url: Option<&str>,
     checkpoint: ReviewCheckpoint,
 ) -> Result<Option<String>, CanonicalPublication> {
     let Some(overview) = report.overview.as_ref() else {
         return Ok(None);
     };
-    let metadata = ReviewRunMetadata::try_new(provider, model, head_sha.clone(), job_url)
-        .map_err(|_| CanonicalPublication::terminal("failed", Some("overview_metadata_invalid")))?
-        .with_checkpoint(checkpoint);
+    let Some(commit_url) = commit_url else {
+        return Ok(None);
+    };
+    let metadata =
+        ReviewRunMetadata::try_new(provider, model, head_sha.clone(), commit_url, job_url)
+            .map_err(|_| {
+                CanonicalPublication::terminal("failed", Some("overview_metadata_invalid"))
+            })?
+            .with_checkpoint(checkpoint);
     render_review_overview(overview, &metadata)
         .map(Some)
         .map_err(|_| CanonicalPublication::terminal("failed", Some("overview_render_failed")))
