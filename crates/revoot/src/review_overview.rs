@@ -23,7 +23,8 @@ const MAX_ASSUMPTIONS: usize = 6;
 const MAX_MANUAL_VALIDATIONS: usize = 4;
 const MAX_ITEM_BYTES: usize = 400;
 const MAX_PROVIDER_MODEL_BYTES: usize = 256;
-const MAX_JOB_URL_BYTES: usize = 2_048;
+const MAX_METADATA_URL_BYTES: usize = 2_048;
+const REVOOT_HOMEPAGE: &str = "https://github.com/getrevoot/revoot";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +116,7 @@ impl ReviewOverview {
 pub struct ReviewRunMetadata {
     provider_model: String,
     commit: GitSha,
+    commit_url: String,
     job_url: Option<String>,
     checkpoint: Option<ReviewCheckpoint>,
 }
@@ -129,6 +131,7 @@ impl ReviewRunMetadata {
         provider: &str,
         model: &str,
         commit: GitSha,
+        commit_url: &str,
         job_url: Option<&str>,
     ) -> Result<Self, ReviewOverviewError> {
         if !valid_identifier(provider) || !valid_identifier(model) {
@@ -138,10 +141,12 @@ impl ReviewRunMetadata {
         if provider_model.len() > MAX_PROVIDER_MODEL_BYTES {
             return Err(ReviewOverviewError::InvalidMetadata);
         }
-        let job_url = job_url.map(validate_job_url).transpose()?;
+        let commit_url = validate_metadata_url(commit_url)?;
+        let job_url = job_url.map(validate_metadata_url).transpose()?;
         Ok(Self {
             provider_model,
             commit,
+            commit_url,
             job_url,
             checkpoint: None,
         })
@@ -226,9 +231,11 @@ pub fn render_review_overview(
         &overview.manual_validations,
     );
 
-    output.push_str("\n<sub>revoot/");
+    output.push_str("\n<sub><a href=\"");
+    output.push_str(REVOOT_HOMEPAGE);
+    output.push_str("\">revoot/");
     output.push_str(env!("CARGO_PKG_VERSION"));
-    output.push(' ');
+    output.push_str("</a> ");
     if let Some(job_url) = &metadata.job_url {
         output.push_str("<a href=\"");
         output.push_str(&escape_attribute(job_url));
@@ -236,10 +243,12 @@ pub fn render_review_overview(
     } else {
         output.push_str("reviewed");
     }
-    output.push_str(" via <code>");
-    output.push_str(&escape_text(&metadata.provider_model));
-    output.push_str("</code> at <code>");
+    output.push_str(" at <a href=\"");
+    output.push_str(&escape_attribute(&metadata.commit_url));
+    output.push_str("\"><code>");
     output.push_str(&metadata.commit.as_str()[..12]);
+    output.push_str("</code></a> using <code>");
+    output.push_str(&escape_text(&metadata.provider_model));
     output.push_str("</code></sub>\n");
     if let Some(checkpoint) = &metadata.checkpoint {
         output.push_str(&checkpoint.render());
@@ -324,8 +333,8 @@ fn valid_identifier(value: &str) -> bool {
         })
 }
 
-fn validate_job_url(value: &str) -> Result<String, ReviewOverviewError> {
-    if value.len() > MAX_JOB_URL_BYTES {
+fn validate_metadata_url(value: &str) -> Result<String, ReviewOverviewError> {
+    if value.len() > MAX_METADATA_URL_BYTES {
         return Err(ReviewOverviewError::InvalidMetadata);
     }
     let url = Url::parse(value).map_err(|_| ReviewOverviewError::InvalidMetadata)?;
@@ -393,6 +402,7 @@ mod tests {
             "anthropic",
             "claude-opus-5",
             GitSha::try_from("a".repeat(40)).unwrap(),
+            "https://github.com/acme/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             Some("https://github.com/acme/repo/actions/runs/42"),
         )
         .unwrap()
@@ -429,9 +439,14 @@ mod tests {
             rendered
                 .contains("<a href=\"https://github.com/acme/repo/actions/runs/42\">reviewed</a>")
         );
-        assert!(rendered.contains(concat!("revoot/", env!("CARGO_PKG_VERSION"))));
-        assert!(rendered.contains("<code>anthropic/claude-opus-5</code>"));
-        assert!(rendered.contains("<code>aaaaaaaaaaaa</code>"));
+        assert!(rendered.contains(concat!(
+            "<a href=\"https://github.com/getrevoot/revoot\">revoot/",
+            env!("CARGO_PKG_VERSION"),
+            "</a>"
+        )));
+        assert!(rendered.contains(
+            "reviewed</a> at <a href=\"https://github.com/acme/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><code>aaaaaaaaaaaa</code></a> using <code>anthropic/claude-opus-5</code>"
+        ));
         assert_eq!(
             crate::review_checkpoint::extract_checkpoint(&rendered),
             Some(checkpoint)
@@ -495,7 +510,18 @@ mod tests {
                 "anthropic",
                 "model",
                 GitSha::try_from("b".repeat(40)).unwrap(),
+                "https://github.com/acme/repo/commit/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 Some("javascript:alert(1)"),
+            )
+            .is_err()
+        );
+        assert!(
+            ReviewRunMetadata::try_new(
+                "anthropic",
+                "model",
+                GitSha::try_from("b".repeat(40)).unwrap(),
+                "javascript:alert(1)",
+                None,
             )
             .is_err()
         );
