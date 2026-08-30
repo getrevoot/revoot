@@ -1,13 +1,8 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="logo-dark.svg">
-    <img src="logo.svg" alt="Revoot" width="180">
-  </picture>
+  <img src="logo.svg" alt="Revoot" width="180">
 </p>
 
-# Revoot
-
-**Agentic code review made easy.**
+<p align="center"><strong>Agentic code review made easy.</strong></p>
 
 Revoot is an independent AI reviewer built for agent-written code—not a wrapper
 that stuffs one giant diff into a prompt. Its review engine ranks changed files

@@ -65,7 +65,8 @@ fn readme_prioritizes_ci_and_documents_distributions() {
     assert!(readme.contains("revoot-linux-arm64.tar.gz"));
     assert!(readme.contains("revoot-macos-arm64.tar.gz"));
     assert!(readme.contains("SHA256SUMS"));
-    assert!(readme.contains("logo-dark.svg"));
+    assert!(readme.contains("logo.svg"));
+    assert!(!readme.contains("logo-dark.svg"));
     assert!(!readme.contains("mise use --global"));
 }
 
