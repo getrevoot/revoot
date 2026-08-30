@@ -33,9 +33,9 @@ implementation, risk, material concerns, and validation gaps.
 ### Required CI variables
 
 - Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a secret.
-- GitHub's built-in `GITHUB_TOKEN` can publish findings and the summary. Add a
-  fine-grained PAT as `REVOOT_GITHUB_TOKEN` if Revoot should also resolve and
-  reopen its review threads automatically.
+- GitHub's built-in `GITHUB_TOKEN` publishes findings and the summary, preserves
+  lineage state, and prevents duplicate comments. Automatic GitHub conversation
+  resolution is optional and never requires a developer PAT.
 - GitLab needs a masked `REVOOT_GITLAB_TOKEN` with API access to publish inline
   discussions and update the merge-request summary. Revoot treats
   `CI_JOB_TOKEN` as read-only.

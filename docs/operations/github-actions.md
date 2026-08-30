@@ -15,13 +15,28 @@ organization secret. Optional Actions variables `REVOOT_PROVIDER` and
 
 No extra GitHub token is required to publish comments and the evolving summary.
 The generated workflow grants its short-lived `GITHUB_TOKEN` repository read
-and pull-request write access; comments appear as `github-actions[bot]`.
+and pull-request write access; comments appear as `github-actions[bot]`. Revoot
+embeds lineage metadata in those comments and the overview, so fixed findings,
+duplicate prevention, human resolution, and recurrence tracking do not depend
+on GitHub's conversation-resolution mutation.
 
 GitHub does not allow that Actions installation token to resolve or reopen
-review threads. For the full lifecycle, create a fine-grained PAT for a bot or
-user with pull-request read/write access and save it as the repository secret
-`REVOOT_GITHUB_TOKEN`. Revoot will prefer it automatically. Human-resolved
-threads are still read and respected when this optional secret is absent.
+review threads. Revoot treats that denial as non-fatal: publication and the
+checkpoint complete, the report records
+`github_thread_resolution_unavailable`, and the conversation remains available
+for manual resolution. An outdated conversation is not the same as a resolved
+conversation; changing its code does not automatically mark it resolved.
+
+If automatic resolve and reopen behavior is required, use a private GitHub App
+installed only on the target repositories with pull-request read/write access.
+Generate its short-lived installation token in the workflow and pass that token
+as `REVOOT_GITHUB_TOKEN`. Do not use a developer's personal access token for
+durable CI automation. GitHub recommends Apps for organization automation and
+long-lived integrations; see [deciding when to build a GitHub App][github-app]
+and [authenticating as an installation][github-app-token].
+
+[github-app]: https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/deciding-when-to-build-a-github-app
+[github-app-token]: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation
 
 ## Scheduling and forks
 
@@ -37,9 +52,11 @@ provider credential can be supplied safely.
 ## Subsequent pushes
 
 Revoot reads existing review threads before each run. It updates one summary,
-re-anchors open findings when needed, and does not repeat resolved findings
-unless semantic review confirms that the issue recurred. Embedded metadata
-identifies Revoot-owned comments; the pull request remains the state store.
+re-anchors findings when needed, and does not repeat an established finding
+unless semantic review confirms that the issue recurred. Human-resolved
+findings remain suppressed unless review establishes a materially new
+occurrence. Embedded metadata identifies Revoot-owned comments; the pull
+request remains the state store.
 
 Revoot checks the pull-request head and discussion state again before writing.
 It stops publication if either changed during the review. Human and other bot
