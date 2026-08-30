@@ -271,3 +271,43 @@ fn generated_github_onboarding_contract_is_bounded_and_matches_ci_asset() {
         "GitHub workflow generation exceeded the ten-minute onboarding budget"
     );
 }
+
+#[test]
+fn configuration_reference_lists_operator_environment() {
+    let reference = fs::read_to_string(workspace_root().join("docs/configuration.md"))
+        .expect("configuration reference");
+    for variable in [
+        "REVOOT_PROVIDER",
+        "REVOOT_MODEL",
+        "REVOOT_REVIEW_MODEL",
+        "REVOOT_REVIEW_CONTEXT_LINES",
+        "REVOOT_MINIMUM_CONFIDENCE",
+        "REVOOT_MAX_FILES",
+        "REVOOT_MAX_INPUT_BYTES",
+        "REVOOT_MAX_FINDINGS",
+        "REVOOT_MAX_MODEL_REQUESTS",
+        "REVOOT_DEADLINE_SECONDS",
+        "REVOOT_PUBLICATION_ENABLED",
+        "REVOOT_FORK_BEHAVIOR",
+        "REVOOT_GITHUB_SERVER_URL",
+        "REVOOT_GITHUB_CA_BUNDLE_FILE",
+        "REVOOT_GITHUB_PRIVATE_CIDRS",
+        "REVOOT_GITLAB_CA_BUNDLE_FILE",
+        "REVOOT_GITLAB_PRIVATE_CIDRS",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "REVOOT_MODEL_TOKEN",
+        "REVOOT_GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "REVOOT_GITLAB_TOKEN",
+        "GITLAB_TOKEN",
+        "REVOOT_GITLAB_BEARER_TOKEN",
+        "CI_JOB_TOKEN",
+    ] {
+        assert!(
+            reference.contains(&format!("`{variable}`")),
+            "configuration reference omitted {variable}"
+        );
+    }
+}

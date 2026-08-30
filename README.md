@@ -129,8 +129,8 @@ paths = ["src/payments/**"]
 focus = ["authorization", "idempotency"]
 ```
 
-See the [configuration reference](docs/configuration.md) for available fields,
-budgets, repository guidance, and expiring finding suppressions.
+See the [configuration reference](docs/configuration.md) for repository fields,
+every supported environment variable, defaults, credentials, and precedence.
 
 Use `revoot review --help` for command options and `--format json` for
 machine-readable output.

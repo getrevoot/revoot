@@ -50,6 +50,71 @@ increases attention to its listed concerns; it does not disable correctness,
 security, reliability, compatibility, data-loss, concurrency, or performance
 analysis elsewhere.
 
+## Environment variables
+
+Environment variables are operator-owned configuration. Command-line options
+take precedence over them; repository `.revoot.toml` settings do not control
+provider credentials, model selection, publication, or network access. Integer
+values must be unsigned decimal numbers, booleans must be exactly `true` or
+`false`, and comma-separated lists must not contain empty entries.
+
+### Provider and review
+
+| Variable | Default | Value and effect |
+| --- | --- | --- |
+| `REVOOT_PROVIDER` | `auto` | `auto`, `anthropic`, or `openai`. `auto` selects the available key; if both keys exist, Anthropic wins. |
+| `REVOOT_MODEL` | `auto` | `auto` selects the provider's catalog default. Any other value is passed as the provider model ID. |
+| `REVOOT_REVIEW_MODEL` | `auto` | Compatibility alias for `REVOOT_MODEL`. Do not set both. |
+| `REVOOT_REVIEW_CONTEXT_LINES` | `40` | Unsigned diff context radius; effective range `0` through `200`. |
+| `REVOOT_MINIMUM_CONFIDENCE` | `70` | Unsigned minimum finding confidence; effective range `70` through `100`. |
+| `REVOOT_MAX_FILES` | `100` | Unsigned selected-file limit; effective range `1` through `100`. |
+| `REVOOT_MAX_INPUT_BYTES` | `1000000` | Unsigned selected-diff byte limit; effective range `1` through `1000000`. |
+| `REVOOT_MAX_FINDINGS` | `25` | Unsigned candidate-finding limit; effective range `1` through `25`. |
+| `REVOOT_MAX_MODEL_REQUESTS` | `20` | Unsigned provider-request limit; effective range `1` through `20`. |
+| `REVOOT_DEADLINE_SECONDS` | `600` | Unsigned review deadline; effective range `1` through `600` seconds. |
+| `REVOOT_PUBLICATION_ENABLED` | `false` | Whether a host-backed review may publish comments. Generated CI sets this to `true`. |
+| `REVOOT_FORK_BEHAVIOR` | `skip` | GitLab fork behavior: `skip` or `report-only`. GitHub fork behavior is encoded in the generated workflow. |
+
+The product bounds shown above are final ceilings. A repository configuration
+may request lower limits, while an environment variable or CLI option can
+override that request only within the product bounds.
+
+### Code-host network
+
+| Variable | Default | Accepted value and effect |
+| --- | --- | --- |
+| `REVOOT_GITHUB_SERVER_URL` | inferred | Exact HTTPS web origin for GitHub Enterprise Server, such as `https://github.example.com`. |
+| `REVOOT_GITHUB_CA_BUNDLE_FILE` | unset | PEM CA bundle used for the configured GitHub host. |
+| `REVOOT_GITHUB_PRIVATE_CIDRS` | unset | Comma-separated private CIDRs allowed for a self-managed GitHub host; at most 16. |
+| `REVOOT_GITLAB_CA_BUNDLE_FILE` | unset | PEM CA bundle used for the discovered GitLab host. |
+| `REVOOT_GITLAB_PRIVATE_CIDRS` | unset | Comma-separated private CIDRs allowed for a self-managed GitLab host; at most 16. |
+
+Private CIDR exceptions apply only to the corresponding code host. They do not
+expand provider API access.
+
+### Credentials
+
+Store these as CI secrets, not repository variables or `.revoot.toml` values.
+
+| Variable | Purpose and precedence |
+| --- | --- |
+| `ANTHROPIC_API_KEY` | Anthropic provider credential. |
+| `OPENAI_API_KEY` | OpenAI provider credential. |
+| `REVOOT_MODEL_TOKEN` | Compatibility alias for `OPENAI_API_KEY`; setting both is rejected. |
+| `REVOOT_GITHUB_TOKEN` | GitHub token; preferred over `GH_TOKEN`, then `GITHUB_TOKEN`. |
+| `GH_TOKEN` | GitHub CLI-compatible token; used when `REVOOT_GITHUB_TOKEN` is absent. |
+| `GITHUB_TOKEN` | GitHub Actions token; used when the other GitHub token variables are absent. |
+| `REVOOT_GITLAB_TOKEN` | GitLab private token with read and write access; highest precedence. |
+| `GITLAB_TOKEN` | GitLab private token used when `REVOOT_GITLAB_TOKEN` is absent. |
+| `REVOOT_GITLAB_BEARER_TOKEN` | GitLab OAuth bearer token used when private-token variables are absent. |
+| `CI_JOB_TOKEN` | GitLab job token fallback. It can read merge-request data but cannot publish discussions. |
+
+GitHub Actions repository or organization variables named `REVOOT_PROVIDER`
+and `REVOOT_MODEL` are mapped into the generated review job, with `auto` as the
+fallback for each. GitHub and GitLab also inject host-owned CI metadata; those
+platform variables identify the pull or merge request and are not Revoot
+configuration knobs.
+
 ## Automatic attention budgeting
 
 Before model execution, Revoot assigns every exact changed file a deterministic
@@ -103,9 +168,11 @@ never controls its own review. In CI, Revoot also requires the configuration
 commit to match the authoritative host snapshot before model execution. A
 configuration change becomes active after merge.
 
-Product and organization policy always clamp repository requests.
-Provider/model choice, credentials, private-network exceptions, publication,
-and other operator settings remain trusted environment or CLI policy.
+Product policy always clamps repository and operator requests. Effective
+precedence is CLI, environment, trusted local configuration, repository
+configuration, then compiled defaults. Provider/model choice, credentials,
+private-network exceptions, publication, and other operator settings remain
+trusted environment or CLI policy.
 
 Use `revoot config explain --base-config .revoot.toml --json` to inspect scalar
 provenance, effective policy clamps, structured rules, and suppressions without
