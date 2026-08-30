@@ -298,11 +298,21 @@ impl ReviewEngineError {
 
 impl fmt::Display for ReviewEngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.kind == ReviewEngineErrorKind::Provider {
+            return match self.provider_kind {
+                Some(kind) => write!(
+                    formatter,
+                    "automatic review provider failed ({})",
+                    provider_error_label(kind)
+                ),
+                None => formatter.write_str("automatic review provider failed"),
+            };
+        }
         formatter.write_str(match self.kind {
             ReviewEngineErrorKind::InvalidRequest => "automatic review request is invalid",
             ReviewEngineErrorKind::Cancelled => "automatic review was cancelled",
             ReviewEngineErrorKind::Budget => "automatic review exhausted a configured budget",
-            ReviewEngineErrorKind::Provider => "automatic review provider failed",
+            ReviewEngineErrorKind::Provider => unreachable!("handled above"),
             ReviewEngineErrorKind::ProviderContract => {
                 "automatic review provider violated the response contract"
             }
@@ -317,6 +327,20 @@ impl fmt::Display for ReviewEngineError {
             }
             ReviewEngineErrorKind::Internal => "automatic review failed internally",
         })
+    }
+}
+
+const fn provider_error_label(kind: ProviderErrorKind) -> &'static str {
+    match kind {
+        ProviderErrorKind::InvalidRequest => "invalid request",
+        ProviderErrorKind::Authentication => "authentication",
+        ProviderErrorKind::PermissionDenied => "permission denied",
+        ProviderErrorKind::RateLimited => "rate limited",
+        ProviderErrorKind::Timeout => "timeout",
+        ProviderErrorKind::Cancelled => "cancelled",
+        ProviderErrorKind::Unavailable => "unavailable",
+        ProviderErrorKind::Protocol => "invalid response",
+        ProviderErrorKind::ResponseTooLarge => "response too large",
     }
 }
 
@@ -2177,7 +2201,10 @@ mod tests {
     #[test]
     fn errors_do_not_retain_provider_or_tool_payloads() {
         let error = ReviewEngineError::provider(ProviderErrorKind::Authentication);
-        assert_eq!(error.to_string(), "automatic review provider failed");
+        assert_eq!(
+            error.to_string(),
+            "automatic review provider failed (authentication)"
+        );
         let encoded = format!("{error:?}");
         assert!(!encoded.contains("token"));
         assert!(!encoded.contains("src/"));
