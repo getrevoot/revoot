@@ -55,8 +55,14 @@ and selected repository context are sent directly to your configured provider.
 
 ## Run in CI
 
-CI reviews publish inline findings and maintain a compact overview on the pull
-or merge request.
+CI reviews publish each actionable finding as a native review comment anchored
+to the relevant changed line. Revoot also maintains one compact summary in the
+pull or merge request description, covering the implementation, overall risk,
+material concerns, and validation gaps.
+
+As new commits are pushed, Revoot updates that summary in place and reconciles
+the existing line comments with the latest code. The review evolves with the
+change instead of appending a disconnected report on every run.
 
 For GitHub Actions:
 
