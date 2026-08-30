@@ -21,6 +21,12 @@ and `pull-requests: write`, checks out the exact pull-request head with persiste
 credentials disabled, and invokes the single `revoot review --ci` operation.
 All referenced actions are pinned to full commit IDs.
 
+The generated workflow uses optional Actions repository or organization
+variables named `REVOOT_PROVIDER` and `REVOOT_MODEL`. When unset, each falls
+back to `auto`; with one provider secret configured, Revoot selects that
+provider and its default model. Use variables—not secrets—for these non-secret
+choices when a repository needs an explicit provider or model.
+
 The generated workflow starts alongside other pull-request workflows. GitHub
 has no repository-wide final stage, and dependencies cannot cross workflow
 files. To run Revoot after particular checks, place its job in the same workflow

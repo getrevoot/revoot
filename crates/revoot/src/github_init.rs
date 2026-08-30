@@ -66,9 +66,11 @@ pub fn render_github_actions(options: &GitHubInitOptions) -> Result<String, GitH
     } else {
         ""
     };
+    let provider = format!("${{{{ vars.REVOOT_PROVIDER || '{}' }}}}", options.provider);
+    let model = format!("${{{{ vars.REVOOT_MODEL || '{}' }}}}", options.model);
     Ok(format!(
         "name: Revoot review\n\non:\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\n\npermissions:\n  contents: read\n  pull-requests: write\n\nconcurrency:\n  group: revoot-${{{{ github.event.pull_request.number }}}}\n  cancel-in-progress: true\n\njobs:\n  review:\n    if: github.event.pull_request.draft == false{fork_condition}\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    container:\n      image: {}\n    steps:\n      - uses: {CHECKOUT_ACTION}\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n          ref: ${{{{ github.event.pull_request.head.sha }}}}\n      - name: Review pull request\n        run: revoot review --ci --format json --output revoot-review.json\n        env:\n          GITHUB_TOKEN: ${{{{ github.token }}}}\n          ANTHROPIC_API_KEY: ${{{{ secrets.ANTHROPIC_API_KEY }}}}\n          OPENAI_API_KEY: ${{{{ secrets.OPENAI_API_KEY }}}}\n          REVOOT_PROVIDER: {}\n          REVOOT_MODEL: {}\n          REVOOT_FORK_BEHAVIOR: {}\n          REVOOT_PUBLICATION_ENABLED: \"true\"\n      - name: Upload report\n        if: always()\n        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02\n        with:\n          name: revoot-review\n          path: revoot-review.json\n          if-no-files-found: ignore\n          retention-days: 7\n",
-        options.image, options.provider, options.model, options.fork_behavior
+        options.image, provider, model, options.fork_behavior
     ))
 }
 
@@ -93,7 +95,8 @@ mod tests {
         assert!(workflow.contains("pull-requests: write"));
         assert!(workflow.contains("head.repo.full_name == github.repository"));
         assert!(workflow.contains("REVOOT_PUBLICATION_ENABLED: \"true\""));
-        assert!(workflow.contains("REVOOT_PROVIDER: auto"));
+        assert!(workflow.contains("REVOOT_PROVIDER: ${{ vars.REVOOT_PROVIDER || 'auto' }}"));
+        assert!(workflow.contains("REVOOT_MODEL: ${{ vars.REVOOT_MODEL || 'auto' }}"));
         assert!(!workflow.contains("pull_request_target"));
         assert!(!workflow.contains("workflow_run"));
         assert!(!workflow.contains("@main"));
@@ -106,5 +109,18 @@ mod tests {
             ..GitHubInitOptions::default()
         };
         assert_eq!(render_github_actions(&options), Err(GitHubInitError::Image));
+    }
+
+    #[test]
+    fn workflow_variables_override_generated_fallbacks() {
+        let workflow = render_github_actions(&GitHubInitOptions {
+            provider: "openai".to_owned(),
+            model: "gpt-5.3-codex".to_owned(),
+            ..GitHubInitOptions::default()
+        })
+        .expect("workflow");
+
+        assert!(workflow.contains("REVOOT_PROVIDER: ${{ vars.REVOOT_PROVIDER || 'openai' }}"));
+        assert!(workflow.contains("REVOOT_MODEL: ${{ vars.REVOOT_MODEL || 'gpt-5.3-codex' }}"));
     }
 }

@@ -80,7 +80,9 @@ revoot init gitlab > revoot-review.yml
 ```
 
 Add the generated file to the repository, configure `ANTHROPIC_API_KEY` or
-`OPENAI_API_KEY` as a CI secret, and follow the generated instructions. See the
+`OPENAI_API_KEY` as a CI secret, and follow the generated instructions. On
+GitHub, optional Actions variables named `REVOOT_PROVIDER` and `REVOOT_MODEL`
+override the generated `auto` defaults. See the
 [GitHub](docs/operations/github-actions.md) and
 [GitLab](docs/operations/gitlab-component.md) guides for permissions and
 self-managed hosts.
