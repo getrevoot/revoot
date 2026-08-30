@@ -176,11 +176,13 @@ jobs:
           path: dist
       - name: Prepare release checksums
         run: mise run release:checksums
+      - name: Prepare release notes
+        run: mise run release:notes
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=(--verify-tag --generate-notes)
+          flags=(--verify-tag --notes-file dist/release-notes.md)
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             flags+=(--prerelease)
           fi
@@ -190,6 +192,7 @@ jobs:
             dist/image-digest.txt
           )
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file dist/release-notes.md
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
           else
             gh release create "$GITHUB_REF_NAME" "${assets[@]}" "${flags[@]}"

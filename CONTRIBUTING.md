@@ -23,6 +23,12 @@ Provider adapters must follow the
 preserve the supported Linux AMD64/ARM64 musl and Apple Silicon targets and pass
 the relevant packaging tasks.
 
+Write commit subjects using Conventional Commit prefixes when the change affects
+a release: `feat:` for features, `fix:` for fixes, and `!` or a
+`BREAKING CHANGE:` footer for incompatible changes. Release-plz uses the commits
+since the previous tag to propose the next version and changelog in a release
+pull request; maintainers may edit those generated notes for clarity.
+
 Never commit credentials, private repository source, raw prompts, raw model
 responses, or private fixtures. By contributing, you agree that your
 contribution is licensed under Apache-2.0, as described in section 5 of the

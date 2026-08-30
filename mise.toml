@@ -6,6 +6,7 @@ rust = { version = "1.97.1", profile = "default", components = ["clippy", "rustf
 ] }
 "cargo:cargo-nextest" = "0.9"
 "cargo:cargo-zigbuild" = "0.23"
+release-plz = "0.3"
 zig = "0.16"
 
 [tasks.build]
@@ -56,8 +57,16 @@ description = "Optionally run one provider through the review scenario corpus"
 run = "cargo test --locked -p revoot --test live_review_quality live_full_checkout_quality -- --ignored --exact --nocapture"
 
 [tasks."release:version"]
-description = "Require the release tag to match the Cargo package version"
+description = "Require the release tag, Cargo package version, and changelog to agree"
 run = "bash scripts/check-release-version.sh"
+
+[tasks."release:pr"]
+description = "Open or update the release preparation pull request"
+run = "release-plz release-pr --config release-plz.toml"
+
+[tasks."release:notes"]
+description = "Extract the current tagged release notes from the changelog"
+run = "bash scripts/extract-release-notes.sh"
 
 [tasks."install:cargo:smoke"]
 description = "Install the current source tree with Cargo and smoke-test the isolated binary"
