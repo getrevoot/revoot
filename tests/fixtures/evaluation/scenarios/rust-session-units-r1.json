@@ -1,0 +1,22 @@
+{
+  "schema_version": "revoot.evaluation-scenario/v1",
+  "case_id": "rust/session-units-r1",
+  "sequence_id": "rust/session-units",
+  "revision": 1,
+  "clean_change": false,
+  "base_sha": "4444444444444444444444444444444444444444",
+  "start_sha": "5555555555555555555555555555555555555555",
+  "head_sha": "6666666666666666666666666666666666666666",
+  "old_path": "src/session.rs",
+  "new_path": "src/session.rs",
+  "change_kind": "modified",
+  "exact_diff": "@@ -1,3 +1,3 @@\n pub fn expires_at(now: u64, config: &crate::Config) -> u64 {\n-    now + config.session_timeout_seconds\n+    now_millis() + config.session_timeout_seconds\n }\n",
+  "checkout_files": {
+    "Cargo.toml": "[package]\nname = \"session-service\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    "src/lib.rs": "pub mod session;\npub struct Config { pub session_timeout_seconds: u64 }\n",
+    "src/session.rs": "pub fn expires_at(now: u64, config: &crate::Config) -> u64 {\n    now_millis() + config.session_timeout_seconds\n}\n"
+  },
+  "expected_defects": [
+    { "side": "new", "line": 2, "category": "reliability" }
+  ]
+}

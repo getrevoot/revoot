@@ -1,0 +1,16 @@
+{
+  "schema_version": "revoot.findings/v1",
+  "work_unit_id": "wu-0001",
+  "findings": [
+    {
+      "anchor_id": "ga1_1111111111111111111111111111111111111111111111111111111111111111",
+      "severity": "high",
+      "confidence_percent": 95,
+      "category": "security",
+      "title": "Unchecked authorization boundary",
+      "explanation": "The changed branch performs the mutation before the authorization decision.",
+      "evidence": "The mutation anchor precedes the only authorization anchor in this work unit."
+    }
+  ],
+  "summary": "One high-confidence security finding was identified."
+}

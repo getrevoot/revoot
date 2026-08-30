@@ -1,0 +1,19 @@
+{
+  "schema_version": "revoot.evaluation-scenario/v1",
+  "case_id": "principles/solid-responsibility-without-consequence",
+  "sequence_id": null,
+  "revision": 1,
+  "clean_change": true,
+  "base_sha": "4040404040404040404040404040404040404040",
+  "start_sha": "5050505050505050505050505050505050505050",
+  "head_sha": "6060606060606060606060606060606060606060",
+  "old_path": "src/labels.rs",
+  "new_path": "src/labels.rs",
+  "change_kind": "modified",
+  "exact_diff": "@@ -1,6 +1,7 @@\n pub fn label(name: &str) -> Option<String> {\n-    if name.is_empty() {\n+    let normalized = name.trim();\n+    if normalized.is_empty() {\n         None\n     } else {\n-        Some(name.to_uppercase())\n+        Some(normalized.to_uppercase())\n     }\n",
+  "checkout_files": {
+    "Cargo.toml": "[package]\nname = \"labels\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    "src/labels.rs": "pub fn label(name: &str) -> Option<String> {\n    let normalized = name.trim();\n    if normalized.is_empty() {\n        None\n    } else {\n        Some(normalized.to_uppercase())\n    }\n}\n"
+  },
+  "expected_defects": []
+}

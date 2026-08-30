@@ -1,0 +1,22 @@
+{
+  "schema_version": "revoot.evaluation-scenario/v1",
+  "case_id": "typescript/cross-file-timeout-units",
+  "sequence_id": null,
+  "revision": 1,
+  "clean_change": false,
+  "base_sha": "1111111111111111111111111111111111111111",
+  "start_sha": "2222222222222222222222222222222222222222",
+  "head_sha": "3333333333333333333333333333333333333333",
+  "old_path": "src/retry.ts",
+  "new_path": "src/retry.ts",
+  "change_kind": "modified",
+  "exact_diff": "@@ -1,3 +1,3 @@\n export function retryDelay(seconds: number): number {\n-  return seconds * 1000;\n+  return seconds;\n }\n",
+  "checkout_files": {
+    "package.json": "{\"name\":\"timeout-service\",\"private\":true}\n",
+    "src/retry.ts": "export function retryDelay(seconds: number): number {\n  return seconds;\n}\n",
+    "src/worker.ts": "import { retryDelay } from './retry';\nexport function retry(task: () => void) { setTimeout(task, retryDelay(30)); }\n"
+  },
+  "expected_defects": [
+    { "side": "new", "line": 2, "category": "correctness" }
+  ]
+}

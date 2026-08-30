@@ -1,0 +1,27 @@
+#compdef revoot
+
+_revoot() {
+  local -a commands
+  commands=(
+    'config:Explain effective review configuration'
+    'init:Generate integration configuration'
+    'doctor:Report host and product readiness'
+    'review:Review the current local change or a code-host change request'
+    'completions:Generate shell completions'
+    'version:Print the Revoot version'
+    'help:Show command help'
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+  case $words[2] in
+    review) _arguments '--base[Local comparison base]:git ref:' '--ci[Use code-host CI context]' '--mr[GitLab merge request IID]:iid:' '--pr[GitHub pull request number]:number:' '--repo[GitHub target repository]:owner/repository:' '--format[Report format]:format:(human json)' '--output[Write report]:path:_files' '--help[Show help]' ;;
+    doctor) _arguments '--json[Emit JSON]' '--help[Show help]' ;;
+    completions) _values 'shell' bash zsh fish ;;
+    init) _arguments '1:target:(gitlab github)' '--component[GitLab component path]:path:' '--version[GitLab component version]:version:' '--image[GitHub worker image]:image:' '--provider[Provider]:provider:' '--model[Model]:model:' '--fork-behavior[Fork policy]:policy:(report-only skip trusted-target)' '--help[Show help]' ;;
+    config) _arguments '1:operation:(explain)' '--json[Emit JSON]' '--base-config[Base config]:path:_files' '--config[Repository config]:path:_files' '--provider[Provider]:provider:' '--model[Model]:model:' '--publish[Enable publication]' '--no-publish[Disable publication]' '--help[Show help]' ;;
+  esac
+}
+
+_revoot "$@"

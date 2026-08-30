@@ -1,0 +1,21 @@
+{
+  "schema_version": "revoot.evaluation-scenario/v1",
+  "case_id": "sql/reliability-unbounded-delete",
+  "sequence_id": null,
+  "revision": 1,
+  "clean_change": false,
+  "base_sha": "1111111111111111111111111111111111111111",
+  "start_sha": "2222222222222222222222222222222222222222",
+  "head_sha": "8888888888888888888888888888888888888888",
+  "old_path": "migrations/cleanup.sql",
+  "new_path": "migrations/cleanup.sql",
+  "change_kind": "modified",
+  "exact_diff": "@@ -1 +1 @@\n-DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP;\n+DELETE FROM sessions;\n",
+  "checkout_files": {
+    "migrations/cleanup.sql": "DELETE FROM sessions;\n",
+    "schema.sql": "CREATE TABLE sessions (id BIGINT PRIMARY KEY, expires_at TIMESTAMP NOT NULL);\n"
+  },
+  "expected_defects": [
+    { "side": "new", "line": 1, "category": "reliability" }
+  ]
+}

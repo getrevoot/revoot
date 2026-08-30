@@ -1,0 +1,189 @@
+[tools]
+rust = { version = "1.97.1", profile = "default", targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-musl",
+  "x86_64-unknown-linux-musl",
+] }
+"cargo:cargo-nextest" = "0.9"
+"cargo:cargo-zigbuild" = "0.23"
+zig = "0.16"
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build --workspace --all-features"
+
+[tasks.check]
+description = "Type-check the workspace"
+run = "cargo check --workspace --all-targets --all-features"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Lint with Clippy and deny warnings"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo nextest run --workspace --all-features"
+
+[tasks.contracts]
+description = "Validate versioned contracts and golden vectors"
+run = "cargo test --locked -p revoot-core"
+
+[tasks."check:targets"]
+description = "Validate both supported Linux musl targets with the pinned Zig toolchain"
+run = '''
+set -eu
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings"
+# ring compiles target-specific C/assembly, so use the existing cargo-zigbuild
+# integration instead of relying on globally installed musl C compilers.
+cargo zigbuild --locked --workspace --all-features --target x86_64-unknown-linux-musl
+cargo zigbuild --locked --workspace --all-features --target aarch64-unknown-linux-musl
+'''
+
+[tasks.doctor]
+description = "Report the current Revoot architecture and capability baseline"
+run = "cargo run --locked -p revoot -- doctor --json"
+
+[tasks."test:providers:live"]
+description = "Optionally smoke-test Anthropic and OpenAI with live credentials"
+run = "cargo test --locked -p revoot --test live_provider_conformance -- --ignored --nocapture"
+
+[tasks."test:quality:live"]
+description = "Optionally run one provider through the review scenario corpus"
+run = "cargo test --locked -p revoot --test live_review_quality live_full_checkout_quality -- --ignored --exact --nocapture"
+
+[tasks."release:version"]
+description = "Require the release tag, Cargo package, and generated CI assets to agree"
+run = "bash scripts/check-release-version.sh"
+
+[tasks."install:cargo:smoke"]
+description = "Install the current source tree with Cargo and smoke-test the isolated binary"
+run = '''
+set -eu
+revoot_install_root="$(mktemp -d "${TMPDIR:-/tmp}/revoot-cargo-install.XXXXXX")"
+trap 'rm -rf "$revoot_install_root"' EXIT
+cargo install --locked --path crates/revoot --root "$revoot_install_root"
+"$revoot_install_root/bin/revoot" --version
+"$revoot_install_root/bin/revoot" doctor --json >/dev/null
+'''
+
+[tasks."release:checksums"]
+description = "Generate and verify checksums for the complete local archive set"
+run = "bash scripts/generate-release-checksums.sh"
+
+[tasks."release:package-manager-manifests"]
+description = "Generate pinned mise and Homebrew release metadata"
+run = '''
+set -eu
+: "${REVOOT_RELEASE_VERSION:?set REVOOT_RELEASE_VERSION}"
+bash scripts/generate-package-manager-manifests.sh \
+  "$REVOOT_RELEASE_VERSION" dist/package-managers
+'''
+
+[tasks.ci]
+description = "Run all CI checks"
+run = [
+  { task = "fmt" },
+  { task = "check" },
+  { task = "lint" },
+  { task = "contracts" },
+  { task = "test" },
+  { task = "check:targets" },
+]
+
+[tasks."package:linux:release:amd64"]
+description = "Package a static Linux AMD64 release binary"
+run = '''
+set -eu
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$MISE_PROJECT_ROOT=."
+bash scripts/package-linux-artifact.sh \
+  x86_64-unknown-linux-musl release dist/revoot-linux-amd64.tar.gz
+'''
+
+[tasks."package:linux:release:arm64"]
+description = "Package a static Linux ARM64 release binary"
+run = '''
+set -eu
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$MISE_PROJECT_ROOT=."
+bash scripts/package-linux-artifact.sh \
+  aarch64-unknown-linux-musl release dist/revoot-linux-arm64.tar.gz
+'''
+
+[tasks."package:linux:debug:amd64"]
+description = "Package a static Linux AMD64 diagnostic binary with debug symbols"
+run = '''
+set -eu
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$MISE_PROJECT_ROOT=."
+bash scripts/package-linux-artifact.sh \
+  x86_64-unknown-linux-musl distribution-debug dist/revoot-linux-amd64-debug.tar.gz
+'''
+
+[tasks."package:linux:debug:arm64"]
+description = "Package a static Linux ARM64 diagnostic binary with debug symbols"
+run = '''
+set -eu
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$MISE_PROJECT_ROOT=."
+bash scripts/package-linux-artifact.sh \
+  aarch64-unknown-linux-musl distribution-debug dist/revoot-linux-arm64-debug.tar.gz
+'''
+
+[tasks."package:linux:release"]
+description = "Package Linux release binaries for AMD64 and ARM64"
+run = [
+  { task = "package:linux:release:amd64" },
+  { task = "package:linux:release:arm64" },
+]
+
+[tasks."package:linux:debug"]
+description = "Package Linux diagnostic binaries for AMD64 and ARM64"
+run = [
+  { task = "package:linux:debug:amd64" },
+  { task = "package:linux:debug:arm64" },
+]
+
+[tasks."verify:linux-artifacts"]
+description = "Verify static linkage, symbols, path hygiene, and archive metadata"
+run = "bash scripts/verify-linux-artifacts.sh"
+
+[tasks."package:linux"]
+description = "Package release and diagnostic Linux distributions"
+run = [
+  { task = "package:linux:release" },
+  { task = "package:linux:debug" },
+  { task = "verify:linux-artifacts" },
+]
+
+[tasks."package:oci:amd64"]
+description = "Build and smoke-test the non-root Linux AMD64 OCI image"
+run = "bash scripts/build-oci-image.sh amd64"
+
+[tasks."package:oci:arm64"]
+description = "Build and smoke-test the non-root Linux ARM64 OCI image"
+run = "bash scripts/build-oci-image.sh arm64"
+
+[tasks."package:oci"]
+description = "Build and smoke-test both supported non-root OCI images"
+run = [
+  { task = "package:oci:amd64" },
+  { task = "package:oci:arm64" },
+]
+
+[tasks."package:macos:release:arm64"]
+description = "Package a macOS ARM64 release binary"
+run = '''
+set -eu
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$MISE_PROJECT_ROOT=."
+bash scripts/package-macos-artifact.sh
+bash scripts/verify-macos-artifact.sh
+'''
+
+[tasks."package:macos:release"]
+description = "Package the macOS ARM64 release binary"
+run = [{ task = "package:macos:release:arm64" }]
+
+[tasks."package:macos"]
+description = "Package macOS distributions"
+run = [{ task = "package:macos:release" }]

@@ -1,0 +1,22 @@
+{
+  "schema_version": "revoot.evaluation-scenario/v1",
+  "case_id": "rust/correctness-divide-by-zero",
+  "sequence_id": null,
+  "revision": 1,
+  "clean_change": false,
+  "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "start_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "old_path": "src/lib.rs",
+  "new_path": "src/lib.rs",
+  "change_kind": "modified",
+  "exact_diff": "@@ -1,3 +1,3 @@\n pub fn average(total: u64, count: u64) -> u64 {\n-    total / count.max(1)\n+    total / count\n }\n",
+  "checkout_files": {
+    "Cargo.toml": "[package]\nname = \"average-service\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    "src/lib.rs": "pub fn average(total: u64, count: u64) -> u64 {\n    total / count\n}\n",
+    "src/caller.rs": "use crate::average;\npub fn empty_average() -> u64 { average(0, 0) }\n"
+  },
+  "expected_defects": [
+    { "side": "new", "line": 2, "category": "correctness" }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": "revoot.evaluation-scenario/v1",
+  "case_id": "terraform/security-public-database-ingress",
+  "sequence_id": null,
+  "revision": 1,
+  "clean_change": false,
+  "base_sha": "1111111111111111111111111111111111111111",
+  "start_sha": "2222222222222222222222222222222222222222",
+  "head_sha": "7777777777777777777777777777777777777777",
+  "old_path": "infra/database.tf",
+  "new_path": "infra/database.tf",
+  "change_kind": "modified",
+  "exact_diff": "@@ -1,5 +1,5 @@\n resource \"aws_security_group_rule\" \"database\" {\n   type        = \"ingress\"\n-  cidr_blocks = [var.application_cidr]\n+  cidr_blocks = [\"0.0.0.0/0\"]\n   from_port   = 5432\n   to_port     = 5432\n",
+  "checkout_files": {
+    "infra/database.tf": "resource \"aws_security_group_rule\" \"database\" {\n  type = \"ingress\"\n  cidr_blocks = [\"0.0.0.0/0\"]\n  from_port = 5432\n  to_port = 5432\n}\n",
+    "infra/variables.tf": "variable \"application_cidr\" { type = string }\n"
+  },
+  "expected_defects": [
+    { "side": "new", "line": 3, "category": "security" }
+  ]
+}

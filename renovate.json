@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "dependencyDashboard": true,
+  "automerge": false,
+  "minimumReleaseAge": "7 days",
+  "rangeStrategy": "replace",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Group compatible Rust dependency updates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch", "minor", "lockFileMaintenance"],
+      "groupName": "rust dependencies"
+    },
+    {
+      "description": "Keep CI actions immutable",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    },
+    {
+      "description": "Keep major updates isolated for explicit review",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

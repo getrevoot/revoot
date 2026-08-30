@@ -1,0 +1,46 @@
+spec:
+  inputs:
+    stage:
+      default: test
+      description: Existing pipeline stage for the review job.
+    image:
+      default: ghcr.io/getrevoot/revoot:0.1.0
+      description: Versioned Revoot image tag or immutable digest.
+    provider:
+      default: anthropic
+      description: Model provider adapter.
+    model:
+      default: auto
+      description: Provider model name.
+    fork_behavior:
+      default: skip
+      options:
+        - skip
+        - report-only
+      description: Safe behavior when source and target projects differ.
+---
+
+revoot-review:
+  stage: $[[ inputs.stage ]]
+  interruptible: true
+  resource_group: revoot-$CI_PROJECT_ID-$CI_MERGE_REQUEST_IID
+  image:
+    name: $[[ inputs.image ]]
+    entrypoint: [""]
+  variables:
+    REVOOT_PROVIDER: $[[ inputs.provider ]]
+    REVOOT_MODEL: $[[ inputs.model ]]
+    REVOOT_FORK_BEHAVIOR: $[[ inputs.fork_behavior ]]
+    REVOOT_PUBLICATION_ENABLED: "true"
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID == $CI_MERGE_REQUEST_TARGET_PROJECT_ID'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && "$[[ inputs.fork_behavior ]]" == "report-only"'
+  script:
+    - revoot review --ci --format json --output revoot-review.json
+  artifacts:
+    when: always
+    access: developer
+    expire_in: 7 days
+    paths:
+      - revoot-review.json

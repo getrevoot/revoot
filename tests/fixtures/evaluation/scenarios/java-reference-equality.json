@@ -1,0 +1,21 @@
+{
+  "schema_version": "revoot.evaluation-scenario/v1",
+  "case_id": "java/correctness-reference-equality",
+  "sequence_id": null,
+  "revision": 1,
+  "clean_change": false,
+  "base_sha": "1111111111111111111111111111111111111111",
+  "start_sha": "2222222222222222222222222222222222222222",
+  "head_sha": "6666666666666666666666666666666666666666",
+  "old_path": "src/Auth.java",
+  "new_path": "src/Auth.java",
+  "change_kind": "modified",
+  "exact_diff": "@@ -1,5 +1,5 @@\n final class Auth {\n   static boolean isAdmin(String role) {\n-    return \"admin\".equals(role);\n+    return role == \"admin\";\n   }\n }\n",
+  "checkout_files": {
+    "src/Auth.java": "final class Auth {\n  static boolean isAdmin(String role) {\n    return role == \"admin\";\n  }\n}\n",
+    "src/User.java": "final class User { String role() { return new String(\"admin\"); } }\n"
+  },
+  "expected_defects": [
+    { "side": "new", "line": 3, "category": "correctness" }
+  ]
+}

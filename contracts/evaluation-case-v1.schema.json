@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.revoot.dev/evaluation-case-v1.schema.json",
+  "title": "Revoot review evaluation case v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "case_id", "clean_change", "expected_defects"],
+  "properties": {
+    "schema_version": { "const": "revoot.evaluation-case/v1" },
+    "case_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "clean_change": { "type": "boolean" },
+    "expected_defects": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["anchor_id", "category"],
+        "properties": {
+          "anchor_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "category": {
+            "enum": ["correctness", "security", "reliability", "performance", "maintainability"]
+          }
+        }
+      }
+    }
+  }
+}

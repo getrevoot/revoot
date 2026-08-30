@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.revoot.dev/findings-v1.schema.json",
+  "title": "Revoot findings envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "work_unit_id", "findings", "summary"],
+  "properties": {
+    "schema_version": { "const": "revoot.findings/v1" },
+    "work_unit_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "findings": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "anchor_id",
+          "severity",
+          "confidence_percent",
+          "category",
+          "title",
+          "explanation",
+          "evidence"
+        ],
+        "properties": {
+          "anchor_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "confidence_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "category": { "enum": ["correctness", "security", "reliability", "performance", "maintainability"] },
+          "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "explanation": { "type": "string", "minLength": 1, "maxLength": 4000 },
+          "evidence": { "type": "string", "minLength": 1, "maxLength": 2000 },
+          "lineage_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "suggested_replacement": { "type": "string", "minLength": 1, "maxLength": 8000 }
+        }
+      }
+    },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 4000 }
+  }
+}

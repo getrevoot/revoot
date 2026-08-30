@@ -1,0 +1,11 @@
+{
+  "schema_version": "revoot.evaluation-case/v1",
+  "case_id": "rust/correctness-001",
+  "clean_change": false,
+  "expected_defects": [
+    {
+      "anchor_id": "src/lib.rs:new:12",
+      "category": "correctness"
+    }
+  ]
+}

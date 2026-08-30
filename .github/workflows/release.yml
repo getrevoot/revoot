@@ -1,0 +1,215 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.5
+          install: true
+          cache: true
+      - run: mise run release:version
+      - run: mise run ci
+
+  package-linux:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.5
+          install: true
+          cache: true
+      - run: mise run package:linux
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-release
+          path: dist/revoot-linux-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  package-macos:
+    needs: verify
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.5
+          install: true
+          cache: true
+      - run: mise run package:macos
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-release
+          path: dist/revoot-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-image-architecture:
+    needs: package-linux
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            architecture: amd64
+            archive: revoot-linux-amd64.tar.gz
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+            archive: revoot-linux-arm64.tar.gz
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-release
+          path: release-input
+      - name: Publish architecture image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: ${{ github.ref_name }}-${{ matrix.architecture }}
+        run: |
+          mkdir image-context
+          tar -xOzf "release-input/${{ matrix.archive }}" revoot > image-context/revoot
+          chmod 0555 image-context/revoot
+          cp packaging/oci/Dockerfile image-context/Dockerfile
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          docker build --platform "linux/${{ matrix.architecture }}" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --tag "$IMAGE:$IMAGE_TAG" image-context
+          docker push "$IMAGE:$IMAGE_TAG"
+
+  publish-image:
+    needs: publish-image-architecture
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Publish multi-architecture image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION_TAG: ${{ github.ref_name }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          SEMVER_TAG=${VERSION_TAG#v}
+          docker buildx imagetools create \
+            --tag "$IMAGE:$VERSION_TAG" \
+            --tag "$IMAGE:$SEMVER_TAG" \
+            "$IMAGE:$VERSION_TAG-amd64" \
+            "$IMAGE:$VERSION_TAG-arm64"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION_TAG" | awk '/^Digest:/ {print $2; exit}')
+          printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          printf '%s\n' "$digest" > image-digest.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-digest
+          path: image-digest.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [package-linux, package-macos, publish-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.5
+          install: true
+          cache: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-release
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: macos-release
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: image-digest
+          path: dist
+      - name: Prepare release assets
+        env:
+          REVOOT_RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          REVOOT_RELEASE_VERSION=${REVOOT_RELEASE_VERSION#v}
+          export REVOOT_RELEASE_VERSION
+          mise run release:checksums
+          mise run release:package-manager-manifests
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=(--verify-tag --generate-notes)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          assets=(
+            dist/revoot-*.tar.gz
+            dist/SHA256SUMS
+            dist/image-digest.txt
+            dist/package-managers/revoot.mise.toml
+            dist/package-managers/revoot.rb
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" "${flags[@]}"
+          fi
+
+  publish-latest:
+    if: ${{ !contains(github.ref_name, '-') }}
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Update latest image tag
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION_TAG: ${{ github.ref_name }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$VERSION_TAG"

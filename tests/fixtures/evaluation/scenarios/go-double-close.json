@@ -1,0 +1,21 @@
+{
+  "schema_version": "revoot.evaluation-scenario/v1",
+  "case_id": "go/reliability-double-close",
+  "sequence_id": null,
+  "revision": 1,
+  "clean_change": false,
+  "base_sha": "1111111111111111111111111111111111111111",
+  "start_sha": "2222222222222222222222222222222222222222",
+  "head_sha": "5555555555555555555555555555555555555555",
+  "old_path": "worker/stop.go",
+  "new_path": "worker/stop.go",
+  "change_kind": "modified",
+  "exact_diff": "@@ -1,3 +1,4 @@\n func stop(done chan struct{}) {\n     close(done)\n+    close(done)\n }\n",
+  "checkout_files": {
+    "go.mod": "module example.com/worker\ngo 1.24\n",
+    "worker/stop.go": "package worker\nfunc stop(done chan struct{}) {\n    close(done)\n    close(done)\n}\n"
+  },
+  "expected_defects": [
+    { "side": "new", "line": 3, "category": "reliability" }
+  ]
+}

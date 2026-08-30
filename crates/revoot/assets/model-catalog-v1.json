@@ -1,0 +1,13 @@
+{
+  "schema_version": "revoot.model-catalog/v1",
+  "providers": [
+    {
+      "adapter": "anthropic",
+      "default_model": "claude-sonnet-5"
+    },
+    {
+      "adapter": "openai",
+      "default_model": "gpt-5.6-terra"
+    }
+  ]
+}

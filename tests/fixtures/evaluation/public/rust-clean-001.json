@@ -1,0 +1,6 @@
+{
+  "schema_version": "revoot.evaluation-case/v1",
+  "case_id": "rust/clean-001",
+  "clean_change": true,
+  "expected_defects": []
+}

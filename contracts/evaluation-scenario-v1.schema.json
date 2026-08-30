@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://revoot.dev/contracts/evaluation-scenario-v1.schema.json",
+  "title": "Revoot executable evaluation scenario",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "case_id", "sequence_id", "revision", "clean_change",
+    "base_sha", "start_sha", "head_sha", "old_path", "new_path",
+    "change_kind", "exact_diff", "checkout_files", "expected_defects"
+  ],
+  "properties": {
+    "schema_version": { "const": "revoot.evaluation-scenario/v1" },
+    "case_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sequence_id": { "type": ["string", "null"], "maxLength": 128 },
+    "revision": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "clean_change": { "type": "boolean" },
+    "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "start_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "old_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "new_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "change_kind": { "enum": ["added", "deleted", "modified", "renamed"] },
+    "exact_diff": { "type": "string", "minLength": 1, "maxLength": 1048576 },
+    "checkout_files": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 10000,
+      "additionalProperties": { "type": "string", "maxLength": 2097152 }
+    },
+    "expected_defects": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["side", "line", "category"],
+        "properties": {
+          "side": { "enum": ["old", "new"] },
+          "line": { "type": "integer", "minimum": 1 },
+          "category": {
+            "enum": ["correctness", "security", "reliability", "performance", "maintainability"]
+          }
+        }
+      }
+    }
+  }
+}
