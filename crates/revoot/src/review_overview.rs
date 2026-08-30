@@ -31,6 +31,7 @@ pub enum RiskLevel {
     Low,
     Moderate,
     High,
+    Critical,
 }
 
 impl RiskLevel {
@@ -39,6 +40,16 @@ impl RiskLevel {
             Self::Low => "Low",
             Self::Moderate => "Moderate",
             Self::High => "High",
+            Self::Critical => "Critical",
+        }
+    }
+
+    const fn icon(self) -> &'static str {
+        match self {
+            Self::Low => "🟢",
+            Self::Moderate => "🟡",
+            Self::High => "🟠",
+            Self::Critical => "🔴",
         }
     }
 }
@@ -178,28 +189,32 @@ pub fn render_review_overview(
     overview.validate()?;
     let mut output = String::new();
     output.push_str(OVERVIEW_START);
-    output.push_str("\n<details>\n<summary><strong>Revoot overview · ");
-    output.push_str(overview.overall_risk.label());
-    output.push_str(" risk</strong></summary>\n\n");
-    output.push_str(&escape_text(&overview.summary));
-    output.push_str("\n\n<strong>Overall risk: ");
+    output.push_str("\n## Revoot Code Review\n\n<hr>\n\n<strong>Overall risk: ");
+    output.push_str(overview.overall_risk.icon());
+    output.push(' ');
     output.push_str(overview.overall_risk.label());
     output.push_str("</strong> — ");
     output.push_str(&escape_text(&overview.overall_basis));
     output.push('\n');
 
     if !overview.risks.is_empty() {
-        output.push_str("\n| Area | Risk | Basis |\n|---|---|---|\n");
+        output.push_str("\n### Risk areas\n\n| Area | Risk | Basis |\n|---|---|---|\n");
         for risk in &overview.risks {
             output.push_str("| ");
             output.push_str(&escape_table_text(&risk.area));
             output.push_str(" | ");
+            output.push_str(risk.risk.icon());
+            output.push_str(" <strong>");
             output.push_str(risk.risk.label());
+            output.push_str("</strong>");
             output.push_str(" | ");
             output.push_str(&escape_table_text(&risk.basis));
             output.push_str(" |\n");
         }
     }
+    output.push('\n');
+    output.push_str(&escape_text(&overview.summary));
+    output.push('\n');
     render_list(
         &mut output,
         "Assumptions and gaps",
@@ -225,7 +240,7 @@ pub fn render_review_overview(
     output.push_str(&escape_text(&metadata.provider_model));
     output.push_str("</code> at <code>");
     output.push_str(&metadata.commit.as_str()[..12]);
-    output.push_str("</code></sub>\n\n</details>\n");
+    output.push_str("</code></sub>\n");
     if let Some(checkpoint) = &metadata.checkpoint {
         output.push_str(&checkpoint.render());
         output.push('\n');
@@ -384,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_shared_details_block_and_versioned_linked_footer() {
+    fn renders_open_color_coded_block_and_versioned_linked_footer() {
         let checkpoint = ReviewCheckpoint::current(
             GitSha::try_from("b".repeat(40)).unwrap(),
             GitSha::try_from("a".repeat(40)).unwrap(),
@@ -395,9 +410,21 @@ mod tests {
         let rendered =
             render_review_overview(&overview(), &metadata().with_checkpoint(checkpoint.clone()))
                 .unwrap();
-        assert!(rendered.starts_with(OVERVIEW_START));
-        assert!(rendered.contains("<details>"));
-        assert!(rendered.contains("Revoot overview · High risk"));
+        assert!(rendered.starts_with(&format!(
+            "{OVERVIEW_START}\n## Revoot Code Review\n\n<hr>\n\n\
+             <strong>Overall risk: 🟠 High</strong>"
+        )));
+        assert!(!rendered.contains("<details>"));
+        assert!(!rendered.contains("<summary>"));
+        assert!(rendered.contains(
+            "### Risk areas\n\n| Area | Risk | Basis |\n|---|---|---|\n\
+             | Data migration | 🟠 <strong>High</strong> | No rollback path was observed. |"
+        ));
+        let risk_position = rendered.find("### Risk areas").unwrap();
+        let summary_position = rendered
+            .find("Changes authentication persistence and deployment ordering.")
+            .unwrap();
+        assert!(risk_position < summary_position);
         assert!(
             rendered
                 .contains("<a href=\"https://github.com/acme/repo/actions/runs/42\">reviewed</a>")
@@ -409,7 +436,17 @@ mod tests {
             crate::review_checkpoint::extract_checkpoint(&rendered),
             Some(checkpoint)
         );
+        assert_eq!(rendered.matches(OVERVIEW_START).count(), 1);
+        assert_eq!(rendered.matches(OVERVIEW_END).count(), 1);
         assert!(rendered.ends_with(OVERVIEW_END));
+    }
+
+    #[test]
+    fn risk_colors_cover_the_public_taxonomy() {
+        assert_eq!(RiskLevel::Low.icon(), "🟢");
+        assert_eq!(RiskLevel::Moderate.icon(), "🟡");
+        assert_eq!(RiskLevel::High.icon(), "🟠");
+        assert_eq!(RiskLevel::Critical.icon(), "🔴");
     }
 
     #[test]

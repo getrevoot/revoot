@@ -29,7 +29,7 @@ use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 /// Version of the trusted reviewer policy used in quality evidence.
-pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v9";
+pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v10";
 
 const SYSTEM_PROMPT: &str = r"You are Revoot, one automatic code reviewer.
 Implementation and review are separate jobs, even when agents perform both.
@@ -1031,7 +1031,7 @@ fn submission_tools() -> [ModelTool; 2] {
                 "additionalProperties": false,
                 "properties": {
                     "summary": {"type": "string", "minLength": 1, "maxLength": 1200},
-                    "overall_risk": {"enum": ["low", "moderate", "high"]},
+                    "overall_risk": {"enum": ["low", "moderate", "high", "critical"]},
                     "overall_basis": {"type": "string", "minLength": 1, "maxLength": 320},
                     "risks": {
                         "type": "array",
@@ -1041,7 +1041,7 @@ fn submission_tools() -> [ModelTool; 2] {
                             "additionalProperties": false,
                             "properties": {
                                 "area": {"type": "string", "minLength": 1, "maxLength": 64},
-                                "risk": {"enum": ["moderate", "high"]},
+                                "risk": {"enum": ["moderate", "high", "critical"]},
                                 "basis": {"type": "string", "minLength": 1, "maxLength": 320}
                             },
                             "required": ["area", "risk", "basis"]
