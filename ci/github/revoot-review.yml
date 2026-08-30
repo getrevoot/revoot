@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     container:
-      image: ghcr.io/getrevoot/revoot:0.1.0
+      image: ghcr.io/getrevoot/revoot:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -38,6 +38,7 @@ jobs:
         run: revoot review --ci --format json --output revoot-review.json
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          REVOOT_GITHUB_TOKEN: ${{ secrets.REVOOT_GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REVOOT_PROVIDER: ${{ vars.REVOOT_PROVIDER || 'auto' }}

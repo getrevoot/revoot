@@ -33,8 +33,9 @@ implementation, risk, material concerns, and validation gaps.
 ### Required CI variables
 
 - Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a secret.
-- GitHub needs no additional secret; the generated workflow uses the built-in
-  `GITHUB_TOKEN` with read-only contents and pull-request write permissions.
+- GitHub's built-in `GITHUB_TOKEN` can publish findings and the summary. Add a
+  fine-grained PAT as `REVOOT_GITHUB_TOKEN` if Revoot should also resolve and
+  reopen its review threads automatically.
 - GitLab needs a masked `REVOOT_GITLAB_TOKEN` with API access to publish inline
   discussions and update the merge-request summary. Revoot treats
   `CI_JOB_TOKEN` as read-only.

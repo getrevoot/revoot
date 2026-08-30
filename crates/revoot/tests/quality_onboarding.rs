@@ -261,7 +261,8 @@ fn generated_github_onboarding_contract_is_bounded_and_matches_ci_asset() {
     assert!(generated.contains("head.repo.full_name == github.repository"));
     assert!(generated.contains("REVOOT_PROVIDER: ${{ vars.REVOOT_PROVIDER || 'auto' }}"));
     assert!(generated.contains("REVOOT_MODEL: ${{ vars.REVOOT_MODEL || 'auto' }}"));
-    assert!(generated.contains("image: ghcr.io/getrevoot/revoot:0.1.0"));
+    assert!(generated.contains("image: ghcr.io/getrevoot/revoot:latest"));
+    assert!(generated.contains("REVOOT_GITHUB_TOKEN: ${{ secrets.REVOOT_GITHUB_TOKEN }}"));
     assert!(!generated.contains("pull_request_target"));
     assert!(!generated.contains("workflow_run"));
     assert!(!generated.contains("@main"));

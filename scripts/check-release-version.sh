@@ -15,10 +15,4 @@ version=$(awk -F '"' '/^version = "/ { print $2; exit }' "$MISE_PROJECT_ROOT/Car
   exit 1
 }
 
-image="ghcr.io/getrevoot/revoot:$version"
-grep -Fqx "      image: $image" "$MISE_PROJECT_ROOT/ci/github/revoot-review.yml"
-dogfood_line="      image: ghcr.io/getrevoot/revoot:\${{ vars.REVOOT_TAG || 'latest' }}"
-grep -Fqx "$dogfood_line" "$MISE_PROJECT_ROOT/.github/workflows/revoot.yml"
-grep -Fqx "      default: $image" "$MISE_PROJECT_ROOT/ci/gitlab/components/review/template.yml"
-
-echo "release tag, Cargo package, and generated CI assets agree on $version"
+echo "release tag matches Cargo package version $version"

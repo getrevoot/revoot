@@ -36,8 +36,8 @@ use crate::github_checkout::{
     classify_github_actions, discover_github_actions_repository, discover_github_repository,
 };
 use crate::github_review::{
-    GitHubReviewContext, GitHubReviewContextOptions, acquire_github_review_context,
-    publish_github_findings, update_github_overview,
+    GitHubReviewContext, GitHubReviewContextOptions, GitHubReviewError,
+    acquire_github_review_context, publish_github_findings, update_github_overview,
 };
 use crate::github_transport::{
     GitHubCaMode, GitHubClient, GitHubCustomCaBundle, load_github_token,
@@ -669,7 +669,17 @@ pub fn run(
         args.github_repository.clone(),
     ))?;
     emit_report(&args, &provider, &model, &report)?;
-    Ok(if report.publication_failed() { 3 } else { 0 })
+    if report.publication_failed() {
+        if report.publication.reason == Some("github_thread_resolution_unavailable") {
+            eprintln!(
+                "Revoot could not resolve a GitHub review thread. Configure a masked REVOOT_GITHUB_TOKEN with pull-request read/write access; GitHub's built-in Actions token cannot perform this mutation."
+            );
+        } else if let Some(reason) = report.publication.reason {
+            eprintln!("Revoot publication failed ({reason}); see the review report for details.");
+        }
+        return Ok(3);
+    }
+    Ok(0)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1808,7 +1818,7 @@ async fn publish_github_review(
     if !prepared.publication_enabled {
         return CanonicalPublication::terminal("report_only", Some("publication_disabled"));
     }
-    let Ok(evidence) = publish_github_findings(
+    let evidence = match publish_github_findings(
         &prepared.client,
         &prepared.context,
         &publication_candidates(report, &prepared.context.identity.head_sha),
@@ -1816,8 +1826,14 @@ async fn publish_github_review(
         &report.authorized_fixed_lineages(),
     )
     .await
-    else {
-        return CanonicalPublication::terminal("failed", Some("publication_stopped"));
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return CanonicalPublication::terminal(
+                "failed",
+                Some(github_publication_failure_reason(error)),
+            );
+        }
     };
     let overview_mutated = if let Some(overview) = overview {
         match update_github_overview(&prepared.client, &prepared.context, overview).await {
@@ -1845,6 +1861,31 @@ async fn publish_github_review(
             .mutation_attempts
             .saturating_add(u32::from(overview_mutated)),
         resolved_discussions: evidence.superseded_comments,
+    }
+}
+
+const fn github_publication_failure_reason(error: GitHubReviewError) -> &'static str {
+    match error {
+        GitHubReviewError::ThreadResolution => "github_thread_resolution_unavailable",
+        GitHubReviewError::PublicationStale
+        | GitHubReviewError::IdentityMismatch
+        | GitHubReviewError::CheckoutHeadMismatch
+        | GitHubReviewError::PullRequestClosed => "github_pull_request_changed",
+        GitHubReviewError::PublicationAmbiguous => "github_review_state_changed",
+        GitHubReviewError::PublicationInventory => "github_comment_inventory_invalid",
+        GitHubReviewError::PublicationMutation | GitHubReviewError::Anchor => {
+            "github_comment_publication_failed"
+        }
+        GitHubReviewError::Transport => "github_api_failed",
+        GitHubReviewError::Overview => "github_overview_update_failed",
+        GitHubReviewError::InvalidPullRequest
+        | GitHubReviewError::PaginationLimit
+        | GitHubReviewError::InvalidFile
+        | GitHubReviewError::DuplicateFile
+        | GitHubReviewError::Diff
+        | GitHubReviewError::Partition
+        | GitHubReviewError::EmptyReview
+        | GitHubReviewError::Invocation => "github_publication_failed",
     }
 }
 

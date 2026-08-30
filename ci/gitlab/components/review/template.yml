@@ -8,7 +8,7 @@ spec:
       default: []
       description: Jobs that must finish before review; empty starts immediately.
     image:
-      default: ghcr.io/getrevoot/revoot:0.1.0
+      default: ghcr.io/getrevoot/revoot:latest
       description: Versioned Revoot image tag or immutable digest.
     provider:
       default: auto

@@ -13,11 +13,15 @@ Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a repository or
 organization secret. Optional Actions variables `REVOOT_PROVIDER` and
 `REVOOT_MODEL` override the `auto` defaults.
 
-No GitHub token setup is required. Each job receives a short-lived
-`GITHUB_TOKEN`; the workflow grants it package and repository read access plus
-pull-request write access. Comments appear as `github-actions[bot]`. A branded
-identity requires a GitHub App or bot-user token supplied as
-`REVOOT_GITHUB_TOKEN`.
+No extra GitHub token is required to publish comments and the evolving summary.
+The generated workflow grants its short-lived `GITHUB_TOKEN` repository read
+and pull-request write access; comments appear as `github-actions[bot]`.
+
+GitHub does not allow that Actions installation token to resolve or reopen
+review threads. For the full lifecycle, create a fine-grained PAT for a bot or
+user with pull-request read/write access and save it as the repository secret
+`REVOOT_GITHUB_TOKEN`. Revoot will prefer it automatically. Human-resolved
+threads are still read and respected when this optional secret is absent.
 
 ## Scheduling and forks
 

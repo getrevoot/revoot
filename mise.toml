@@ -56,7 +56,7 @@ description = "Optionally run one provider through the review scenario corpus"
 run = "cargo test --locked -p revoot --test live_review_quality live_full_checkout_quality -- --ignored --exact --nocapture"
 
 [tasks."release:version"]
-description = "Require the release tag, Cargo package, and generated CI assets to agree"
+description = "Require the release tag to match the Cargo package version"
 run = "bash scripts/check-release-version.sh"
 
 [tasks."install:cargo:smoke"]

@@ -79,6 +79,7 @@ pub enum GitHubReviewError {
     PublicationAmbiguous,
     PublicationStale,
     PublicationMutation,
+    ThreadResolution,
     Overview,
 }
 
@@ -104,6 +105,7 @@ impl fmt::Display for GitHubReviewError {
             Self::PublicationAmbiguous => "GitHub contains ambiguous Revoot-owned comments",
             Self::PublicationStale => "GitHub pull-request HEAD changed before publication",
             Self::PublicationMutation => "GitHub review-comment publication failed",
+            Self::ThreadResolution => "GitHub review-thread resolution failed",
             Self::Overview => "GitHub pull-request overview update failed",
         })
     }
@@ -812,13 +814,17 @@ async fn set_thread_resolved(
             "variables": {"threadId": thread_id},
         }))
         .await?;
-    let envelope: Envelope = serde_json::from_slice(&response.body)
-        .map_err(|_| GitHubReviewError::PublicationMutation)?;
-    let thread = envelope
+    let envelope: Envelope =
+        serde_json::from_slice(&response.body).map_err(|_| GitHubReviewError::ThreadResolution)?;
+    if envelope
         .errors
-        .is_none()
-        .then_some(envelope.data)
-        .flatten()
+        .as_ref()
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(GitHubReviewError::ThreadResolution);
+    }
+    let thread = envelope
+        .data
         .and_then(|data| {
             if resolved {
                 data.resolve_review_thread
@@ -827,9 +833,9 @@ async fn set_thread_resolved(
             }
         })
         .map(|payload| payload.thread)
-        .ok_or(GitHubReviewError::PublicationMutation)?;
+        .ok_or(GitHubReviewError::ThreadResolution)?;
     if thread.id != thread_id || thread.is_resolved != resolved {
-        return Err(GitHubReviewError::PublicationMutation);
+        return Err(GitHubReviewError::ThreadResolution);
     }
     Ok(())
 }
@@ -1377,6 +1383,43 @@ mod tests {
         server.await.unwrap();
         assert_eq!(evidence.superseded_comments, 1);
         assert_eq!(evidence.mutation_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn inaccessible_thread_mutation_has_a_distinct_failure() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut mutation, _) = listener.accept().await.unwrap();
+            assert!(
+                read_request(&mut mutation)
+                    .await
+                    .starts_with(b"POST /graphql ")
+            );
+            write_json(
+                &mut mutation,
+                &serde_json::json!({
+                    "data": {"resolveReviewThread": null},
+                    "errors": [{"message": "Resource not accessible by integration"}]
+                }),
+            )
+            .await;
+        });
+        let client = GitHubClient::new_for_loopback(
+            GitHubToken::new(b"test-token".to_vec()).unwrap(),
+            address,
+        )
+        .unwrap();
+
+        assert_eq!(
+            set_thread_resolved(&client, "PRRT_thread", true)
+                .await
+                .expect_err("the integration cannot resolve this thread"),
+            GitHubReviewError::ThreadResolution
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
