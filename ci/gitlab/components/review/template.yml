@@ -11,7 +11,7 @@ spec:
       default: ghcr.io/getrevoot/revoot:0.1.0
       description: Versioned Revoot image tag or immutable digest.
     provider:
-      default: anthropic
+      default: auto
       description: Model provider adapter.
     model:
       default: auto

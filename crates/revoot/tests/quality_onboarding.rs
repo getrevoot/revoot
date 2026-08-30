@@ -223,7 +223,7 @@ fn generated_gitlab_onboarding_contract_is_bounded_and_matches_ci_assets() {
             .expect("self-managed example must be readable");
         assert!(example.contains("0123456789abcdef0123456789abcdef01234567"));
         assert!(example.contains("@sha256:REPLACE_ME"));
-        assert!(example.contains("provider: anthropic"));
+        assert!(example.contains("provider: auto"));
         assert!(example.contains("fork_behavior: skip"));
     }
 

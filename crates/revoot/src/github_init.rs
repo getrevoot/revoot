@@ -17,7 +17,7 @@ impl Default for GitHubInitOptions {
     fn default() -> Self {
         Self {
             image: "ghcr.io/getrevoot/revoot:0.1.0".to_owned(),
-            provider: "anthropic".to_owned(),
+            provider: "auto".to_owned(),
             model: "auto".to_owned(),
             fork_behavior: "skip".to_owned(),
         }
@@ -93,6 +93,7 @@ mod tests {
         assert!(workflow.contains("pull-requests: write"));
         assert!(workflow.contains("head.repo.full_name == github.repository"));
         assert!(workflow.contains("REVOOT_PUBLICATION_ENABLED: \"true\""));
+        assert!(workflow.contains("REVOOT_PROVIDER: auto"));
         assert!(!workflow.contains("pull_request_target"));
         assert!(!workflow.contains("workflow_run"));
         assert!(!workflow.contains("@main"));

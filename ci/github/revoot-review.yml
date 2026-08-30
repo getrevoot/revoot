@@ -31,7 +31,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          REVOOT_PROVIDER: anthropic
+          REVOOT_PROVIDER: auto
           REVOOT_MODEL: auto
           REVOOT_FORK_BEHAVIOR: skip
           REVOOT_PUBLICATION_ENABLED: "true"

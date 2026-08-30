@@ -19,7 +19,7 @@ fn github_ci_is_the_canonical_pull_request_gate() {
 
     assert_eq!(pipeline.matches("mise run ci").count(), 1);
     assert!(pipeline.contains("pull_request:"));
-    assert!(pipeline.contains("branches:\n      - master"));
+    assert!(pipeline.contains("branches:\n      - main"));
     assert!(pipeline.contains("contents: read"));
     assert!(pipeline.contains("persist-credentials: false"));
     assert!(pipeline.contains("workflow_dispatch:"));

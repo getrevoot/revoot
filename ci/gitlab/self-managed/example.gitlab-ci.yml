@@ -4,6 +4,6 @@ include:
   - component: $CI_SERVER_FQDN/getrevoot/revoot-ci/review@0123456789abcdef0123456789abcdef01234567
     inputs:
       image: ghcr.io/getrevoot/revoot@sha256:REPLACE_ME
-      provider: anthropic
+      provider: auto
       model: auto
       fork_behavior: skip

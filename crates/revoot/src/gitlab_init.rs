@@ -19,7 +19,7 @@ impl Default for GitLabInitOptions {
         Self {
             component: DEFAULT_COMPONENT.to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            provider: "anthropic".to_owned(),
+            provider: "auto".to_owned(),
             model: "auto".to_owned(),
             fork_behavior: "skip".to_owned(),
         }
@@ -103,6 +103,7 @@ mod tests {
         })
         .unwrap();
         assert!(output.contains("review@1.2.3"));
+        assert!(output.contains("provider: auto"));
         assert!(output.contains("fork_behavior: skip"));
         assert!(!output.contains("latest"));
     }
