@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   review:
+    name: Review pull request
     if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -23,8 +24,10 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
+      options: --user 0:0
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
           persist-credentials: false

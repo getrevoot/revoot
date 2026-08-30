@@ -255,6 +255,7 @@ fn generated_github_onboarding_contract_is_bounded_and_matches_ci_asset() {
     assert!(generated.contains("packages: read"));
     assert!(generated.contains("pull-requests: write"));
     assert!(generated.contains("persist-credentials: false"));
+    assert!(generated.contains("options: --user 0:0"));
     assert!(generated.contains("github.event.pull_request.head.sha"));
     assert!(generated.contains("head.repo.full_name == github.repository"));
     assert!(generated.contains("REVOOT_PROVIDER: ${{ vars.REVOOT_PROVIDER || 'auto' }}"));
