@@ -32,6 +32,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
+      - name: Prepare workspace
+        run: chown 0:0 "$GITHUB_WORKSPACE"
       - name: Review pull request
         run: revoot review --ci --format json --output revoot-review.json
         env:
