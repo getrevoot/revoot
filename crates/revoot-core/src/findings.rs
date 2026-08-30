@@ -32,24 +32,27 @@ pub enum Severity {
     High,
     Medium,
     Low,
+    Info,
 }
 
 impl Severity {
     const fn priority(self) -> u8 {
         match self {
-            Self::Critical => 4,
-            Self::High => 3,
-            Self::Medium => 2,
-            Self::Low => 1,
+            Self::Critical => 5,
+            Self::High => 4,
+            Self::Medium => 3,
+            Self::Low => 2,
+            Self::Info => 1,
         }
     }
 
-    const fn label(self) -> &'static str {
+    const fn presentation(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            Self::Critical => "critical",
-            Self::High => "high",
-            Self::Medium => "medium",
-            Self::Low => "low",
+            Self::Critical => ("🔴", "P1", "Critical"),
+            Self::High => ("🟠", "P2", "High"),
+            Self::Medium => ("🟡", "P3", "Medium"),
+            Self::Low => ("🟢", "P4", "Low"),
+            Self::Info => ("🔵", "P5", "Info"),
         }
     }
 }
@@ -72,6 +75,16 @@ impl FindingCategory {
             Self::Reliability => "reliability",
             Self::Performance => "performance",
             Self::Maintainability => "maintainability",
+        }
+    }
+
+    const fn presentation(self) -> &'static str {
+        match self {
+            Self::Correctness => "Correctness",
+            Self::Security => "Security",
+            Self::Reliability => "Reliability",
+            Self::Performance => "Performance",
+            Self::Maintainability => "Maintainability",
         }
     }
 }
@@ -506,18 +519,21 @@ fn render_finding(finding: &Finding) -> String {
     let title = render_safe_markdown(&finding.title);
     let explanation = render_safe_markdown(&finding.explanation);
     let evidence = render_safe_markdown(&finding.evidence);
+    let (severity_icon, priority, severity_label) = finding.severity.presentation();
     let mut body = format!(
-        "**{} · {} · {}%** — {}\n\n{}\n\n**Evidence**\n\n{}",
-        finding.severity.label(),
-        finding.category.label(),
-        finding.confidence_percent,
-        title,
+        "**[Revoot](https://github.com/getrevoot/revoot)**\n\n\
+         | Severity | Category | Confidence |\n\
+         | --- | --- | --- |\n\
+         | {severity_icon} **{priority} ({severity_label})** | {} | {} |\n\n\
+         ### {title}\n\n{}\n\n{}",
+        finding.category.presentation(),
+        confidence_label(finding.confidence_percent),
         explanation,
         evidence
     );
     if let Some(replacement) = &finding.suggested_replacement {
         let fence = code_fence(replacement);
-        body.push_str("\n\n**Suggested replacement**\n\n");
+        body.push_str("\n\n#### Suggested fix\n\n");
         body.push_str(&fence);
         body.push('\n');
         body.push_str(replacement);
@@ -527,6 +543,15 @@ fn render_finding(finding: &Finding) -> String {
         body.push_str(&fence);
     }
     body
+}
+
+const fn confidence_label(confidence_percent: u8) -> &'static str {
+    match confidence_percent {
+        0 => "N/A",
+        1..=69 => "Low",
+        70..=89 => "Medium",
+        90..=u8::MAX => "High",
+    }
 }
 
 fn render_safe_markdown(value: &str) -> String {
@@ -603,6 +628,46 @@ mod tests {
             lineage_id: None,
             suggested_replacement: None,
         }
+    }
+
+    #[test]
+    fn finding_comment_uses_branded_metadata_and_one_body() {
+        let mut value = finding("anchor-1", Severity::Medium, 85);
+        value.title = "Avoid the fallback path".to_owned();
+        value.explanation = "The fallback changes successful requests.".to_owned();
+        value.evidence = "The caller reaches this branch for every retry.".to_owned();
+        value.suggested_replacement = Some("return primary;".to_owned());
+
+        let rendered = render_finding(&value);
+
+        assert!(rendered.starts_with(
+            "**[Revoot](https://github.com/getrevoot/revoot)**\n\n\
+             | Severity | Category | Confidence |\n\
+             | --- | --- | --- |\n\
+             | 🟡 **P3 (Medium)** | Correctness | Medium |"
+        ));
+        assert!(rendered.contains("### Avoid the fallback path"));
+        assert!(rendered.contains(
+            "The fallback changes successful requests.\n\n\
+             The caller reaches this branch for every retry."
+        ));
+        assert!(rendered.contains("#### Suggested fix\n\n```\nreturn primary;\n```"));
+        assert!(!rendered.contains("**Evidence**"));
+        assert!(!rendered.contains("Suggested replacement"));
+    }
+
+    #[test]
+    fn severity_and_confidence_presentations_cover_the_public_taxonomy() {
+        assert_eq!(Severity::Critical.presentation(), ("🔴", "P1", "Critical"));
+        assert_eq!(Severity::High.presentation(), ("🟠", "P2", "High"));
+        assert_eq!(Severity::Medium.presentation(), ("🟡", "P3", "Medium"));
+        assert_eq!(Severity::Low.presentation(), ("🟢", "P4", "Low"));
+        assert_eq!(Severity::Info.presentation(), ("🔵", "P5", "Info"));
+
+        assert_eq!(confidence_label(95), "High");
+        assert_eq!(confidence_label(85), "Medium");
+        assert_eq!(confidence_label(60), "Low");
+        assert_eq!(confidence_label(0), "N/A");
     }
 
     fn envelope(anchor_id: &str, finding: Finding) -> FindingsEnvelope {

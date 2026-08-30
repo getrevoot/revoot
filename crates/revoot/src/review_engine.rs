@@ -29,7 +29,7 @@ use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 /// Version of the trusted reviewer policy used in quality evidence.
-pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v8";
+pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v9";
 
 const SYSTEM_PROMPT: &str = r"You are Revoot, one automatic code reviewer.
 Implementation and review are separate jobs, even when agents perform both.
@@ -75,7 +75,10 @@ invariant materially harder to preserve. Do not request abstraction for
 anticipated reuse or decomposition without a demonstrated benefit. Do not
 submit acronym-based, generic stylistic, naming, formatting, preference, praise,
 or diff-narration comments. State the observable impact, the improvement, and
-the repository evidence connecting it to the changed line. Challenge each
+the repository evidence connecting it to the changed line. Treat explanation
+and evidence as complementary parts of one published comment: explanation states
+the impact and improvement, while evidence supplies concrete repository-specific
+proof without restating the explanation. Challenge each
 hypothesis before calling submit_candidate_finding. Before submitting, call
 show_diff for every changed path that anchors a finding and inspect relevant
 repository context with read_file or search. Use only an exact anchor ID
@@ -1003,7 +1006,7 @@ fn submission_tools() -> [ModelTool; 2] {
                             "additionalProperties": false,
                             "properties": {
                                 "anchor_id": {"type": "string", "minLength": 1, "maxLength": 128},
-                                "severity": {"enum": ["critical", "high", "medium", "low"]},
+                                "severity": {"enum": ["critical", "high", "medium", "low", "info"]},
                                 "confidence_percent": {"type": "integer", "minimum": 0, "maximum": 100},
                                 "category": {"enum": ["correctness", "security", "reliability", "performance", "maintainability"]},
                                 "title": {"type": "string", "minLength": 1, "maxLength": 160},
