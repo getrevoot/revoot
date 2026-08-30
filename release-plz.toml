@@ -1,0 +1,37 @@
+[workspace]
+changelog_update = false
+dependencies_update = false
+git_only = true
+git_release_enable = false
+git_tag_enable = false
+publish = false
+release = false
+release_always = false
+repo_url = "https://github.com/getrevoot/revoot"
+semver_check = false
+
+[changelog]
+protect_breaking_commits = true
+sort_commits = "newest"
+commit_parsers = [
+  { message = "^Merge ", skip = true },
+  { message = "^chore", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^docs?", skip = true },
+  { message = "^test", skip = true },
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^deprecat", group = "Deprecated" },
+  { message = "^(remove|delete)", group = "Removed" },
+  { message = ".*", group = "Changed" },
+]
+
+[[package]]
+name = "revoot"
+changelog_include = ["revoot-core"]
+changelog_path = "./CHANGELOG.md"
+changelog_update = true
+git_tag_name = "v{{ version }}"
+release = true

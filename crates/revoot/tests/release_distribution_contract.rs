@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -21,12 +22,30 @@ fn release_workflow_builds_packages_images_and_checksums() {
     assert!(pipeline.contains("mise run package:linux"));
     assert!(pipeline.contains("mise run package:macos"));
     assert!(pipeline.contains("mise run release:checksums"));
+    assert!(pipeline.contains("mise run release:notes"));
     assert!(!pipeline.contains("package-manager"));
     assert!(!pipeline.contains("revoot.mise.toml"));
     assert!(!pipeline.contains("revoot.rb"));
     assert!(pipeline.contains("ghcr.io/${{ github.repository }}"));
     assert!(pipeline.contains("gh release create \"$GITHUB_REF_NAME\""));
-    assert!(pipeline.contains("--verify-tag --generate-notes"));
+    assert!(pipeline.contains("gh release edit \"$GITHUB_REF_NAME\" --notes-file"));
+    assert!(pipeline.contains("--verify-tag --notes-file dist/release-notes.md"));
+    assert!(!pipeline.contains("--generate-notes"));
+}
+
+#[test]
+fn release_preparation_is_manual_and_updates_a_pull_request() {
+    let root = workspace();
+    let pipeline = fs::read_to_string(root.join(".github/workflows/prepare-release.yml"))
+        .expect("release preparation pipeline");
+    let _: serde_json::Value =
+        serde_saphyr::from_str(&pipeline).expect("release preparation pipeline must be valid YAML");
+
+    assert!(pipeline.contains("workflow_dispatch:"));
+    assert!(pipeline.contains("contents: write"));
+    assert!(pipeline.contains("pull-requests: write"));
+    assert!(pipeline.contains("mise run release:pr"));
+    assert!(pipeline.contains("secrets.RELEASE_PLZ_TOKEN || github.token"));
 }
 
 #[test]
@@ -79,23 +98,59 @@ fn readme_prioritizes_ci_and_documents_distributions() {
 }
 
 #[test]
-fn release_version_guard_binds_tag_and_generated_assets() {
+fn release_version_guard_binds_tag_package_and_changelog() {
     let root = workspace();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let fixture = std::env::temp_dir().join(format!("revoot-release-guard-{nonce}"));
+    fs::create_dir_all(&fixture).expect("release fixture directory");
+    fs::write(
+        fixture.join("Cargo.toml"),
+        "[workspace.package]\nversion = \"0.1.0\"\n",
+    )
+    .expect("Cargo fixture");
+    fs::write(
+        fixture.join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n\n## [0.1.0](https://example.invalid/v0.1.0) - 2026-08-30\n\n- Initial release.\n",
+    )
+    .expect("changelog fixture");
+    for arguments in [
+        &["init"][..],
+        &["config", "user.name", "Revoot Test"][..],
+        &["config", "user.email", "test@example.invalid"][..],
+        &["add", "."][..],
+        &["commit", "-m", "test: release fixture"][..],
+        &["tag", "-a", "v0.1.0", "-m", "Revoot v0.1.0"][..],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(&fixture)
+                .status()
+                .expect("git fixture command")
+                .success()
+        );
+    }
+
     let matching = Command::new("bash")
-        .arg("scripts/check-release-version.sh")
-        .env("MISE_PROJECT_ROOT", &root)
+        .arg(root.join("scripts/check-release-version.sh"))
+        .env("MISE_PROJECT_ROOT", &fixture)
         .env("GITHUB_REF_NAME", "v0.1.0")
-        .current_dir(&root)
+        .current_dir(&fixture)
         .status()
         .expect("release version guard");
     assert!(matching.success());
 
     let mismatch = Command::new("bash")
-        .arg("scripts/check-release-version.sh")
-        .env("MISE_PROJECT_ROOT", &root)
+        .arg(root.join("scripts/check-release-version.sh"))
+        .env("MISE_PROJECT_ROOT", &fixture)
         .env("GITHUB_REF_NAME", "v0.2.0")
-        .current_dir(&root)
+        .current_dir(&fixture)
         .status()
         .expect("release version mismatch");
     assert!(!mismatch.success());
+
+    fs::remove_dir_all(fixture).expect("remove release fixture");
 }
