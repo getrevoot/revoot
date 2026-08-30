@@ -1,10 +1,10 @@
 # Releasing Revoot
 
-GitHub is the source, container registry, and release host. Pushing an exact
-semantic-version tag runs CI, builds the supported archives and container
-images, generates checksums, and publishes the release.
+An exact semantic-version tag runs validation, builds the supported archives
+and multi-architecture container image, generates checksums, and creates the
+GitHub release.
 
-## Prepare a release
+## Prepare
 
 Update the workspace version and generated CI image tags together, then run:
 
@@ -17,22 +17,20 @@ mise run install:cargo:smoke
 GITHUB_REF_NAME=v0.1.0 mise run release:version
 ```
 
-The archives contain the Revoot binary, Apache-2.0 license, and Bash, Zsh, and
-Fish completions. Linux release binaries are static and stripped; diagnostic
-archives retain symbols. The macOS archive is a native ARM64 Mach-O.
+`package:macos` requires an Apple Silicon macOS host.
 
 ## Publish
 
-Create and push the version tag:
+Create and push the tag:
 
 ```sh
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow publishes Linux and macOS archives, `SHA256SUMS`, and a
-multi-architecture image at `ghcr.io/getrevoot/revoot`. Stable releases also
-update the `latest` image tag.
+The workflow publishes Linux AMD64/ARM64 and Apple Silicon macOS archives,
+`SHA256SUMS`, and `ghcr.io/getrevoot/revoot` tags with and without the leading
+`v`. Stable releases also update `latest`; prereleases do not.
 
-If a workflow job fails, correct the problem and rerun it. Do not move an
-already-published version tag to a different commit.
+If a job fails, fix it and rerun the workflow. Never move a published version
+tag to a different commit.

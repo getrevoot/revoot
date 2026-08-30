@@ -1,72 +1,57 @@
-# GitLab component operation
+# GitLab CI/CD component
 
-The Revoot source, issues, pull requests, releases, and container image live on
-GitHub. `gitlab.com/getrevoot/revoot-ci` is a deliberately small GitLab-native
-component and acceptance project; it is not a mirror of the Rust repository.
+## Set up
 
-The component project contains only its README, license, pipeline, deterministic
-fixture changes, and `templates/review/template.yml`. The template runs the
-released `ghcr.io/getrevoot/revoot` image. Each component release pins the exact
-image digest produced by the corresponding GitHub release.
+Generate a version-pinned component include and add it to `.gitlab-ci.yml`:
 
-The job defaults to GitLab's always-defined `.post` stage, so it remains valid
-when a project has custom stages. Its empty `needs` list starts review
-immediately alongside other CI work instead of waiting for the pipeline to
-finish. Pass job names through the `needs` input when review should wait for
-specific checks. A pipeline containing no ordinary-stage jobs does not run
-`.post` jobs; a Revoot-only pipeline should override `stage` to `test`.
+```sh
+revoot init gitlab
+```
 
-The acceptance pipeline exercises:
+Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a masked CI/CD variable.
+Provider and model default to `auto` and can be overridden through component
+inputs.
 
-- merge-request discovery and exact diff acquisition;
-- checkout and API snapshot binding;
-- initial inline publication and repeat-run convergence;
-- changed-head and stale-finding behavior;
-- job-token report-only behavior and project-token publication; and
-- cross-project fork safety when the companion fork fixture is available.
+## Publishing token
 
-With a write-capable project token, each successful review also updates one
-bounded, version-marked `<details>` block in the merge-request description.
-Author text outside that block is preserved. The overview records the
-implementation summary, overall risk, material risk areas, assumptions or gaps,
-manual validation still required, and a footer identifying the Revoot version,
-linked GitLab job, provider/model, and reviewed commit. Repeated runs converge
-to one block; ambiguous markers stop publication.
+Revoot needs a write-capable token to create inline discussions, resolve its
+old discussions, and update the merge-request summary. Create a project access
+token with the `api` scope and at least the Developer role, then save it as a
+masked CI/CD variable named `REVOOT_GITLAB_TOKEN`. GitLab attributes comments
+to the project token's bot user.
 
-Before model work, Revoot completely acquires the bounded merge-request
-discussion inventory, including live resolution state, resolver identity,
-current and original anchors, timestamps, and attributed replies. The reviewer
-must interpret that untrusted context before submitting findings. Revoot embeds
-lineage and occurrence metadata in its own notes, carries still-open lineages
-without reposting them, leaves human-resolved findings suppressed, resolves an
-owned finding only after an omission-free review explicitly proves it fixed,
-and reopens a discussion only when Revoot resolved it and semantic review
-confirms a recurrence. A moved finding is posted at its current anchor before an
-open old thread is resolved; notes without trustworthy position metadata remain
-untouched. Human and foreign-bot discussions are never mutated. GitLab
-discussions and the owned description block are the durable state store; no
-external Revoot state service is required.
+`CI_JOB_TOKEN` can read merge-request data but cannot publish discussions. If
+`REVOOT_GITLAB_TOKEN` is absent, the publishing job fails its readiness check.
+GitLab.com project access tokens require Premium or Ultimate; on other plans,
+use a dedicated bot user's personal access token with the `api` scope.
 
-The owned overview carries the last review checkpoint. It is an attention hint,
-not authorization to omit code: merge-request descriptions are author-editable.
-Revoot verifies local ancestry, derives the tree delta since the prior reviewed
-head, and prioritizes those paths while preserving the complete merge-request
-diff as scope. Incomplete coverage, policy changes, rewritten history, empty or
-excessive deltas, and two consecutive incremental passes force full attention.
-The checkpoint is written only after notes and resolution transitions converge.
+Do not expose either the provider key or publishing token to untrusted fork
+pipelines. The component skips fork merge requests by default.
 
-The component marks review jobs interruptible and serializes publication per
-merge request with a GitLab resource group. Revoot still rechecks the immutable
-head and reacquires the discussion inventory before publication because
-job-level serialization is not an atomic code-host transaction. A concurrent
-reply, edit, resolution, or new discussion stops publication.
+## Job behavior
 
-GitHub remains authoritative if the component project or fixture diverges. Do
-not accept product source contributions, publish Revoot binaries, or build a
-second container image from GitLab.
+The job uses `.post`, which exists even when a project defines custom stages.
+An empty `needs` list starts it alongside other jobs; pass job names through the
+`needs` input to wait for checks. A pipeline with no ordinary-stage job does not
+run `.post`, so a Revoot-only pipeline should set `stage` to `test`.
 
-The canonical component template is maintained under `ci/gitlab/components` in
-the GitHub repository. A component release copies that reviewed template into
-the GitLab project's `templates/` directory and records the matching GHCR
-digest. GitLab platform state—merge requests, tokens, and pipeline results—is
-intentionally local to the fixture project.
+Review jobs are interruptible and publication is serialized per merge request.
+Revoot also rechecks the head and discussions before writing, stopping if
+either changed during review.
+
+On later pushes, Revoot updates one summary and reconciles its existing inline
+discussions. Resolved findings stay suppressed unless semantic review confirms
+a recurrence. Human and other bot discussions may suppress duplicates but are
+never modified. Embedded metadata identifies owned comments; GitLab remains
+the state store.
+
+## Component project
+
+The component and its acceptance fixtures live at
+`gitlab.com/getrevoot/revoot-ci`. It is not a mirror of this Rust repository and
+does not build Revoot. Each component release points to the matching image from
+`ghcr.io/getrevoot/revoot`.
+
+GitHub remains authoritative for Revoot source, releases, and container images.
+The canonical component template is maintained in
+`ci/gitlab/components/review/template.yml` in this repository.
