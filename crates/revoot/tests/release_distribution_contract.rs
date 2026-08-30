@@ -41,6 +41,11 @@ fn readme_leads_with_the_versioned_container_image() {
     assert!(docker < development);
     assert!(readme.contains("ghcr.io/getrevoot/revoot:0.1.0 review"));
     assert!(readme.contains("$PWD:/workspace:ro"));
+    assert!(readme.contains("https://github.com/getrevoot/revoot/releases"));
+    assert!(readme.contains("revoot-linux-amd64.tar.gz"));
+    assert!(readme.contains("revoot-linux-arm64.tar.gz"));
+    assert!(readme.contains("revoot-macos-arm64.tar.gz"));
+    assert!(readme.contains("SHA256SUMS"));
     assert!(!readme.contains("mise use --global"));
 }
 

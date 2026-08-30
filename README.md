@@ -47,6 +47,35 @@ docker run --rm \
 Revoot does not modify the checkout or execute repository code. Reviewed code
 and selected repository context are sent directly to your configured provider.
 
+## Install a native binary
+
+Each [GitHub release](https://github.com/getrevoot/revoot/releases) includes
+archives for Linux AMD64, Linux ARM64, and Apple Silicon macOS, plus a
+`SHA256SUMS` file. Download the matching archive:
+
+| System | Release asset |
+| --- | --- |
+| Linux x86-64 | `revoot-linux-amd64.tar.gz` |
+| Linux ARM64 | `revoot-linux-arm64.tar.gz` |
+| Apple Silicon macOS | `revoot-macos-arm64.tar.gz` |
+
+Verify the archive against `SHA256SUMS`, then extract and install the binary on
+your `PATH`:
+
+```sh
+archive=revoot-macos-arm64.tar.gz # choose from the table above
+
+awk -v archive="$archive" '$2 == archive' SHA256SUMS | shasum -a 256 --check -
+tar -xzf "$archive"
+mkdir -p "$HOME/.local/bin"
+install -m 0755 revoot "$HOME/.local/bin/revoot"
+revoot --version
+```
+
+On Linux, use `sha256sum --check -` if `shasum` is unavailable. Ensure
+`$HOME/.local/bin` is on your `PATH`. Native installations can use the shorter
+`revoot review` and `revoot init` commands in place of the Docker invocations.
+
 ## Run in CI
 
 CI reviews publish each actionable finding as a native review comment anchored
