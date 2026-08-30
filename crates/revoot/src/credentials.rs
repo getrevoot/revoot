@@ -85,6 +85,9 @@ impl DiscoveredCredentials {
                 _ => None,
             };
             let Some(kind) = kind else { continue };
+            if value.is_empty() {
+                continue;
+            }
             if discovered
                 .values
                 .insert(kind, SecretValue::new(&value)?)
@@ -177,5 +180,26 @@ mod tests {
         )])
         .expect_err("whitespace must be rejected");
         assert_eq!(error, CredentialError::InvalidValue);
+    }
+
+    #[test]
+    fn ignores_empty_provider_variables_from_ci_workflows() {
+        let credentials = DiscoveredCredentials::discover([
+            (OsString::from("ANTHROPIC_API_KEY"), OsString::new()),
+            (
+                OsString::from("OPENAI_API_KEY"),
+                OsString::from("openai-key"),
+            ),
+        ])
+        .expect("one configured provider");
+
+        assert!(credentials.get(CredentialKind::Anthropic).is_none());
+        assert_eq!(
+            credentials
+                .get(CredentialKind::OpenAiCompatible)
+                .expect("OpenAI key")
+                .expose(),
+            b"openai-key"
+        );
     }
 }
