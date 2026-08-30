@@ -44,6 +44,36 @@ jobs:
           REVOOT_MODEL: ${{ vars.REVOOT_MODEL || 'auto' }}
           REVOOT_FORK_BEHAVIOR: skip
           REVOOT_PUBLICATION_ENABLED: "true"
+      - name: Verify GitHub thread mutation capability
+        if: always()
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const threadId = "PRRT_kwDOUI-AMs6dkgGv";
+            let resolved = false;
+            try {
+              const result = await github.graphql(`
+                mutation($threadId: ID!) {
+                  resolveReviewThread(input: {threadId: $threadId}) {
+                    thread { id isResolved }
+                  }
+                }
+              `, {threadId});
+              core.info(JSON.stringify(result));
+              resolved = result.resolveReviewThread.thread.isResolved;
+            } finally {
+              if (resolved) {
+                const result = await github.graphql(`
+                  mutation($threadId: ID!) {
+                    unresolveReviewThread(input: {threadId: $threadId}) {
+                      thread { id isResolved }
+                    }
+                  }
+                `, {threadId});
+                core.info(JSON.stringify(result));
+              }
+            }
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
