@@ -14,8 +14,8 @@ organization secret. Optional Actions variables `REVOOT_PROVIDER` and
 `REVOOT_MODEL` override the `auto` defaults.
 
 No GitHub token setup is required. Each job receives a short-lived
-`GITHUB_TOKEN`; the workflow grants it `contents: read` and
-`pull-requests: write`. Comments appear as `github-actions[bot]`. A branded
+`GITHUB_TOKEN`; the workflow grants it package and repository read access plus
+pull-request write access. Comments appear as `github-actions[bot]`. A branded
 identity requires a GitHub App or bot-user token supplied as
 `REVOOT_GITHUB_TOKEN`.
 
@@ -41,7 +41,7 @@ Revoot checks the pull-request head and discussion state again before writing.
 It stops publication if either changed during the review. Human and other bot
 comments may suppress duplicates but are never modified.
 
-## Manual and Enterprise use
+## Manual use
 
 For a manual review, provide a token with repository contents read and pull
 request write access:
@@ -52,6 +52,20 @@ REVOOT_GITHUB_TOKEN=... OPENAI_API_KEY=... revoot review --pr 42
 
 Credentials are checked in this order: `REVOOT_GITHUB_TOKEN`, `GH_TOKEN`, then
 `GITHUB_TOKEN`.
+
+## Revoot repository dogfooding
+
+The `Publish preview image` workflow builds an AMD64 image from any selected
+branch without creating a GitHub release. Give it an RC or branch tag, then set
+the repository variable `REVOOT_TAG` to that tag. Clear the variable to return
+reviews to `latest`.
+
+```sh
+gh workflow run preview-image.yml --ref my-branch -f tag=rc-0.2.0-1
+gh variable set REVOOT_TAG --body rc-0.2.0-1
+```
+
+## GitHub Enterprise Server
 
 For GitHub Enterprise Server, provide its HTTPS origin. Revoot derives the
 `/api/v3` REST endpoint:

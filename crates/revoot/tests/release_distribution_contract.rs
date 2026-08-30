@@ -30,6 +30,21 @@ fn release_workflow_builds_packages_images_and_checksums() {
 }
 
 #[test]
+fn preview_workflow_publishes_branch_images_for_dogfooding() {
+    let root = workspace();
+    let pipeline = fs::read_to_string(root.join(".github/workflows/preview-image.yml"))
+        .expect("preview pipeline");
+    let _: serde_json::Value =
+        serde_saphyr::from_str(&pipeline).expect("preview pipeline must be valid YAML");
+
+    assert!(pipeline.contains("workflow_dispatch:"));
+    assert!(pipeline.contains("packages: write"));
+    assert!(pipeline.contains("package:linux:release:amd64"));
+    assert!(pipeline.contains("docker push \"$IMAGE:$PREVIEW_TAG\""));
+    assert!(!pipeline.contains("gh release create"));
+}
+
+#[test]
 fn readme_leads_with_the_versioned_container_image() {
     let root = workspace();
     let readme = fs::read_to_string(root.join("README.md")).expect("README");

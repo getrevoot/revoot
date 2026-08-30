@@ -246,16 +246,20 @@ fn generated_github_onboarding_contract_is_bounded_and_matches_ci_asset() {
         render_github_actions(&GitHubInitOptions::default()).expect("safe workflow inputs");
     let canonical = fs::read_to_string(workspace_root().join("ci/github/revoot-review.yml"))
         .expect("canonical GitHub workflow");
+    let _: serde_json::Value =
+        serde_saphyr::from_str(&canonical).expect("canonical GitHub workflow must be valid YAML");
 
     assert_eq!(generated, canonical);
     assert_eq!(generated.matches("revoot review --ci").count(), 1);
     assert!(generated.contains("contents: read"));
+    assert!(generated.contains("packages: read"));
     assert!(generated.contains("pull-requests: write"));
     assert!(generated.contains("persist-credentials: false"));
     assert!(generated.contains("github.event.pull_request.head.sha"));
     assert!(generated.contains("head.repo.full_name == github.repository"));
     assert!(generated.contains("REVOOT_PROVIDER: ${{ vars.REVOOT_PROVIDER || 'auto' }}"));
     assert!(generated.contains("REVOOT_MODEL: ${{ vars.REVOOT_MODEL || 'auto' }}"));
+    assert!(generated.contains("image: ghcr.io/getrevoot/revoot:0.1.0"));
     assert!(!generated.contains("pull_request_target"));
     assert!(!generated.contains("workflow_run"));
     assert!(!generated.contains("@main"));
@@ -279,6 +283,7 @@ fn configuration_reference_lists_operator_environment() {
     for variable in [
         "REVOOT_PROVIDER",
         "REVOOT_MODEL",
+        "REVOOT_TAG",
         "REVOOT_REVIEW_MODEL",
         "REVOOT_REVIEW_CONTEXT_LINES",
         "REVOOT_MINIMUM_CONFIDENCE",

@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
   pull-requests: write
 
 concurrency:
@@ -19,6 +20,9 @@ jobs:
     timeout-minutes: 10
     container:
       image: ghcr.io/getrevoot/revoot:0.1.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:

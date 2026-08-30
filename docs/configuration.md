@@ -111,9 +111,11 @@ Store these as CI secrets, not repository variables or `.revoot.toml` values.
 
 GitHub Actions repository or organization variables named `REVOOT_PROVIDER`
 and `REVOOT_MODEL` are mapped into the generated review job, with `auto` as the
-fallback for each. GitHub and GitLab also inject host-owned CI metadata; those
-platform variables identify the pull or merge request and are not Revoot
-configuration knobs.
+fallback for each. This repository's dogfooding workflow also uses `REVOOT_TAG`
+to select an RC or branch image, with `latest` as its fallback. These are
+workflow controls, not `revoot` process environment variables. GitHub and
+GitLab also inject host-owned CI metadata; those platform variables identify
+the pull or merge request and are not Revoot configuration knobs.
 
 ## Automatic attention budgeting
 
