@@ -55,14 +55,17 @@ Credentials are checked in this order: `REVOOT_GITHUB_TOKEN`, `GH_TOKEN`, then
 
 ## Revoot repository dogfooding
 
-The `Publish preview image` workflow builds an AMD64 image from any selected
-branch without creating a GitHub release. Give it an RC or branch tag, then set
-the repository variable `REVOOT_TAG` to that tag. Clear the variable to return
-reviews to `latest`.
+After CI succeeds for a trusted push to `main`, `Publish preview image` publishes
+AMD64 `main` and immutable `sha-*` images without creating a GitHub release.
+This repository sets `REVOOT_TAG=main` to dogfood the newest green build.
+
+Manual dispatch can publish an RC or branch tag. Point `REVOOT_TAG` at that tag
+for testing, set it back to `main` afterward, or clear it to use `latest`.
 
 ```sh
 gh workflow run preview-image.yml --ref my-branch -f tag=rc-0.2.0-1
 gh variable set REVOOT_TAG --body rc-0.2.0-1
+gh variable set REVOOT_TAG --body main
 ```
 
 ## GitHub Enterprise Server

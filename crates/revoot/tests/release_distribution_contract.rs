@@ -30,7 +30,7 @@ fn release_workflow_builds_packages_images_and_checksums() {
 }
 
 #[test]
-fn preview_workflow_publishes_branch_images_for_dogfooding() {
+fn preview_workflow_publishes_green_main_and_manual_images_for_dogfooding() {
     let root = workspace();
     let pipeline = fs::read_to_string(root.join(".github/workflows/preview-image.yml"))
         .expect("preview pipeline");
@@ -38,9 +38,17 @@ fn preview_workflow_publishes_branch_images_for_dogfooding() {
         serde_saphyr::from_str(&pipeline).expect("preview pipeline must be valid YAML");
 
     assert!(pipeline.contains("workflow_dispatch:"));
+    assert!(pipeline.contains("workflow_run:"));
+    assert!(pipeline.contains("github.event.workflow_run.conclusion == 'success'"));
+    assert!(pipeline.contains("github.event.workflow_run.event == 'push'"));
+    assert!(pipeline.contains("github.event.workflow_run.head_branch == 'main'"));
+    assert!(pipeline.contains("head_repository.full_name == github.repository"));
     assert!(pipeline.contains("packages: write"));
     assert!(pipeline.contains("package:linux:release:amd64"));
+    assert!(pipeline.contains("tag=main"));
+    assert!(pipeline.contains("sha_tag=sha-${SOURCE_SHA:0:12}"));
     assert!(pipeline.contains("docker push \"$IMAGE:$PREVIEW_TAG\""));
+    assert!(pipeline.contains("docker push \"$IMAGE:$SHA_TAG\""));
     assert!(!pipeline.contains("gh release create"));
 }
 
