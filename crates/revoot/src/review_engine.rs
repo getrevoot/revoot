@@ -9,7 +9,7 @@ use std::fmt::{self, Write as _};
 
 use revoot_core::{
     AgentBudgetDimension, AgentBudgetError, AgentOmission, AgentOmissionReason,
-    AgentProviderTurnError, AgentRun, AgentRunError, AgentTool, AgentTurnPurpose,
+    AgentProviderTurnError, AgentRun, AgentRunError, AgentTool, AgentTurnPurpose, AnchorPosition,
     CancellationToken, CandidateAdmission, CandidateAdmissionError, CandidateAdmissionHook,
     CandidateSubmission, CandidateSuppressionReason, DirectProviderErrorKind as ProviderErrorKind,
     ExecutionFact, ExecutionGraph, ExecutionGraphError, ExecutionGraphLimits, ExecutionGraphPlan,
@@ -29,7 +29,7 @@ use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 
 /// Version of the trusted reviewer policy used in quality evidence.
-pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v7";
+pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v8";
 
 const SYSTEM_PROMPT: &str = r"You are Revoot, one automatic code reviewer.
 Implementation and review are separate jobs, even when agents perform both.
@@ -78,7 +78,8 @@ or diff-narration comments. State the observable impact, the improvement, and
 the repository evidence connecting it to the changed line. Challenge each
 hypothesis before calling submit_candidate_finding. Before submitting, call
 show_diff for every changed path that anchors a finding and inspect relevant
-repository context with read_file or search. If a candidate is suppressed
+repository context with read_file or search. Use only an exact anchor ID
+returned by show_diff; never invent or derive one. If a candidate is suppressed
 because evidence is missing, obtain that evidence and resubmit it once; do not
 merely repeat the candidate.
 Silence is correct when no well-supported improvement remains. Risk describes
@@ -186,8 +187,10 @@ pub struct ReviewEngineRequest {
     /// Comment bodies are untrusted data; ownership and state are trusted host
     /// projections established by the acquisition controller.
     pub prior_review: PriorReviewContext,
-    /// Trusted mapping from opaque candidate anchors to their changed checkout paths.
-    pub anchor_paths: BTreeMap<String, RepositoryRelativePath>,
+    /// Trusted catalog of opaque candidate anchors and their changed coordinates.
+    /// The matching subset is returned with `show_diff` so the model can use an
+    /// exact allowlisted anchor instead of inventing one.
+    pub anchors: BTreeMap<String, ReviewAnchor>,
     /// Fresh, trusted change context. This is intentionally not a reusable
     /// implementer conversation or general model-message history.
     pub review_brief: IndependentReviewBrief,
@@ -198,6 +201,13 @@ pub struct ReviewEngineRequest {
     /// The model cannot remove or downgrade these facts.
     pub initial_omissions: Vec<AgentOmission>,
     pub limits: ReviewEngineLimits,
+}
+
+/// Model-visible location for one trusted candidate anchor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAnchor {
+    pub path: RepositoryRelativePath,
+    pub position: AnchorPosition,
 }
 
 /// Stable, JSON-report-friendly engine evidence.
@@ -435,7 +445,7 @@ struct RestrainedAdmission<'a> {
     minimum_confidence_percent: u8,
     inspected_repository_context: bool,
     inspected_diff_paths: &'a BTreeSet<RepositoryRelativePath>,
-    anchor_paths: &'a BTreeMap<String, RepositoryRelativePath>,
+    anchors: &'a BTreeMap<String, ReviewAnchor>,
     prior_review: &'a PriorReviewContext,
     prior_review_cursor: usize,
 }
@@ -451,9 +461,9 @@ impl CandidateAdmissionHook for RestrainedAdmission<'_> {
             );
         }
         if candidate.findings.iter().any(|finding| {
-            self.anchor_paths
+            self.anchors
                 .get(&finding.anchor_id)
-                .is_none_or(|path| !self.inspected_diff_paths.contains(path))
+                .is_none_or(|anchor| !self.inspected_diff_paths.contains(&anchor.path))
         }) {
             return CandidateAdmission::Suppress(CandidateSuppressionReason::DiffEvidenceMissing);
         }
@@ -708,7 +718,7 @@ pub async fn run_review(
                 &prior_review,
                 &cancellation,
                 clock.now_millis(),
-                &request.anchor_paths,
+                &request.anchors,
                 request.limits,
                 &mut summary,
                 &mut evidence,
@@ -858,7 +868,7 @@ fn validate_request(request: &ReviewEngineRequest) -> Result<(), ReviewEngineErr
         || request.limits.max_conversation_bytes == 0
         || request.limits.max_tool_result_bytes == 0
         || !(1..=100).contains(&request.limits.minimum_confidence_percent)
-        || request.anchor_paths.is_empty()
+        || request.anchors.is_empty()
     {
         return Err(ReviewEngineError::new(
             ReviewEngineErrorKind::InvalidRequest,
@@ -930,7 +940,7 @@ fn model_tools(history_available: bool, prior_review_available: bool) -> Vec<Mod
         ),
         model_tool(
             "show_diff",
-            "Show the exact changed-file diff that seeds review scope and anchors.",
+            "Show the exact changed-file diff and the trusted anchor IDs for its changed lines. Use an exact returned anchor_id for candidate findings.",
             object_schema(&["path"]),
         ),
     ];
@@ -1177,7 +1187,7 @@ fn execute_tool(
     prior_review: &PriorReviewContext,
     cancellation: &CancellationToken,
     now_millis: u64,
-    anchor_paths: &BTreeMap<String, RepositoryRelativePath>,
+    anchors: &BTreeMap<String, ReviewAnchor>,
     limits: ReviewEngineLimits,
     summary: &mut Option<ReviewOverview>,
     evidence: &mut EngineEvidence,
@@ -1267,8 +1277,25 @@ fn execute_tool(
             let result = toolbox
                 .show_diff(&path, run.budget_mut(), cancellation, now_millis)
                 .map_err(map_repository_error)?;
-            evidence.inspected_diff_paths.insert(path);
-            serde_json::to_value(result).map_err(|_| internal())?
+            evidence.inspected_diff_paths.insert(path.clone());
+            let changed_line_anchors = anchors
+                .iter()
+                .filter(|(_, anchor)| {
+                    anchor.path == path
+                        && !matches!(anchor.position, AnchorPosition::Context { .. })
+                })
+                .map(|(anchor_id, anchor)| {
+                    json!({
+                        "anchor_id": anchor_id,
+                        "position": anchor.position,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "path": result.path,
+                "content": result.content,
+                "changed_line_anchors": changed_line_anchors,
+            })
         }
         "list_change_commits" => {
             ensure_allowed(run, AgentTool::ListChangeCommits)?;
@@ -1330,7 +1357,7 @@ fn execute_tool(
                 minimum_confidence_percent: limits.minimum_confidence_percent,
                 inspected_repository_context: evidence.inspected_repository_context,
                 inspected_diff_paths: &evidence.inspected_diff_paths,
-                anchor_paths,
+                anchors,
                 prior_review,
                 prior_review_cursor: evidence.prior_review_cursor,
             };
@@ -1780,7 +1807,13 @@ mod tests {
             toolbox,
             history: None,
             prior_review: PriorReviewContext::default(),
-            anchor_paths: BTreeMap::from([("ga1_fixture".to_owned(), path("src/changed.rs"))]),
+            anchors: BTreeMap::from([(
+                "ga1_fixture".to_owned(),
+                ReviewAnchor {
+                    path: path("src/changed.rs"),
+                    position: AnchorPosition::addition(1).expect("valid anchor position"),
+                },
+            )]),
             review_brief: IndependentReviewBrief::try_new(
                 "Review unit-1 at anchor ga1_fixture.".to_owned(),
             )
@@ -1960,6 +1993,17 @@ mod tests {
             request.messages.iter().any(|message| {
                 message.content.iter().any(|content| {
                     matches!(content, ModelContent::ToolResult { content, .. } if content.contains("src/dependency.rs"))
+                })
+            })
+        }));
+        assert!(requests.iter().any(|request| {
+            request.messages.iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(content, ModelContent::ToolResult { content, .. }
+                        if content.contains("changed_line_anchors")
+                            && content.contains("ga1_fixture")
+                            && content.contains("\"kind\":\"addition\"")
+                            && content.contains("\"new_line\":1"))
                 })
             })
         }));
@@ -2251,8 +2295,10 @@ mod tests {
         let provider = ScriptedProvider::new(exploration_script(Some(verified_candidate(94))));
         let mut review_request = request(&fixture, &cancellation, AgentBudgetLimits::default());
         review_request
-            .anchor_paths
-            .insert("ga1_fixture".to_owned(), path("src/dependency.rs"));
+            .anchors
+            .get_mut("ga1_fixture")
+            .expect("fixture anchor")
+            .path = path("src/dependency.rs");
         let report = run_review(
             &provider,
             review_request,

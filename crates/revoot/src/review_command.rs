@@ -79,7 +79,7 @@ use crate::review_checkpoint::{
 };
 use crate::review_engine::{
     IndependentReviewBrief, MonotonicClock, PriorFindingDisposition, PriorFindingDispositionKind,
-    ReviewEngineLimits, ReviewEngineRequest, ReviewReport, run_review,
+    ReviewAnchor, ReviewEngineLimits, ReviewEngineRequest, ReviewReport, run_review,
 };
 use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
@@ -493,14 +493,22 @@ impl PreparedReview {
         omissions
     }
 
-    fn anchor_paths(
+    fn review_anchors(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, RepositoryRelativePath>, Diagnostic> {
+    ) -> Result<std::collections::BTreeMap<String, ReviewAnchor>, Diagnostic> {
         self.anchors()
             .iter()
             .map(|anchor| {
                 RepositoryRelativePath::try_from(anchor.path.new_path.as_str().to_owned())
-                    .map(|path| (anchor.id.as_str().to_owned(), path))
+                    .map(|path| {
+                        (
+                            anchor.id.as_str().to_owned(),
+                            ReviewAnchor {
+                                path,
+                                position: anchor.position,
+                            },
+                        )
+                    })
                     .map_err(|_| {
                         diagnostic(
                             ErrorCode::ContractInvalid,
@@ -946,7 +954,7 @@ async fn execute_prepared_review(
             toolbox,
             history,
             prior_review: prepared.prior_review(),
-            anchor_paths: prepared.anchor_paths()?,
+            anchors: prepared.review_anchors()?,
             review_brief,
             repository_guidance: guidance,
             initial_omissions,

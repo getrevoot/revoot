@@ -12,7 +12,8 @@ use revoot::providers::ApiKey;
 use revoot::providers::anthropic::{AnthropicAdapter, AnthropicConfig};
 use revoot::providers::openai::{OpenAiAdapter, OpenAiConfig};
 use revoot::review_engine::{
-    IndependentReviewBrief, MonotonicClock, ReviewEngineLimits, ReviewEngineRequest, run_review,
+    IndependentReviewBrief, MonotonicClock, ReviewAnchor, ReviewEngineLimits, ReviewEngineRequest,
+    run_review,
 };
 use revoot_core::{
     AgentBudgetLimits, AgentBudgetUsage, AgentTool, AnchorPosition, AnchorTable, CancellationToken,
@@ -240,13 +241,18 @@ fn prepare_case(
         toolbox,
         history: None,
         prior_review: revoot_core::PriorReviewContext::default(),
-        anchor_paths: anchors
+        anchors: anchors
             .iter()
             .map(|anchor| {
                 (
                     anchor.id.as_str().to_owned(),
-                    RepositoryRelativePath::try_from(anchor.path.new_path.as_str().to_owned())
+                    ReviewAnchor {
+                        path: RepositoryRelativePath::try_from(
+                            anchor.path.new_path.as_str().to_owned(),
+                        )
                         .expect("anchor checkout path"),
+                        position: anchor.position,
+                    },
                 )
             })
             .collect(),
