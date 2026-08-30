@@ -345,7 +345,9 @@ const fn provider_error_label(kind: ProviderErrorKind) -> &'static str {
         ProviderErrorKind::InvalidRequest => "invalid request",
         ProviderErrorKind::Authentication => "authentication",
         ProviderErrorKind::PermissionDenied => "permission denied",
-        ProviderErrorKind::RateLimited => "rate limited",
+        ProviderErrorKind::RateLimited => {
+            "rate limit or API credits exhausted; check provider usage and billing"
+        }
         ProviderErrorKind::Timeout => "timeout",
         ProviderErrorKind::Cancelled => "cancelled",
         ProviderErrorKind::Unavailable => "unavailable",
@@ -2220,5 +2222,11 @@ mod tests {
         let encoded = format!("{error:?}");
         assert!(!encoded.contains("token"));
         assert!(!encoded.contains("src/"));
+
+        let error = ReviewEngineError::provider(ProviderErrorKind::RateLimited, Some(429));
+        assert_eq!(
+            error.to_string(),
+            "automatic review provider failed (rate limit or API credits exhausted; check provider usage and billing; HTTP 429)"
+        );
     }
 }
