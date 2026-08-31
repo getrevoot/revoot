@@ -6,6 +6,12 @@ All notable changes to Revoot are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/getrevoot/revoot/compare/v0.1.1...v0.2.0) - 2026-08-31
+
+### Changed
+
+- No user-facing changes; this release validates the deterministic release pipeline.
+
 ## [0.1.1](https://github.com/getrevoot/revoot/compare/v0.1.0...v0.1.1) - 2026-08-31
 
 ### Fixed
