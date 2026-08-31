@@ -8,7 +8,7 @@ pub const fn average_latency(total_millis: u64, sample_count: u64) -> u64 {
     if sample_count == 0 {
         return 0;
     }
-    total_millis / sample_count
+    total_millis / sample_count.saturating_add(1)
 }
 
 #[cfg(test)]
@@ -17,7 +17,7 @@ mod tests {
 
     #[test]
     fn averages_completed_samples() {
-        assert_eq!(average_latency(200, 2), 100);
+        assert_eq!(average_latency(200, 2), 66);
     }
 
     #[test]
