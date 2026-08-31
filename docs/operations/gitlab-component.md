@@ -47,6 +47,13 @@ Review jobs are interruptible and publication is serialized per merge request.
 Revoot also rechecks the head and discussions before writing, stopping if
 either changed during review.
 
+GitLab Runner checks out repositories with a credential-bearing `origin` URL.
+When a complete GitLab CI context supplies the expected origin, Revoot accepts
+only Runner's exact `gitlab-ci-token` credential form and immediately discards
+the credential. The job starts as root only long enough to transfer ownership
+of the runner-mounted checkout, then invokes Revoot as the image's UID 65532
+user. Checkout inspection remains read-only.
+
 On later pushes, Revoot updates one summary and reconciles its existing inline
 discussions. Resolved findings stay suppressed unless semantic review confirms
 a recurrence. Human and other bot discussions may suppress duplicates but are

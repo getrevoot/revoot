@@ -32,6 +32,10 @@ revoot-review:
   image:
     name: $[[ inputs.image ]]
     entrypoint: [""]
+    docker:
+      user: "0:0"
+    kubernetes:
+      user: "0:0"
   variables:
     REVOOT_PROVIDER: $[[ inputs.provider ]]
     REVOOT_MODEL: $[[ inputs.model ]]
@@ -42,8 +46,13 @@ revoot-review:
     # Fork policy is enforced again by `revoot review --ci` after it has
     # classified the authoritative merge-request context.
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  before_script:
+    # The runner helper owns the mounted checkout. Match the non-root Revoot
+    # user before dropping privileges for repository inspection and review.
+    - chown 65532:65532 "$CI_PROJECT_DIR"
+    - chown -R 65532:65532 "$CI_PROJECT_DIR/.git"
   script:
-    - revoot review --ci --format json --output revoot-review.json
+    - su -p -s /bin/sh revoot -c 'exec revoot review --ci --format json --output revoot-review.json'
   artifacts:
     when: always
     access: developer

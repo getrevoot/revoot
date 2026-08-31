@@ -62,6 +62,11 @@ fn gitlab_is_a_component_fixture_not_a_source_mirror() {
     assert!(template.contains("default: .post"));
     assert!(template.contains("needs: $[[ inputs.needs ]]"));
     assert!(template.contains("- if: '$CI_PIPELINE_SOURCE == \"merge_request_event\"'"));
+    assert!(template.contains("docker:\n      user: \"0:0\""));
+    assert!(template.contains("kubernetes:\n      user: \"0:0\""));
+    assert!(template.contains("chown -R 65532:65532 \"$CI_PROJECT_DIR/.git\""));
+    assert!(template.contains("su -p -s /bin/sh revoot"));
+    assert!(!template.contains("CI_REPOSITORY_URL"));
     assert!(!template.contains("CI_MERGE_REQUEST_SOURCE_PROJECT_ID"));
     assert!(!template.contains("CI_MERGE_REQUEST_PROJECT_ID"));
     assert!(!template.contains("CI_MERGE_REQUEST_TARGET_PROJECT_ID"));
