@@ -87,20 +87,20 @@ REVOOT_GITHUB_TOKEN=... OPENAI_API_KEY=... revoot review --pr 42
 Credentials are checked in this order: `REVOOT_GITHUB_TOKEN`, `GH_TOKEN`, then
 `GITHUB_TOKEN`.
 
-## Revoot repository dogfooding
+## Revoot repository images and dogfooding
 
 After CI succeeds for a trusted push to `main`, `Publish preview image` publishes
 AMD64 `main` and immutable `sha-*` images without creating a GitHub release.
-This repository sets `REVOOT_IMAGE` to an immutable preview image digest to
-dogfood a reviewed build.
+Manual dispatch can publish an RC or branch tag for ad hoc testing.
 
-Manual dispatch can publish an RC or branch tag. Resolve that tag to its digest
-and update `REVOOT_IMAGE`; do not point the review workflow at the mutable tag.
+Pull requests dogfood their own Revoot changes automatically. The review
+workflow builds the pull request's AMD64 binary without credentials, publishes
+it as `ghcr.io/getrevoot/revoot:pr-N`, and runs the review job from that image.
+The PR-scoped tag is replaced on each push, and workflow concurrency prevents
+an older review run from continuing after a newer push.
 
 ```sh
 gh workflow run preview-image.yml --ref my-branch -f tag=rc-0.2.0-1
-gh variable set REVOOT_IMAGE --body \
-  'ghcr.io/getrevoot/revoot:rc-0.2.0-1@sha256:DIGEST'
 ```
 
 ## GitHub Enterprise Server

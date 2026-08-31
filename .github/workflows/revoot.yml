@@ -6,21 +6,87 @@ on:
 
 permissions:
   contents: read
-  packages: read
-  pull-requests: write
 
 concurrency:
   group: revoot-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  review:
-    name: Review pull request
+  build-image:
+    name: Build pull request image
     if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install toolchain
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.5
+          install: true
+          cache: true
+      - name: Build Linux AMD64 binary
+        run: mise run package:linux:release:amd64
+      - name: Upload binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: revoot-pr-image-binary
+          path: dist/revoot-linux-amd64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-image:
+    name: Publish pull request image
+    needs: build-image
+    runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out image definition
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: packaging/oci/Dockerfile
+          sparse-checkout-cone-mode: false
+      - name: Download binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: revoot-pr-image-binary
+          path: image-input
+      - name: Publish pull request image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
+        run: |
+          mkdir image-context
+          tar -xOzf image-input/revoot-linux-amd64.tar.gz revoot > image-context/revoot
+          chmod 0555 image-context/revoot
+          cp packaging/oci/Dockerfile image-context/Dockerfile
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}" \
+            --tag "$IMAGE" image-context
+          docker push "$IMAGE"
+
+  review:
+    name: Review pull request
+    needs: publish-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
     container:
-      image: ${{ vars.REVOOT_IMAGE }}
+      image: ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}

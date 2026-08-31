@@ -71,6 +71,23 @@ fn preview_workflow_publishes_green_main_and_manual_images_for_dogfooding() {
     assert!(pipeline.contains("docker push \"$IMAGE:$PREVIEW_TAG\""));
     assert!(pipeline.contains("docker push \"$IMAGE:$SHA_TAG\""));
     assert!(!pipeline.contains("gh release create"));
+
+    let review_pipeline =
+        fs::read_to_string(root.join(".github/workflows/revoot.yml")).expect("review pipeline");
+    assert!(review_pipeline.contains("mise run package:linux:release:amd64"));
+    assert!(review_pipeline.contains("docker push \"$IMAGE\""));
+    assert!(review_pipeline.contains(
+        "image: ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}"
+    ));
+    assert!(review_pipeline.contains("needs: publish-image"));
+    let checkout = review_pipeline
+        .find("Check out image definition")
+        .expect("image definition checkout");
+    let download = review_pipeline
+        .find("Download binary")
+        .expect("binary artifact download");
+    assert!(checkout < download);
+    assert!(!review_pipeline.contains("vars.REVOOT_IMAGE"));
 }
 
 #[test]
