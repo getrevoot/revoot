@@ -197,8 +197,10 @@ pub fn discover_gitlab_repository(
 ///
 /// # Errors
 ///
-/// Rejects malformed URLs, embedded credentials, unsupported origins, encoded
-/// paths, and invalid GitLab project paths.
+/// Rejects malformed URLs, unsupported origins, encoded paths, and invalid
+/// GitLab project paths. GitLab Runner's `gitlab-ci-token` credential form is
+/// accepted only when CI supplied the expected origin; the credential is never
+/// retained.
 pub fn parse_gitlab_remote_url(
     value: &str,
     origin_policy: &GitLabOriginPolicy,
@@ -209,8 +211,11 @@ pub fn parse_gitlab_remote_url(
     }
     let (host, project, explicit_https_origin) = if value.starts_with("https://") {
         let url = Url::parse(value).map_err(|_| GitLabCheckoutError::UnsupportedRemote)?;
-        if !url.username().is_empty()
-            || url.password().is_some()
+        let runner_credentials = expected_origin.is_some()
+            && url.username() == "gitlab-ci-token"
+            && url.password().is_some_and(|password| !password.is_empty());
+        let has_credentials = !url.username().is_empty() || url.password().is_some();
+        if (has_credentials && !runner_credentials)
             || url.query().is_some()
             || url.fragment().is_some()
         {
@@ -390,6 +395,29 @@ mod tests {
                 Some(&expected),
             ),
             Err(GitLabCheckoutError::RemoteOriginMismatch)
+        );
+    }
+
+    #[test]
+    fn accepts_only_gitlab_runner_credentials_with_an_expected_origin() {
+        let expected = GitLabOrigin::parse("https://gitlab.example.com", &policy()).unwrap();
+        let runner_url = "https://gitlab-ci-token:job-secret@gitlab.example.com/group/project.git";
+        let (origin, project) =
+            parse_gitlab_remote_url(runner_url, &policy(), Some(&expected)).unwrap();
+        assert_eq!(origin, expected);
+        assert_eq!(project.as_str(), "group/project");
+
+        assert_eq!(
+            parse_gitlab_remote_url(runner_url, &policy(), None),
+            Err(GitLabCheckoutError::UnsupportedRemote)
+        );
+        assert_eq!(
+            parse_gitlab_remote_url(
+                "https://other:job-secret@gitlab.example.com/group/project.git",
+                &policy(),
+                Some(&expected),
+            ),
+            Err(GitLabCheckoutError::UnsupportedRemote)
         );
     }
 

@@ -775,8 +775,9 @@ async fn run_async(
             "--base is available only for local branch review",
         ));
     }
+    let expected_gitlab_origin = gitlab_ci.hint().map(|hint| &hint.origin);
     let discovered_gitlab =
-        discover_gitlab_repository(current_directory, &origin_policy, None).ok();
+        discover_gitlab_repository(current_directory, &origin_policy, expected_gitlab_origin).ok();
     let explicit_github = pull_request_number.is_some() || explicit_github_repository.is_some();
     let github_requested = if github_ci.is_some() {
         true
