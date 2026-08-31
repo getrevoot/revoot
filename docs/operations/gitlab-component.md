@@ -33,7 +33,8 @@ use a dedicated bot user's personal access token with the `api` scope.
 Do not expose either the provider key or publishing token to untrusted fork
 pipelines. The component starts on merge-request pipelines so it can classify
 the authoritative context; Revoot then skips fork merge requests by default
-before provider or publication work.
+before credential discovery, GitLab API requests, provider calls, or publication
+work.
 
 ## Job behavior
 

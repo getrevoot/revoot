@@ -746,6 +746,18 @@ async fn run_async(
             "both GitHub and GitLab CI contexts are present",
         ));
     }
+    if matches!(gitlab_ci, revoot_core::GitLabCiContext::ForkMismatch { .. })
+        && matches!(
+            fork_behavior(&string_environment)?,
+            GitLabForkBehavior::Skip
+        )
+    {
+        return Ok((
+            "not_used".to_owned(),
+            "not_used".to_owned(),
+            skipped_fork_review_report(),
+        ));
+    }
     let explicit_host = ci_requested
         || merge_request_iid.is_some()
         || pull_request_number.is_some()
@@ -1088,6 +1100,26 @@ fn no_changes_report() -> CanonicalReviewReport {
         suppressed_candidates: 0,
         selection: CanonicalSelection::default(),
         publication: CanonicalPublication::terminal("not_needed", Some("no_changes")),
+        finding_locations: BTreeMap::new(),
+    }
+}
+
+fn skipped_fork_review_report() -> CanonicalReviewReport {
+    CanonicalReviewReport {
+        state: "skipped",
+        overview: None,
+        summary: Some("Fork merge request skipped by policy.".to_owned()),
+        findings: Vec::new(),
+        omissions: Vec::new(),
+        prior_finding_dispositions: Vec::new(),
+        duplicates_omitted: 0,
+        usage: AgentBudgetUsage::default(),
+        turns: 0,
+        tool_calls: 0,
+        admitted_candidates: 0,
+        suppressed_candidates: 0,
+        selection: CanonicalSelection::default(),
+        publication: CanonicalPublication::terminal("skipped", Some("fork_policy")),
         finding_locations: BTreeMap::new(),
     }
 }
@@ -2912,6 +2944,31 @@ mod tests {
         );
     }
 
+    fn fork_gitlab_environment() -> Vec<(OsString, OsString)> {
+        [
+            ("CI_SERVER_URL", "https://gitlab.example.com"),
+            ("CI_PIPELINE_SOURCE", "merge_request_event"),
+            ("CI_PROJECT_ID", "99"),
+            ("CI_PROJECT_PATH", "contributor/project"),
+            ("CI_MERGE_REQUEST_PROJECT_ID", "42"),
+            ("CI_MERGE_REQUEST_PROJECT_PATH", "group/project"),
+            ("CI_MERGE_REQUEST_IID", "7"),
+            ("CI_MERGE_REQUEST_SOURCE_PROJECT_ID", "99"),
+            (
+                "CI_MERGE_REQUEST_SOURCE_PROJECT_PATH",
+                "contributor/project",
+            ),
+            ("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME", "feature/fork"),
+            ("CI_MERGE_REQUEST_TARGET_BRANCH_NAME", "main"),
+            ("CI_MERGE_REQUEST_EVENT_TYPE", "detached"),
+            ("CI_COMMIT_SHA", "0123456789abcdef0123456789abcdef01234567"),
+            ("CI_MERGE_REQUEST_SOURCE_BRANCH_SHA", ""),
+        ]
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect()
+    }
+
     #[test]
     fn changed_file_selection_limits_do_not_cap_repository_exploration() {
         let repository = CleanLocalRepository::new();
@@ -3015,6 +3072,38 @@ mod tests {
         )
         .expect("binary-only review succeeds");
         assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn skipped_gitlab_fork_needs_no_checkout_code_host_or_provider_credential() {
+        let sequence = LOCAL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let output = std::env::temp_dir().join(format!(
+            "revoot-skipped-gitlab-fork-{}-{sequence}.json",
+            std::process::id()
+        ));
+        let missing_checkout = std::env::temp_dir().join(format!(
+            "revoot-missing-gitlab-checkout-{}-{sequence}",
+            std::process::id()
+        ));
+        let exit = super::run(
+            [
+                "--ci".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+                "--output".to_owned(),
+                output.to_string_lossy().into_owned(),
+            ]
+            .into_iter(),
+            fork_gitlab_environment(),
+            &missing_checkout,
+        )
+        .expect("default fork policy skips before external acquisition");
+        assert_eq!(exit, 0);
+        let report = fs::read_to_string(&output).expect("skipped report");
+        assert!(report.contains("\"provider\": \"not_used\""));
+        assert!(report.contains("\"state\": \"skipped\""));
+        assert!(report.contains("\"reason\": \"fork_policy\""));
+        fs::remove_file(output).expect("remove skipped report");
     }
 
     #[test]
