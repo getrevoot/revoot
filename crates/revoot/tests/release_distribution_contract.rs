@@ -80,6 +80,13 @@ fn preview_workflow_publishes_green_main_and_manual_images_for_dogfooding() {
         "image: ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}"
     ));
     assert!(review_pipeline.contains("needs: publish-image"));
+    let checkout = review_pipeline
+        .find("Check out image definition")
+        .expect("image definition checkout");
+    let download = review_pipeline
+        .find("Download binary")
+        .expect("binary artifact download");
+    assert!(checkout < download);
     assert!(!review_pipeline.contains("vars.REVOOT_IMAGE"));
 }
 
