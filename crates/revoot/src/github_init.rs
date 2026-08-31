@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-const CHECKOUT_ACTION: &str = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5";
+const CHECKOUT_ACTION: &str = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd";
 const UPLOAD_ACTION: &str = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
