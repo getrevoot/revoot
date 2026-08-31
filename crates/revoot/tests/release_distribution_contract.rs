@@ -44,10 +44,47 @@ fn release_preparation_is_manual_and_updates_a_pull_request() {
         serde_saphyr::from_str(&pipeline).expect("release preparation pipeline must be valid YAML");
 
     assert!(pipeline.contains("workflow_dispatch:"));
-    assert!(pipeline.contains("contents: write"));
-    assert!(pipeline.contains("pull-requests: write"));
+    assert!(pipeline.contains("actions/create-github-app-token@"));
+    assert!(pipeline.contains("secrets.RELEASE_APP_ID"));
+    assert!(pipeline.contains("secrets.RELEASE_APP_PRIVATE_KEY"));
     assert!(pipeline.contains("mise run release:pr"));
-    assert!(pipeline.contains("GIT_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || github.token }}"));
+    assert!(pipeline.contains("GIT_TOKEN: ${{ steps.release-token.outputs.token }}"));
+    assert!(!pipeline.contains("RELEASE_PLZ_TOKEN"));
+    assert!(!pipeline.contains("github.token"));
+}
+
+#[test]
+fn merged_release_pull_requests_are_tagged_by_the_release_app() {
+    let root = workspace();
+    let pipeline = fs::read_to_string(root.join(".github/workflows/promote-release.yml"))
+        .expect("release promotion pipeline");
+    let _: serde_json::Value =
+        serde_saphyr::from_str(&pipeline).expect("release promotion pipeline must be valid YAML");
+
+    assert!(pipeline.contains("pull_request:"));
+    assert!(pipeline.contains("types: [closed]"));
+    assert!(pipeline.contains("workflow_dispatch:"));
+    assert!(pipeline.contains("release_pr:"));
+    assert!(pipeline.contains("cancel-in-progress: false"));
+    assert!(pipeline.contains("actions/create-github-app-token@"));
+    assert!(pipeline.contains("secrets.RELEASE_APP_ID"));
+    assert!(pipeline.contains("secrets.RELEASE_APP_PRIVATE_KEY"));
+    assert!(pipeline.contains(".merged_at != null"));
+    assert!(pipeline.contains(".base.ref == \"main\""));
+    assert!(pipeline.contains("startsWith(github.event.pull_request.head.ref, 'release-plz-')"));
+    assert!(pipeline.contains("persist-credentials: true"));
+    assert!(pipeline.contains("path: release-automation"));
+    assert!(pipeline.contains("path: release-source"));
+    assert!(pipeline.contains("release-automation/scripts/tag-merged-release.sh"));
+    assert!(!pipeline.contains("github.token"));
+
+    let tagger =
+        fs::read_to_string(root.join("scripts/tag-merged-release.sh")).expect("release tagger");
+    assert!(tagger.contains("merge-base --is-ancestor"));
+    assert!(tagger.contains("chore: release $tag"));
+    assert!(tagger.contains("show-ref --verify --quiet"));
+    assert!(tagger.contains("tag -a \"$tag\" \"$release_sha\""));
+    assert!(tagger.contains("push origin \"refs/tags/$tag\""));
 }
 
 #[test]
@@ -174,4 +211,109 @@ fn release_version_guard_binds_tag_package_and_changelog() {
     assert!(!mismatch.success());
 
     fs::remove_dir_all(fixture).expect("remove release fixture");
+}
+
+#[test]
+fn merged_release_tagger_is_validated_and_idempotent() {
+    let root = workspace();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let fixture = std::env::temp_dir().join(format!("revoot-release-tagger-{nonce}"));
+    let remote = std::env::temp_dir().join(format!("revoot-release-origin-{nonce}.git"));
+    fs::create_dir_all(&fixture).expect("release tagger fixture directory");
+    fs::write(
+        fixture.join("Cargo.toml"),
+        "[workspace.package]\nversion = \"0.1.0\"\n",
+    )
+    .expect("Cargo fixture");
+    fs::write(
+        fixture.join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n\n## [0.1.0](https://example.invalid/v0.1.0) - 2026-08-30\n\n- Initial release.\n",
+    )
+    .expect("changelog fixture");
+    for arguments in [
+        &["init", "-b", "main"][..],
+        &["config", "user.name", "Revoot Test"][..],
+        &["config", "user.email", "test@example.invalid"][..],
+        &["add", "."][..],
+        &["commit", "-m", "chore: release v0.1.0"][..],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(&fixture)
+                .status()
+                .expect("git fixture command")
+                .success()
+        );
+    }
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote.to_str().expect("remote path")])
+            .status()
+            .expect("bare remote")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path")
+            ])
+            .current_dir(&fixture)
+            .status()
+            .expect("add fixture remote")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["push", "--set-upstream", "origin", "main"])
+            .current_dir(&fixture)
+            .status()
+            .expect("push fixture main")
+            .success()
+    );
+
+    let release_sha = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&fixture)
+            .output()
+            .expect("fixture release SHA")
+            .stdout,
+    )
+    .expect("UTF-8 release SHA");
+    let release_sha = release_sha.trim();
+    for _ in 0..2 {
+        assert!(
+            Command::new("bash")
+                .arg(root.join("scripts/tag-merged-release.sh"))
+                .args([release_sha, fixture.to_str().expect("fixture path")])
+                .status()
+                .expect("merged release tagger")
+                .success()
+        );
+    }
+
+    let remote_tag = String::from_utf8(
+        Command::new("git")
+            .args([
+                "--git-dir",
+                remote.to_str().expect("remote path"),
+                "rev-parse",
+                "v0.1.0^{commit}",
+            ])
+            .output()
+            .expect("remote release tag")
+            .stdout,
+    )
+    .expect("UTF-8 remote tag");
+    assert_eq!(remote_tag.trim(), release_sha);
+
+    fs::remove_dir_all(fixture).expect("remove release tagger fixture");
+    fs::remove_dir_all(remote).expect("remove release tagger remote");
 }
