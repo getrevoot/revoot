@@ -9,8 +9,9 @@ REVOOT_IMAGE='ghcr.io/getrevoot/revoot:VERSION@sha256:DIGEST'
 revoot init gitlab --image "$REVOOT_IMAGE"
 ```
 
-Copy the digest from the matching GitHub release's `image-digest.txt`. The
-component input rejects mutable tags.
+Copy the digest from the matching
+[GitHub release](https://github.com/getrevoot/revoot/releases) in
+`image-digest.txt`. The component input rejects mutable tags.
 
 Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a masked CI/CD variable.
 Provider and model default to `auto` and can be overridden through component
@@ -52,10 +53,12 @@ the state store.
 ## Component project
 
 The component and its acceptance fixtures live at
-`gitlab.com/getrevoot/revoot-ci`. It is not a mirror of this Rust repository and
-does not build Revoot. Each component release points to the matching image from
-`ghcr.io/getrevoot/revoot`.
+[`gitlab.com/revoot/revoot-ci`](https://gitlab.com/revoot/revoot-ci). It is not a mirror of this Rust repository and does not build Revoot. Each component
+release points to the matching image from the
+[Revoot container package](https://github.com/getrevoot/revoot/pkgs/container/revoot).
 
-GitHub remains authoritative for Revoot source, releases, and container images.
+GitHub remains authoritative for Revoot
+[source](https://github.com/getrevoot/revoot),
+[releases](https://github.com/getrevoot/revoot/releases), and container images.
 The canonical component template is maintained in
-`ci/gitlab/components/review/template.yml` in this repository.
+[`ci/gitlab/components/review/template.yml`](https://github.com/getrevoot/revoot/blob/main/ci/gitlab/components/review/template.yml).

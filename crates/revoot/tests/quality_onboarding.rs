@@ -194,7 +194,7 @@ fn generated_gitlab_onboarding_contract_is_bounded_and_matches_ci_assets() {
     let started = Instant::now();
     let options = GitLabInitOptions {
         image: immutable_image("0.1.0"),
-        component: "gitlab.com/getrevoot/revoot-ci/review".to_owned(),
+        component: "gitlab.com/revoot/revoot-ci/review".to_owned(),
         version: "0.1.0".to_owned(),
         provider: "anthropic".to_owned(),
         model: "claude-sonnet-5".to_owned(),
@@ -203,7 +203,7 @@ fn generated_gitlab_onboarding_contract_is_bounded_and_matches_ci_assets() {
     let generated = render_gitlab_ci(&options).expect("safe onboarding input must render");
 
     assert_eq!(generated.matches("include:").count(), 1);
-    assert!(generated.contains("component: gitlab.com/getrevoot/revoot-ci/review@0.1.0"));
+    assert!(generated.contains("component: gitlab.com/revoot/revoot-ci/review@0.1.0"));
     assert!(generated.contains("provider: anthropic"));
     assert!(generated.contains("model: claude-sonnet-5"));
     assert!(generated.contains("fork_behavior: skip"));

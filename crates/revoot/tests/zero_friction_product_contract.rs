@@ -327,7 +327,7 @@ fn a_silent_review_is_a_successful_terminal_outcome() {
 fn generated_gitlab_include_is_minimal_and_selects_no_review_strategy() {
     let generated = render_gitlab_ci(&GitLabInitOptions {
         image: immutable_image("1.2.3"),
-        component: "gitlab.com/getrevoot/revoot-ci/review".to_owned(),
+        component: "gitlab.com/revoot/revoot-ci/review".to_owned(),
         version: "1.2.3".to_owned(),
         provider: "anthropic".to_owned(),
         model: "auto".to_owned(),
@@ -340,7 +340,7 @@ fn generated_gitlab_include_is_minimal_and_selects_no_review_strategy() {
         lines,
         [
             "include:",
-            "  - component: gitlab.com/getrevoot/revoot-ci/review@1.2.3",
+            "  - component: gitlab.com/revoot/revoot-ci/review@1.2.3",
             "    inputs:",
             "      image: ghcr.io/getrevoot/revoot:1.2.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "      provider: anthropic",
