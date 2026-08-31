@@ -1,0 +1,53 @@
+name: Clean up pull request images
+
+on:
+  pull_request_target:
+    types: [closed]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: read
+
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request_target'
+      && format('revoot-{0}', github.event.pull_request.number)
+      || 'cleanup-pr-images' }}
+  cancel-in-progress: true
+
+jobs:
+  cleanup:
+    name: Delete closed pull request images
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete closed pull request images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          open_tags=$(mktemp)
+          package_versions=$(mktemp)
+          trap 'rm -f "$open_tags" "$package_versions"' EXIT
+
+          gh api --paginate \
+            "/repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+            --jq '.[] | "pr-\(.number)"' > "$open_tags"
+
+          package_name=${GITHUB_REPOSITORY#*/}
+          package_endpoint="/orgs/$GITHUB_REPOSITORY_OWNER/packages/container/$package_name/versions"
+          gh api --paginate "$package_endpoint?per_page=100" \
+            --jq '.[] | .id as $id | .metadata.container.tags[] | select(test("^pr-[0-9]+$")) | [$id, .] | @tsv' \
+            > "$package_versions"
+
+          while IFS=$'\t' read -r version_id tag; do
+            if ! grep -Fxq "$tag" "$open_tags"; then
+              echo "Deleting $tag (package version $version_id)"
+              gh api --method DELETE "$package_endpoint/$version_id"
+            fi
+          done < "$package_versions"
