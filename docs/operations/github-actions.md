@@ -51,12 +51,14 @@ provider credential can be supplied safely.
 
 ## Subsequent pushes
 
-Revoot reads existing review threads before each run. It updates one summary,
-re-anchors findings when needed, and does not repeat an established finding
-unless semantic review confirms that the issue recurred. Human-resolved
-findings remain suppressed unless review establishes a materially new
-occurrence. Embedded metadata identifies Revoot-owned comments; the pull
-request remains the state store.
+Revoot reads existing review threads before each run. It updates one summary
+and does not repeat an established finding unless semantic review confirms that
+the issue recurred. When GitHub permits thread resolution, Revoot can retire an
+old thread and re-anchor the recurrence. Otherwise it retains the existing open
+lineage instead of creating a second active conversation, while recording the
+current occurrence in the overview. Human-resolved findings remain suppressed
+unless review establishes a materially new occurrence. Embedded metadata
+identifies Revoot-owned comments; the pull request remains the state store.
 
 Revoot checks the pull-request head and discussion state again before writing.
 It stops publication if either changed during the review. Human and other bot
