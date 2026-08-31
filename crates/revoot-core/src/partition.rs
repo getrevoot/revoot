@@ -17,6 +17,42 @@ const WORK_UNIT_PREFIX: &str = "wu2_";
 const LOW_SIGNAL_BUDGET_DIVISOR: u64 = 10;
 const MAX_LOW_SIGNAL_BYTES: u64 = 64 * 1_024;
 
+/// Return whether a repository path is always denied from model context.
+///
+/// This predicate is shared by initial review partitioning and repository
+/// tools so sensitive paths cannot cross one model boundary through another.
+#[must_use]
+pub fn is_sensitive_model_context_path(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    (basename == ".env" || basename.starts_with(".env."))
+        || matches!(
+            basename,
+            ".npmrc" | ".pypirc" | ".netrc" | ".dockercfg" | "credentials" | "kubeconfig"
+        )
+        || [
+            ".pem",
+            ".key",
+            ".p12",
+            ".pfx",
+            ".jks",
+            ".keystore",
+            ".tfstate",
+            ".tfstate.backup",
+        ]
+        .iter()
+        .any(|suffix| basename.ends_with(suffix))
+        || [
+            ".aws/",
+            ".azure/",
+            ".config/gcloud/",
+            ".kube/",
+            ".ssh/",
+            ".terraform/",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix) || path.contains(&format!("/{prefix}")))
+}
+
 /// Stable classification used by deterministic exclusion policy.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1145,6 +1181,9 @@ fn selection_reason(
     policy: &ReviewSelectionPolicy,
 ) -> Option<ReviewOmissionReason> {
     let path = file.canonical_path();
+    if is_sensitive_model_context_path(path.as_str()) {
+        return Some(ReviewOmissionReason::ExactPathPolicy);
+    }
     let has_includes = !policy.included_paths.is_empty()
         || !policy.included_prefixes.is_empty()
         || !policy.included_suffixes.is_empty();
@@ -1445,14 +1484,14 @@ mod tests {
     #[test]
     fn basename_prefix_exclusion_applies_at_every_repository_depth() {
         let mut selection = policy();
-        selection.excluded_basename_prefixes = vec![".env.".to_owned()];
+        selection.excluded_basename_prefixes = vec!["secret.".to_owned()];
         let plan = build_partition_plan(
             snapshot(),
             &selection,
             limits(),
             [
-                file(".env.production", 10, '1'),
-                file("services/api/.env.example", 10, '2'),
+                file("secret.production", 10, '1'),
+                file("services/api/secret.example", 10, '2'),
                 file("src/lib.rs", 10, '3'),
             ],
         )
@@ -1463,6 +1502,38 @@ mod tests {
             plan.omitted
                 .iter()
                 .all(|omitted| omitted.reason == ReviewOmissionReason::PrefixPolicy)
+        );
+    }
+
+    #[test]
+    fn sensitive_model_context_paths_are_omitted_at_every_repository_depth() {
+        let plan = build_partition_plan(
+            snapshot(),
+            &policy(),
+            limits(),
+            [
+                file("services/api/.dockercfg", 10, '1'),
+                file("services/api/.aws/config", 10, '2'),
+                file("ops/.terraform/vars.tfvars", 10, '3'),
+                file(
+                    "home/.config/gcloud/application_default_credentials.json",
+                    10,
+                    '4',
+                ),
+                file("src/lib.rs", 10, '5'),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.coverage.included_files, 1);
+        assert_eq!(plan.coverage.omitted_files, 4);
+        assert!(
+            plan.omitted
+                .iter()
+                .all(|omitted| omitted.reason == ReviewOmissionReason::ExactPathPolicy)
+        );
+        assert_eq!(
+            plan.work_units[0].files[0].path.new_path.as_str(),
+            "src/lib.rs"
         );
     }
 

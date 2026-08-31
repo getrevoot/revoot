@@ -2319,48 +2319,14 @@ fn selection_policy(
     repository_policy: &RepositoryReviewPolicy,
 ) -> Result<ReviewSelectionPolicy, Diagnostic> {
     let mut policy = ReviewSelectionPolicy {
-        version: "automatic-v2".to_owned(),
+        version: "automatic-v3".to_owned(),
         included_paths: BTreeSet::new(),
         included_prefixes: Vec::new(),
         included_suffixes: Vec::new(),
-        excluded_paths: [".env", ".npmrc", ".pypirc", ".netrc", ".dockercfg"]
-            .into_iter()
-            .map(|path| RepositoryPath::try_from(path.to_owned()).expect("built-in path is valid"))
-            .collect(),
-        excluded_prefixes: vec![
-            ".aws/".to_owned(),
-            ".azure/".to_owned(),
-            ".config/gcloud/".to_owned(),
-            ".git/".to_owned(),
-            ".kube/".to_owned(),
-            ".ssh/".to_owned(),
-            ".terraform/".to_owned(),
-            "vendor/".to_owned(),
-        ],
-        excluded_suffixes: [
-            ".env.local",
-            ".env.production",
-            ".env.staging",
-            ".generated",
-            ".jks",
-            ".key",
-            ".keystore",
-            ".p12",
-            ".pem",
-            ".pfx",
-            ".tfstate",
-            ".tfstate.backup",
-            "/.env",
-            "/.netrc",
-            "/.npmrc",
-            "/.pypirc",
-            "/credentials",
-            "/kubeconfig",
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect(),
-        excluded_basename_prefixes: vec![".env.".to_owned()],
+        excluded_paths: BTreeSet::new(),
+        excluded_prefixes: vec![".git/".to_owned(), "vendor/".to_owned()],
+        excluded_suffixes: vec![".generated".to_owned()],
+        excluded_basename_prefixes: Vec::new(),
         include_generated: config_bool(resolution, "review.include_generated")?,
         max_file_bytes: 2 * 1024 * 1024,
     };

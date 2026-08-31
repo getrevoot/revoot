@@ -12,6 +12,7 @@ use revoot_core::{
     AssignmentScope, ConfigAssignment, ConfigExplainRecord, ConfigField, ConfigKey, ConfigSource,
     ConfigValue, ConfigurationResolution, ConfigurationSchema, Diagnostic, ErrorCode, GitSha,
     PolicyConstraint, PolicyRule, Sha256Digest, SourceProvenance, ValueConstraint,
+    is_sensitive_model_context_path,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,7 +70,7 @@ impl RepositoryReviewPolicy {
     /// may narrow the context further, but cannot re-enable a built-in denial.
     #[must_use]
     pub fn allows_model_context(&self, path: &str) -> bool {
-        !default_sensitive_context_path(path)
+        !is_sensitive_model_context_path(path)
             && !self
                 .model_context
                 .exclude
@@ -865,37 +866,6 @@ fn context_pattern_matches(pattern: &str, path: &str) -> bool {
             .strip_prefix("**/*")
             .is_some_and(|suffix| path.ends_with(suffix))
         || pattern == path
-}
-
-fn default_sensitive_context_path(path: &str) -> bool {
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    (basename == ".env" || basename.starts_with(".env."))
-        || matches!(
-            basename,
-            ".npmrc" | ".pypirc" | ".netrc" | ".dockercfg" | "credentials" | "kubeconfig"
-        )
-        || [
-            ".pem",
-            ".key",
-            ".p12",
-            ".pfx",
-            ".jks",
-            ".keystore",
-            ".tfstate",
-            ".tfstate.backup",
-        ]
-        .iter()
-        .any(|suffix| basename.ends_with(suffix))
-        || [
-            ".aws/",
-            ".azure/",
-            ".config/gcloud/",
-            ".kube/",
-            ".ssh/",
-            ".terraform/",
-        ]
-        .iter()
-        .any(|prefix| path.starts_with(prefix) || path.contains(&format!("/{prefix}")))
 }
 
 fn validate_string_list(values: &[String], maximum: usize, label: &str) -> Result<(), Diagnostic> {

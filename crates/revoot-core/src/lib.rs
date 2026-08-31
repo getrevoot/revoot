@@ -81,6 +81,7 @@ pub use partition::{
     ReviewObject, ReviewObjectRole, ReviewOmissionReason, ReviewPartitionPlan,
     ReviewSelectionPolicy, ReviewValue, ReviewValueReason, ReviewValueTier, ReviewWorkUnit,
     WorkUnitFile, WorkUnitId, build_partition_plan, classify_review_value,
+    is_sensitive_model_context_path,
 };
 pub use provider::ProviderErrorKind as DirectProviderErrorKind;
 pub use provider::{
