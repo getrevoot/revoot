@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-const DEFAULT_COMPONENT: &str = "gitlab.com/getrevoot/revoot-ci/review";
+const DEFAULT_COMPONENT: &str = "gitlab.com/revoot/revoot-ci/review";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitLabInitOptions {
