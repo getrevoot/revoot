@@ -194,7 +194,7 @@ pub fn render_review_overview(
     overview.validate()?;
     let mut output = String::new();
     output.push_str(OVERVIEW_START);
-    output.push_str("\n## Revoot Code Review\n\n<hr>\n\n<strong>Overall risk: ");
+    output.push_str("\n## Revoot Code Review\n\n<strong>Overall risk: ");
     output.push_str(overview.overall_risk.icon());
     output.push(' ');
     output.push_str(overview.overall_risk.label());
@@ -421,9 +421,10 @@ mod tests {
             render_review_overview(&overview(), &metadata().with_checkpoint(checkpoint.clone()))
                 .unwrap();
         assert!(rendered.starts_with(&format!(
-            "{OVERVIEW_START}\n## Revoot Code Review\n\n<hr>\n\n\
+            "{OVERVIEW_START}\n## Revoot Code Review\n\n\
              <strong>Overall risk: 🟠 High</strong>"
         )));
+        assert!(!rendered.contains("<hr>"));
         assert!(!rendered.contains("<details>"));
         assert!(!rendered.contains("<summary>"));
         assert!(rendered.contains(

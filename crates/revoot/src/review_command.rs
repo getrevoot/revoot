@@ -1079,17 +1079,14 @@ fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
     CanonicalReviewReport {
         state: "no_findings",
         overview: Some(ReviewOverview {
-            summary: "The change contains no files selected for model review after deterministic attention budgeting.".to_owned(),
+            summary: "No changed files were selected for model review.".to_owned(),
             overall_risk: RiskLevel::Moderate,
-            overall_basis: "The risk profile is incomplete because no changed file qualified for semantic model review.".to_owned(),
+            overall_basis: "The overall risk could not be fully assessed because no changed files were selected for model review.".to_owned(),
             risks: Vec::new(),
-            assumptions_and_gaps: vec!["Files omitted by deterministic attention budgeting were not semantically reviewed.".to_owned()],
+            assumptions_and_gaps: vec!["The omitted files were not reviewed by the model.".to_owned()],
             manual_validations: Vec::new(),
         }),
-        summary: Some(
-            "No changed file qualified for model review after deterministic attention budgeting."
-                .to_owned(),
-        ),
+        summary: Some("No changed files were selected for model review.".to_owned()),
         findings: Vec::new(),
         omissions: prepared.initial_omissions(),
         prior_finding_dispositions: Vec::new(),
@@ -1115,7 +1112,7 @@ fn minimum_review_risk(
     {
         (
             RiskLevel::Critical,
-            "Confirmed critical review evidence affects a material behavior or safety boundary.",
+            "The review identified a critical-severity finding.",
         )
     } else if findings
         .iter()
@@ -1123,16 +1120,20 @@ fn minimum_review_risk(
     {
         (
             RiskLevel::High,
-            "Confirmed review evidence affects a material behavior or safety boundary.",
+            "The review identified a high-severity finding.",
         )
-    } else if selection.selected_high_signal_files > 0
-        || findings
-            .iter()
-            .any(|finding| finding.severity == Severity::Medium)
+    } else if findings
+        .iter()
+        .any(|finding| finding.severity == Severity::Medium)
     {
         (
             RiskLevel::Moderate,
-            "The change touches a high-signal surface or has confirmed material review evidence.",
+            "The review identified a medium-severity finding.",
+        )
+    } else if selection.selected_high_signal_files > 0 {
+        (
+            RiskLevel::Moderate,
+            "The change affects code that warrants additional scrutiny.",
         )
     } else {
         (RiskLevel::Low, "")
@@ -3105,7 +3106,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_finding_severity_sets_the_minimum_overall_risk() {
+    fn findings_and_selected_code_set_clear_minimum_risk_bases() {
         let finding = |severity| RankedFinding {
             work_unit_id: "unit".to_owned(),
             anchor_id: AnchorId::try_from(format!("ga1_{}", "a".repeat(64))).unwrap(),
@@ -3120,12 +3121,37 @@ mod tests {
         let selection = CanonicalSelection::default();
 
         assert_eq!(
-            minimum_review_risk(&[finding(Severity::Critical)], &selection).0,
-            RiskLevel::Critical
+            minimum_review_risk(&[finding(Severity::Critical)], &selection),
+            (
+                RiskLevel::Critical,
+                "The review identified a critical-severity finding."
+            )
         );
         assert_eq!(
-            minimum_review_risk(&[finding(Severity::High)], &selection).0,
-            RiskLevel::High
+            minimum_review_risk(&[finding(Severity::High)], &selection),
+            (
+                RiskLevel::High,
+                "The review identified a high-severity finding."
+            )
+        );
+        assert_eq!(
+            minimum_review_risk(&[finding(Severity::Medium)], &selection),
+            (
+                RiskLevel::Moderate,
+                "The review identified a medium-severity finding."
+            )
+        );
+
+        let selected_code = CanonicalSelection {
+            selected_high_signal_files: 1,
+            ..CanonicalSelection::default()
+        };
+        assert_eq!(
+            minimum_review_risk(&[], &selected_code),
+            (
+                RiskLevel::Moderate,
+                "The change affects code that warrants additional scrutiny."
+            )
         );
     }
 
