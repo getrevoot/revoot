@@ -162,6 +162,10 @@ fn pull_request_dogfooding_publishes_and_cleans_up_scoped_images() {
     assert!(cleanup_pipeline.contains("pull-requests: read"));
     assert!(cleanup_pipeline.contains("format('revoot-{0}'"));
     assert!(cleanup_pipeline.contains("^pr-[0-9]+$"));
+    assert!(cleanup_pipeline.contains(".metadata.container.tags | join(\",\")"));
+    assert!(cleanup_pipeline.contains("IFS=',' read -ra version_tags"));
+    assert!(cleanup_pipeline.contains("for tag in \"${version_tags[@]}\""));
+    assert!(cleanup_pipeline.contains("[[ ! \"$tag\" =~ ^pr-[0-9]+$ ]]"));
     assert!(cleanup_pipeline.contains("gh api --method DELETE"));
     assert!(!cleanup_pipeline.contains("actions/checkout"));
 }

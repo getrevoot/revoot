@@ -42,12 +42,20 @@ jobs:
           package_name=${GITHUB_REPOSITORY#*/}
           package_endpoint="/orgs/$GITHUB_REPOSITORY_OWNER/packages/container/$package_name/versions"
           gh api --paginate "$package_endpoint?per_page=100" \
-            --jq '.[] | .id as $id | .metadata.container.tags[] | select(test("^pr-[0-9]+$")) | [$id, .] | @tsv' \
+            --jq '.[] | select(any(.metadata.container.tags[]?; test("^pr-[0-9]+$"))) | [.id, (.metadata.container.tags | join(","))] | @tsv' \
             > "$package_versions"
 
-          while IFS=$'\t' read -r version_id tag; do
-            if ! grep -Fxq "$tag" "$open_tags"; then
-              echo "Deleting $tag (package version $version_id)"
+          while IFS=$'\t' read -r version_id tags; do
+            IFS=',' read -ra version_tags <<< "$tags"
+            delete=true
+            for tag in "${version_tags[@]}"; do
+              if [[ ! "$tag" =~ ^pr-[0-9]+$ ]] || grep -Fxq "$tag" "$open_tags"; then
+                delete=false
+                break
+              fi
+            done
+            if [[ "$delete" == true ]]; then
+              echo "Deleting closed PR image tags $tags (package version $version_id)"
               gh api --method DELETE "$package_endpoint/$version_id"
             fi
           done < "$package_versions"
