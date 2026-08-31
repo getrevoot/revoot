@@ -272,6 +272,7 @@ fn generated_github_onboarding_contract_is_bounded_and_matches_ci_asset() {
     assert!(generated.contains("persist-credentials: false"));
     assert!(generated.contains("--security-opt no-new-privileges"));
     assert!(generated.contains("chown 65532:65532 \"$GITHUB_WORKSPACE\""));
+    assert!(generated.contains("chown -R 65532:65532 \"$GITHUB_WORKSPACE/.git\""));
     assert!(generated.contains("su -p -s /bin/sh revoot"));
     assert!(generated.contains("github.event.pull_request.head.sha"));
     assert!(generated.contains("head.repo.full_name == github.repository"));

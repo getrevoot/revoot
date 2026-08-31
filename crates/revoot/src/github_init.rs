@@ -109,7 +109,9 @@ jobs:
           persist-credentials: false
           ref: ${{{{ github.event.pull_request.head.sha }}}}
       - name: Prepare workspace
-        run: chown 65532:65532 "$GITHUB_WORKSPACE"
+        run: |
+          chown 65532:65532 "$GITHUB_WORKSPACE"
+          chown -R 65532:65532 "$GITHUB_WORKSPACE/.git"
       - name: Review pull request
         run: su -p -s /bin/sh revoot -c 'exec revoot review --ci --format json --output revoot-review.json'
         env:
@@ -183,6 +185,7 @@ mod tests {
         assert!(workflow.contains("image: ghcr.io/getrevoot/revoot:0.1.0@sha256:"));
         assert!(workflow.contains("--security-opt no-new-privileges"));
         assert!(workflow.contains("chown 65532:65532 \"$GITHUB_WORKSPACE\""));
+        assert!(workflow.contains("chown -R 65532:65532 \"$GITHUB_WORKSPACE/.git\""));
         assert!(workflow.contains("su -p -s /bin/sh revoot"));
         assert!(!workflow.contains("pull_request_target"));
         assert!(!workflow.contains("workflow_run"));

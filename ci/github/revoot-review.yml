@@ -33,7 +33,9 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Prepare workspace
-        run: chown 65532:65532 "$GITHUB_WORKSPACE"
+        run: |
+          chown 65532:65532 "$GITHUB_WORKSPACE"
+          chown -R 65532:65532 "$GITHUB_WORKSPACE/.git"
       - name: Review pull request
         run: su -p -s /bin/sh revoot -c 'exec revoot review --ci --format json --output revoot-review.json'
         env:
