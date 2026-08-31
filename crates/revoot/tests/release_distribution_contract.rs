@@ -130,27 +130,8 @@ fn merged_release_pull_requests_are_tagged_by_the_release_app() {
 }
 
 #[test]
-fn preview_workflow_publishes_green_main_and_manual_images_for_dogfooding() {
+fn pull_request_dogfooding_publishes_and_cleans_up_scoped_images() {
     let root = workspace();
-    let pipeline = fs::read_to_string(root.join(".github/workflows/preview-image.yml"))
-        .expect("preview pipeline");
-    let _: serde_json::Value =
-        serde_saphyr::from_str(&pipeline).expect("preview pipeline must be valid YAML");
-
-    assert!(pipeline.contains("workflow_dispatch:"));
-    assert!(pipeline.contains("workflow_run:"));
-    assert!(pipeline.contains("github.event.workflow_run.conclusion == 'success'"));
-    assert!(pipeline.contains("github.event.workflow_run.event == 'push'"));
-    assert!(pipeline.contains("github.event.workflow_run.head_branch == 'main'"));
-    assert!(pipeline.contains("head_repository.full_name == github.repository"));
-    assert!(pipeline.contains("packages: write"));
-    assert!(pipeline.contains("package:linux:release:amd64"));
-    assert!(pipeline.contains("tag=main"));
-    assert!(pipeline.contains("sha_tag=sha-${SOURCE_SHA:0:12}"));
-    assert!(pipeline.contains("docker push \"$IMAGE:$PREVIEW_TAG\""));
-    assert!(pipeline.contains("docker push \"$IMAGE:$SHA_TAG\""));
-    assert!(!pipeline.contains("gh release create"));
-
     let review_pipeline =
         fs::read_to_string(root.join(".github/workflows/revoot.yml")).expect("review pipeline");
     assert!(review_pipeline.contains("mise run package:linux:release:amd64"));
@@ -167,6 +148,26 @@ fn preview_workflow_publishes_green_main_and_manual_images_for_dogfooding() {
         .expect("binary artifact download");
     assert!(checkout < download);
     assert!(!review_pipeline.contains("vars.REVOOT_IMAGE"));
+
+    let cleanup_pipeline = fs::read_to_string(root.join(".github/workflows/cleanup-pr-images.yml"))
+        .expect("pull request image cleanup pipeline");
+    let _: serde_json::Value = serde_saphyr::from_str(&cleanup_pipeline)
+        .expect("pull request image cleanup pipeline must be valid YAML");
+
+    assert!(cleanup_pipeline.contains("pull_request_target:"));
+    assert!(cleanup_pipeline.contains("types: [closed]"));
+    assert!(cleanup_pipeline.contains("schedule:"));
+    assert!(cleanup_pipeline.contains("workflow_dispatch:"));
+    assert!(cleanup_pipeline.contains("packages: write"));
+    assert!(cleanup_pipeline.contains("pull-requests: read"));
+    assert!(cleanup_pipeline.contains("format('revoot-{0}'"));
+    assert!(cleanup_pipeline.contains("^pr-[0-9]+$"));
+    assert!(cleanup_pipeline.contains(".metadata.container.tags | join(\",\")"));
+    assert!(cleanup_pipeline.contains("IFS=',' read -ra version_tags"));
+    assert!(cleanup_pipeline.contains("for tag in \"${version_tags[@]}\""));
+    assert!(cleanup_pipeline.contains("[[ ! \"$tag\" =~ ^pr-[0-9]+$ ]]"));
+    assert!(cleanup_pipeline.contains("gh api --method DELETE"));
+    assert!(!cleanup_pipeline.contains("actions/checkout"));
 }
 
 #[test]
