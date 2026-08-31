@@ -66,8 +66,14 @@ unless review establishes a materially new occurrence. Embedded metadata
 identifies Revoot-owned comments; the pull request remains the state store.
 
 Revoot checks the pull-request head and discussion state again before writing.
-It stops publication if either changed during the review. Human and other bot
-comments may suppress duplicates but are never modified.
+It stops publication if either changed during the review. When ordinary human
+review changes the discussion inventory before Revoot has attempted a mutation,
+the JSON report records publication state `stopped` with reason
+`github_review_state_changed`, retains the computed review artifact, and the
+review command exits successfully. A later run reconciles against the new
+authoritative state. Changed pull-request identity, ambiguous ownership,
+transport failures, and partial or uncertain mutations remain failures. Human
+and other bot comments may suppress duplicates but are never modified.
 
 ## Manual use
 

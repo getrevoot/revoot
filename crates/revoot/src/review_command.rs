@@ -252,7 +252,7 @@ impl CanonicalReviewReport {
     }
 
     fn publication_failed(&self) -> bool {
-        matches!(self.publication.state, "failed" | "unavailable")
+        self.publication.failed()
     }
 }
 
@@ -267,6 +267,10 @@ struct CanonicalPublication {
 }
 
 impl CanonicalPublication {
+    fn failed(&self) -> bool {
+        matches!(self.state, "failed" | "unavailable")
+    }
+
     const fn pending() -> Self {
         Self {
             state: "pending",
@@ -1883,12 +1887,7 @@ async fn publish_github_review(
     .await
     {
         Ok(evidence) => evidence,
-        Err(error) => {
-            return CanonicalPublication::terminal(
-                "failed",
-                Some(github_publication_failure_reason(error)),
-            );
-        }
+        Err(failure) => return github_publication_failure(failure),
     };
     let overview_mutated = if let Some(overview) = overview {
         match update_github_overview(&prepared.client, &prepared.context, overview).await {
@@ -1920,6 +1919,25 @@ async fn publish_github_review(
     }
 }
 
+const fn github_publication_failure(
+    failure: crate::github_review::GitHubPublicationFailure,
+) -> CanonicalPublication {
+    let state = if matches!(failure.error, GitHubReviewError::PublicationStateChanged)
+        && failure.evidence.mutation_attempts == 0
+    {
+        "stopped"
+    } else {
+        "failed"
+    };
+    CanonicalPublication {
+        state,
+        reason: Some(github_publication_failure_reason(failure.error)),
+        actions_confirmed: failure.evidence.actions_confirmed,
+        mutation_attempts: failure.evidence.mutation_attempts,
+        resolved_discussions: failure.evidence.superseded_comments,
+    }
+}
+
 const fn github_publication_failure_reason(error: GitHubReviewError) -> &'static str {
     match error {
         GitHubReviewError::ThreadResolution => "github_thread_resolution_failed",
@@ -1927,7 +1945,8 @@ const fn github_publication_failure_reason(error: GitHubReviewError) -> &'static
         | GitHubReviewError::IdentityMismatch
         | GitHubReviewError::CheckoutHeadMismatch
         | GitHubReviewError::PullRequestClosed => "github_pull_request_changed",
-        GitHubReviewError::PublicationAmbiguous => "github_review_state_changed",
+        GitHubReviewError::PublicationStateChanged => "github_review_state_changed",
+        GitHubReviewError::PublicationAmbiguous => "github_comment_ownership_ambiguous",
         GitHubReviewError::PublicationInventory => "github_comment_inventory_invalid",
         GitHubReviewError::PublicationMutation | GitHubReviewError::Anchor => {
             "github_comment_publication_failed"
@@ -2888,16 +2907,47 @@ mod tests {
     use crate::config::{
         RepositoryReviewPolicy, RepositorySuppression, resolve_review_configuration,
     };
+    use crate::github_review::{
+        GitHubPublicationEvidence, GitHubPublicationFailure, GitHubReviewError,
+    };
     use crate::review_overview::RiskLevel;
 
     use super::{
         CanonicalPublication, CanonicalReviewReport, CanonicalSelection, OutputFormat,
         REPORT_SCHEMA_VERSION, ReviewOutput, agent_limits, apply_repository_suppressions,
-        fork_behavior, minimum_review_risk, parse_args, parse_private_cidr, partition_limits,
-        select_model, validate_bound_job_url, write_report_atomically,
+        fork_behavior, github_publication_failure, minimum_review_risk, parse_args,
+        parse_private_cidr, partition_limits, select_model, validate_bound_job_url,
+        write_report_atomically,
     };
 
     static LOCAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn github_review_state_change_is_non_failing_only_before_mutation() {
+        let stopped = github_publication_failure(GitHubPublicationFailure {
+            error: GitHubReviewError::PublicationStateChanged,
+            evidence: GitHubPublicationEvidence::default(),
+        });
+        assert_eq!(stopped.state, "stopped");
+        assert_eq!(stopped.reason, Some("github_review_state_changed"));
+        assert_eq!(stopped.mutation_attempts, 0);
+        assert!(!stopped.failed());
+
+        let partial = github_publication_failure(GitHubPublicationFailure {
+            error: GitHubReviewError::PublicationStateChanged,
+            evidence: GitHubPublicationEvidence {
+                actions_confirmed: 1,
+                mutation_attempts: 2,
+                superseded_comments: 1,
+                ..GitHubPublicationEvidence::default()
+            },
+        });
+        assert_eq!(partial.state, "failed");
+        assert_eq!(partial.actions_confirmed, 1);
+        assert_eq!(partial.mutation_attempts, 2);
+        assert_eq!(partial.resolved_discussions, 1);
+        assert!(partial.failed());
+    }
 
     struct CleanLocalRepository(PathBuf);
 
