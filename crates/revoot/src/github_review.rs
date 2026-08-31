@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::github_checkout::{DiscoveredGitHubRepository, GitHubCiContext, GitHubRepositorySlug};
 use crate::github_transport::{GitHubClient, GitHubTransportError};
-use crate::prior_review::acquire_github_prior_review;
+use crate::prior_review::{PriorReviewAcquisitionError, acquire_github_prior_review};
 use crate::review_overview::{ReviewOverviewError, update_description};
 
 const MAX_PAGES: u32 = 30;
@@ -77,6 +77,7 @@ pub enum GitHubReviewError {
     Invocation,
     PublicationInventory,
     PublicationAmbiguous,
+    PublicationStateChanged,
     PublicationStale,
     PublicationMutation,
     ThreadResolution,
@@ -103,6 +104,7 @@ impl fmt::Display for GitHubReviewError {
                 "GitHub review-comment inventory is incomplete or invalid"
             }
             Self::PublicationAmbiguous => "GitHub contains ambiguous Revoot-owned comments",
+            Self::PublicationStateChanged => "GitHub review state changed before publication",
             Self::PublicationStale => "GitHub pull-request HEAD changed before publication",
             Self::PublicationMutation => "GitHub review-comment publication failed",
             Self::ThreadResolution => "GitHub review-thread resolution failed",
@@ -554,6 +556,12 @@ pub struct GitHubPublicationEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GitHubPublicationFailure {
+    pub error: GitHubReviewError,
+    pub evidence: GitHubPublicationEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThreadResolutionOutcome {
     Updated,
     Unavailable,
@@ -578,7 +586,8 @@ pub async fn publish_github_findings(
     candidates: &[PublicationCandidate],
     prior_review: &PriorReviewContext,
     fixed_lineages: &BTreeSet<Sha256Digest>,
-) -> Result<GitHubPublicationEvidence, GitHubReviewError> {
+) -> Result<GitHubPublicationEvidence, GitHubPublicationFailure> {
+    let mut evidence = GitHubPublicationEvidence::default();
     let current = acquire_github_prior_review(
         client,
         &context.target_repository,
@@ -586,24 +595,43 @@ pub async fn publish_github_findings(
         &context.identity.head_sha,
     )
     .await
-    .map_err(|_| GitHubReviewError::PublicationAmbiguous)?;
+    .map_err(|error| GitHubPublicationFailure {
+        error: match error {
+            PriorReviewAcquisitionError::Transport => GitHubReviewError::Transport,
+            PriorReviewAcquisitionError::Wire
+            | PriorReviewAcquisitionError::Pagination
+            | PriorReviewAcquisitionError::Identity
+            | PriorReviewAcquisitionError::Inventory => GitHubReviewError::PublicationInventory,
+        },
+        evidence,
+    })?;
     if current != *prior_review {
-        return Err(GitHubReviewError::PublicationAmbiguous);
+        return Err(GitHubPublicationFailure {
+            error: GitHubReviewError::PublicationStateChanged,
+            evidence,
+        });
     }
-    let bot = authenticated_user(client).await?;
+    let bot = authenticated_user(client)
+        .await
+        .map_err(|error| GitHubPublicationFailure { error, evidence })?;
     let comments = list_comments(
         client,
         &context.target_repository,
         context.identity.pull_request_number,
     )
-    .await?;
+    .await
+    .map_err(|error| GitHubPublicationFailure { error, evidence })?;
     let snapshot = ReviewSnapshotIdentity::GitHub(context.identity.clone());
     let scope = review_publication_scope_digest(&snapshot);
     let prepared = candidates
         .iter()
         .map(|candidate| {
-            prepare_review_publication(&snapshot, &candidate.target, &candidate.body)
-                .map_err(|_| GitHubReviewError::PublicationMutation)
+            prepare_review_publication(&snapshot, &candidate.target, &candidate.body).map_err(
+                |_| GitHubPublicationFailure {
+                    error: GitHubReviewError::PublicationMutation,
+                    evidence,
+                },
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let fingerprints = prepared
@@ -614,7 +642,6 @@ pub async fn publish_github_findings(
         .iter()
         .filter_map(|item| finding_lineage_id(&item.body))
         .collect::<BTreeSet<_>>();
-    let mut evidence = GitHubPublicationEvidence::default();
     let mut thread_resolution_available = true;
     for publication in &prepared {
         let exact_matches = comments
@@ -649,15 +676,20 @@ pub async fn publish_github_findings(
                     &mut thread_resolution_available,
                     &mut evidence,
                 )
-                .await?
+                .await
+                .map_err(|error| GitHubPublicationFailure { error, evidence })?
                     == ThreadResolutionOutcome::Unavailable
             {
                 evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
                 continue;
             }
-            ensure_fresh(client, context).await?;
-            create_comment(client, context, publication).await?;
+            ensure_fresh(client, context)
+                .await
+                .map_err(|error| GitHubPublicationFailure { error, evidence })?;
             evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
+            create_comment(client, context, publication)
+                .await
+                .map_err(|error| GitHubPublicationFailure { error, evidence })?;
             evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
             continue;
         }
@@ -700,17 +732,27 @@ pub async fn publish_github_findings(
                         &mut thread_resolution_available,
                         &mut evidence,
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| GitHubPublicationFailure { error, evidence })?;
                 }
                 evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
             }
             [] => {
-                ensure_fresh(client, context).await?;
-                create_comment(client, context, publication).await?;
+                ensure_fresh(client, context)
+                    .await
+                    .map_err(|error| GitHubPublicationFailure { error, evidence })?;
                 evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
+                create_comment(client, context, publication)
+                    .await
+                    .map_err(|error| GitHubPublicationFailure { error, evidence })?;
                 evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
             }
-            _ => return Err(GitHubReviewError::PublicationAmbiguous),
+            _ => {
+                return Err(GitHubPublicationFailure {
+                    error: GitHubReviewError::PublicationAmbiguous,
+                    evidence,
+                });
+            }
         }
     }
     for lineage in fixed_lineages {
@@ -725,7 +767,10 @@ pub async fn publish_github_findings(
                         .as_ref()
                         .is_some_and(|marker| marker.lineage_sha256 == *lineage)
             })
-            .ok_or(GitHubReviewError::PublicationAmbiguous)?;
+            .ok_or(GitHubPublicationFailure {
+                error: GitHubReviewError::PublicationAmbiguous,
+                evidence,
+            })?;
         reconcile_thread_resolution(
             client,
             context,
@@ -734,7 +779,8 @@ pub async fn publish_github_findings(
             &mut thread_resolution_available,
             &mut evidence,
         )
-        .await?;
+        .await
+        .map_err(|error| GitHubPublicationFailure { error, evidence })?;
     }
     for comment in comments.iter().filter(|comment| comment.user.id == bot.id) {
         if comment.lineage_id().is_some_and(|lineage| {
@@ -774,9 +820,13 @@ pub async fn publish_github_findings(
         if marker.scope_sha256 == scope && fingerprints.contains(&marker.fingerprint_sha256) {
             continue;
         }
-        ensure_fresh(client, context).await?;
-        supersede_comment(client, &context.target_repository, comment).await?;
+        ensure_fresh(client, context)
+            .await
+            .map_err(|error| GitHubPublicationFailure { error, evidence })?;
         evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
+        supersede_comment(client, &context.target_repository, comment)
+            .await
+            .map_err(|error| GitHubPublicationFailure { error, evidence })?;
         evidence.superseded_comments = evidence.superseded_comments.saturating_add(1);
     }
     Ok(evidence)
@@ -1752,11 +1802,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_discussion_during_review_stops_before_publication() {
+    async fn human_resolution_during_review_stops_before_publication() {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("listener");
         let address = listener.local_addr().unwrap();
+        let prior = PriorReviewContext::try_new(vec![revoot_core::PriorReviewDiscussion {
+            thread_id: "PRRT_human".to_owned(),
+            comment_id: "50".to_owned(),
+            source: PriorReviewSource::Other,
+            state: PriorReviewState::Open,
+            path: Some("src/lib.rs".to_owned()),
+            line: Some(1),
+            original_line: Some(1),
+            body: "A human review comment.".to_owned(),
+            replies: Vec::new(),
+            resolution: None,
+            lineage: None,
+        }])
+        .unwrap();
         let server = tokio::spawn(async move {
             let (mut inventory, _) = listener.accept().await.unwrap();
             assert!(
@@ -1770,17 +1834,17 @@ mod tests {
                     "reviewThreads": {
                         "nodes": [{
                             "id": "PRRT_human",
-                            "isResolved": false,
+                            "isResolved": true,
                             "isOutdated": false,
                             "path": "src/lib.rs",
                             "line": 1,
                             "originalLine": 1,
-                            "resolvedBy": null,
+                            "resolvedBy": {"login": "reviewer", "databaseId": 8},
                             "comments": {
                                 "nodes": [{
                                     "databaseId": 50,
-                                    "body": "A human comment added while Revoot was reviewing.",
-                                    "author": {"login": "reviewer"},
+                                    "body": "A human review comment.",
+                                    "author": {"login": "reviewer", "databaseId": 8},
                                     "originalCommit": {"oid": "b".repeat(40)},
                                     "createdAt": "2026-08-29T10:00:00Z",
                                     "updatedAt": "2026-08-29T10:00:00Z"
@@ -1799,16 +1863,12 @@ mod tests {
             address,
         )
         .unwrap();
-        let error = publish_github_findings(
-            &client,
-            &review_context(),
-            &[],
-            &PriorReviewContext::default(),
-            &BTreeSet::new(),
-        )
-        .await
-        .expect_err("changed inventory must stop publication");
-        assert_eq!(error, GitHubReviewError::PublicationAmbiguous);
+        let error =
+            publish_github_findings(&client, &review_context(), &[], &prior, &BTreeSet::new())
+                .await
+                .expect_err("changed inventory must stop publication");
+        assert_eq!(error.error, GitHubReviewError::PublicationStateChanged);
+        assert_eq!(error.evidence, GitHubPublicationEvidence::default());
         server.await.unwrap();
     }
 
