@@ -17,7 +17,7 @@ license = "Apache-2.0"
 gix = { version = "0.87", default-features = false, features = ["revision", "sha1", "dirwalk"] }
 similar = "2.7"
 libc = "0.2"
-revoot-core = { path = "crates/revoot-core" }
+revoot-core = { version = "0.1.0", path = "crates/revoot-core" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
