@@ -61,9 +61,9 @@ fn gitlab_is_a_component_fixture_not_a_source_mirror() {
     assert!(!template.contains("default: ghcr.io/getrevoot/revoot:"));
     assert!(template.contains("default: .post"));
     assert!(template.contains("needs: $[[ inputs.needs ]]"));
-    assert!(
-        template.contains("CI_MERGE_REQUEST_SOURCE_PROJECT_ID == $CI_MERGE_REQUEST_PROJECT_ID")
-    );
+    assert!(template.contains("- if: '$CI_PIPELINE_SOURCE == \"merge_request_event\"'"));
+    assert!(!template.contains("CI_MERGE_REQUEST_SOURCE_PROJECT_ID"));
+    assert!(!template.contains("CI_MERGE_REQUEST_PROJECT_ID"));
     assert!(!template.contains("CI_MERGE_REQUEST_TARGET_PROJECT_ID"));
     assert!(!template.contains("registry.gitlab.com/revoot"));
     assert!(documentation.contains("not a mirror"));

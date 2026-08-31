@@ -39,8 +39,9 @@ revoot-review:
     REVOOT_PUBLICATION_ENABLED: "true"
     GIT_DEPTH: "0"
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID == $CI_MERGE_REQUEST_PROJECT_ID'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && "$[[ inputs.fork_behavior ]]" == "report-only"'
+    # Fork policy is enforced again by `revoot review --ci` after it has
+    # classified the authoritative merge-request context.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   script:
     - revoot review --ci --format json --output revoot-review.json
   artifacts:
