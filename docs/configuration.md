@@ -18,6 +18,9 @@ max_findings = 12
 generated_files = "ignore"
 guidance = "All externally retried writes must be idempotent."
 
+[model_context]
+exclude = ["internal/**", "**/*.vault"]
+
 [[rules]]
 paths = ["crates/payments/**"]
 focus = ["authorization", "idempotency", "money-handling"]
@@ -35,11 +38,13 @@ ticket = "ENG-1842"
 
 ## Fields
 
-`review.include` and `review.exclude` accept exact paths, directory prefixes
+`review.include`, `review.exclude`, and `model_context.exclude` accept exact paths, directory prefixes
 ending in `/**`, and suffixes beginning with `**/*`. Inclusion narrows the
-changed-file review scope. Exclusion takes precedence. Neither setting prevents
-Revoot from reading an unchanged checkout file when it is crucial to verifying
-a finding.
+changed-file review scope. Exclusion takes precedence. `review.exclude` does not
+prevent Revoot from reading an unchanged checkout file when it is crucial to
+verifying a finding; `model_context.exclude` prevents both changed-file prompt
+inclusion and auxiliary toolbox access. It is loaded from the comparison base
+commit and can only narrow the built-in sensitive-path policy.
 
 `review.minimum_confidence` is clamped to the supported high-signal range of
 70–100. `review.max_findings` may lower the product ceiling but cannot raise it.
@@ -111,9 +116,9 @@ Store these as CI secrets, not repository variables or `.revoot.toml` values.
 
 GitHub Actions repository or organization variables named `REVOOT_PROVIDER`
 and `REVOOT_MODEL` are mapped into the generated review job, with `auto` as the
-fallback for each. This repository's dogfooding workflow also uses `REVOOT_TAG`
-to select the newest green `main` image or an RC or branch image, with `latest`
-as its fallback. These are workflow controls, not `revoot` process environment
+fallback for each. This repository's dogfooding workflow also requires
+`REVOOT_IMAGE` to contain an immutable image digest reference. These are
+workflow controls, not `revoot` process environment
 variables. GitHub and GitLab also inject host-owned CI metadata; those platform
 variables identify the pull or merge request and are not Revoot configuration
 knobs.

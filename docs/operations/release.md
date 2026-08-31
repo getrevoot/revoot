@@ -4,7 +4,8 @@ Release-plz prepares a pull request from the commits since the previous release.
 The pull request updates the workspace version and `CHANGELOG.md`; its changelog
 entry is the source for the GitHub release notes. An exact semantic-version tag
 then runs validation, builds the supported archives and multi-architecture
-container image, generates checksums, and creates the GitHub release.
+container image, audits dependencies, generates checksums and a CycloneDX SBOM,
+creates signed artifact attestations, and creates the GitHub release.
 
 ## Prepare
 
@@ -33,6 +34,7 @@ mise run verify
 mise run package:linux
 mise run package:macos
 mise run release:checksums
+mise run sbom
 mise run install:cargo:smoke
 ```
 
@@ -49,9 +51,12 @@ git push origin v0.1.0
 ```
 
 The workflow publishes Linux AMD64/ARM64 and Apple Silicon macOS archives,
-`SHA256SUMS`, and `ghcr.io/getrevoot/revoot` tags with and without the leading
-`v`. It uses the matching changelog section as the GitHub release notes. Stable
-releases also update `latest`; prereleases do not.
+`SHA256SUMS`, `revoot.cdx.json`, `image-digest.txt`, and
+`ghcr.io/getrevoot/revoot` tags with and without the leading `v`. GitHub
+attestations bind the archives and image digest to the release workflow. It uses
+the matching changelog section as the GitHub release notes. Stable releases also
+update `latest`; prereleases do not. Deployment examples always use the immutable
+digest rather than these convenience tags.
 
 If a job fails, fix it and rerun the workflow. Never move a published version
 tag to a different commit.

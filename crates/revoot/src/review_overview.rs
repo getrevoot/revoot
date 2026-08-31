@@ -319,10 +319,14 @@ fn render_list(output: &mut String, heading: &str, items: &[String]) {
 }
 
 fn valid_line(value: &str, maximum: usize) -> bool {
+    let lowercase = value.to_ascii_lowercase();
     !value.trim().is_empty()
         && value.len() <= maximum
         && value == value.trim()
         && !value.chars().any(char::is_control)
+        && !["http://", "https://", "mailto:"]
+            .into_iter()
+            .any(|scheme| lowercase.contains(scheme))
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -504,6 +508,12 @@ mod tests {
         invalid.risks.resize(5, invalid.risks[0].clone());
         assert_eq!(
             render_review_overview(&invalid, &metadata()),
+            Err(ReviewOverviewError::InvalidOverview)
+        );
+        let mut linked = overview();
+        linked.summary = "Read https://attacker.invalid/collect".to_owned();
+        assert_eq!(
+            render_review_overview(&linked, &metadata()),
             Err(ReviewOverviewError::InvalidOverview)
         );
         assert!(

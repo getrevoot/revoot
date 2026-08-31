@@ -20,11 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     container:
-      image: ghcr.io/getrevoot/revoot:latest
+      image: ${{ vars.REVOOT_IMAGE }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      options: --user 0:0
+      options: --user 0:0 --security-opt no-new-privileges
     steps:
       - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -33,9 +33,9 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Prepare workspace
-        run: chown 0:0 "$GITHUB_WORKSPACE"
+        run: chown 65532:65532 "$GITHUB_WORKSPACE"
       - name: Review pull request
-        run: revoot review --ci --format json --output revoot-review.json
+        run: su -p -s /bin/sh revoot -c 'exec revoot review --ci --format json --output revoot-review.json'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           REVOOT_GITHUB_TOKEN: ${{ secrets.REVOOT_GITHUB_TOKEN }}

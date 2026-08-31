@@ -43,6 +43,9 @@ fn github_release_owns_archives_and_the_single_public_image() {
     assert!(pipeline.contains("contents: write"));
     assert!(pipeline.contains("docker buildx imagetools create"));
     assert!(pipeline.contains("gh release create"));
+    assert!(pipeline.contains("actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26"));
+    assert!(pipeline.contains("revoot.cdx.json"));
+    assert!(pipeline.contains("subject-checksums: dist/SHA256SUMS"));
     assert!(!pipeline.contains("registry.gitlab.com"));
 }
 
@@ -54,7 +57,8 @@ fn gitlab_is_a_component_fixture_not_a_source_mirror() {
     let documentation = fs::read_to_string(root.join("docs/operations/gitlab-component.md"))
         .expect("GitLab component policy must be readable");
 
-    assert!(template.contains("ghcr.io/getrevoot/revoot:"));
+    assert!(template.contains("@sha256:[0-9a-f]{64}"));
+    assert!(!template.contains("default: ghcr.io/getrevoot/revoot:"));
     assert!(template.contains("default: .post"));
     assert!(template.contains("needs: $[[ inputs.needs ]]"));
     assert!(!template.contains("registry.gitlab.com/revoot"));

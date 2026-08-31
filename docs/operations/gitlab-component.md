@@ -5,8 +5,12 @@
 Generate a version-pinned component include and add it to `.gitlab-ci.yml`:
 
 ```sh
-revoot init gitlab
+REVOOT_IMAGE='ghcr.io/getrevoot/revoot:VERSION@sha256:DIGEST'
+revoot init gitlab --image "$REVOOT_IMAGE"
 ```
+
+Copy the digest from the matching GitHub release's `image-digest.txt`. The
+component input rejects mutable tags.
 
 Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a masked CI/CD variable.
 Provider and model default to `auto` and can be overridden through component

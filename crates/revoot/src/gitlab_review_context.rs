@@ -440,6 +440,7 @@ mod tests {
                 excluded_paths: BTreeSet::new(),
                 excluded_prefixes: Vec::new(),
                 excluded_suffixes: Vec::new(),
+                excluded_basename_prefixes: Vec::new(),
                 include_generated: false,
                 max_file_bytes: 1024 * 1024,
             },

@@ -7,7 +7,8 @@
 Revoot is an independent AI reviewer built for agent-written code—not a wrapper
 that stuffs one giant diff into a prompt. Its review engine ranks changed files
 by signal, splits large changes into bounded work units, and gives the reviewing
-agent read-only tools to investigate the full checkout and commit history.
+agent read-only tools to investigate a policy-approved checkout inventory and
+commit history.
 Candidate findings are evidence-checked, confidence-filtered, deduplicated, and
 ranked before Revoot publishes line-specific comments and a concise risk
 summary.
@@ -20,6 +21,27 @@ required.
 
 Revoot is bring-your-own-keys (BYOK): it calls Anthropic or OpenAI directly from your
 CI runner. There is no Revoot service or hosted control plane.
+
+## Security is a product boundary
+
+Revoot is designed for zero-trust review of attacker-controlled pull-request
+content. The model cannot execute commands, access environment variables, make
+arbitrary network requests, write files, or publish directly. In CI, auxiliary
+repository reads are limited to Git-tracked files, sensitive path classes are
+denied by default, and repository policy can exclude more context. Provider and
+code-host traffic is restricted to exact HTTPS endpoints with proxies and
+redirects disabled; model-authored links, images, quick actions, and HTML are
+rejected or escaped before publication.
+
+Generated CI requires immutable container digest references, runs the review
+process as UID 65532, skips secret-bearing fork jobs by default, and grants only
+the code-host permissions needed for review. Releases include checksums, a
+CycloneDX SBOM, and signed GitHub artifact attestations.
+
+These controls reduce exposure; they do not make a model provider a trusted
+party or replace runner-level egress controls and a reviewed provider-retention
+agreement. See the [security architecture and deployment checklist](docs/security.md)
+for the complete threat model, guarantees, and limitations.
 
 > Revoot is pre-1.0. Interfaces may change between minor releases.
 
@@ -48,18 +70,22 @@ For GitHub Actions:
 
 ```sh
 mkdir -p .github/workflows
-docker run --rm ghcr.io/getrevoot/revoot:latest init github \
+REVOOT_IMAGE='ghcr.io/getrevoot/revoot:VERSION@sha256:DIGEST'
+docker run --rm "$REVOOT_IMAGE" init github --image "$REVOOT_IMAGE" \
   > .github/workflows/revoot.yml
 ```
 
 For GitLab CI:
 
 ```sh
-docker run --rm ghcr.io/getrevoot/revoot:latest init gitlab \
+docker run --rm "$REVOOT_IMAGE" init gitlab --image "$REVOOT_IMAGE" \
   > .gitlab-ci.yml
 ```
 
-Add the generated file to the repository and follow its instructions. See the
+Replace `VERSION` and `DIGEST` with the version and digest published in the
+GitHub release's `image-digest.txt`; mutable tags are intentionally rejected by
+the generators. Add the generated file to the repository and follow its
+instructions. See the
 [GitHub](docs/operations/github-actions.md) and
 [GitLab](docs/operations/gitlab-component.md) guides for permissions and
 self-managed hosts.
@@ -75,6 +101,9 @@ version = 1
 exclude = ["vendor/**", "dist/**"]
 minimum_confidence = 80
 max_findings = 12
+
+[model_context]
+exclude = ["internal/**", "fixtures/private/**"]
 
 [[rules]]
 paths = ["src/payments/**"]
@@ -94,7 +123,7 @@ to review work in progress without publishing comments to a code host.
 
 ### Run via Docker
 
-The versioned container image is the simplest local option. Set one provider
+An immutable container image is the simplest local option. Set one provider
 key, mount the repository read-only, and start a review:
 
 ```sh
@@ -104,7 +133,7 @@ docker run --rm \
   --volume "$PWD:/workspace:ro" \
   --workdir /workspace \
   --env OPENAI_API_KEY \
-  ghcr.io/getrevoot/revoot:latest review
+  'ghcr.io/getrevoot/revoot:VERSION@sha256:DIGEST' review
 ```
 
 For Claude, set and pass `ANTHROPIC_API_KEY` instead. Revoot reviews committed
@@ -118,7 +147,8 @@ and selected repository context are sent directly to your configured provider.
 
 Each [GitHub release](https://github.com/getrevoot/revoot/releases) includes
 archives for Linux AMD64, Linux ARM64, and Apple Silicon macOS, plus a
-`SHA256SUMS` file. Download the matching archive:
+`SHA256SUMS` file, CycloneDX SBOM, and signed build attestations. Download the
+matching archive:
 
 | System | Release asset |
 | --- | --- |

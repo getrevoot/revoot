@@ -134,6 +134,7 @@ pub struct ReviewSelectionPolicy {
     pub excluded_paths: BTreeSet<RepositoryPath>,
     pub excluded_prefixes: Vec<String>,
     pub excluded_suffixes: Vec<String>,
+    pub excluded_basename_prefixes: Vec<String>,
     pub include_generated: bool,
     pub max_file_bytes: u64,
 }
@@ -182,6 +183,7 @@ impl ReviewSelectionPolicy {
             + self.excluded_paths.len()
             + self.excluded_prefixes.len()
             + self.excluded_suffixes.len()
+            + self.excluded_basename_prefixes.len()
             > MAX_POLICY_PATTERNS
         {
             return Err(PartitionConfigurationError::PatternCount);
@@ -191,6 +193,7 @@ impl ReviewSelectionPolicy {
             &self.included_suffixes,
             &self.excluded_prefixes,
             &self.excluded_suffixes,
+            &self.excluded_basename_prefixes,
         ] {
             if patterns.iter().any(|pattern| {
                 pattern.is_empty()
@@ -637,7 +640,7 @@ pub struct ReviewPartitionPlan {
 }
 
 impl ReviewPartitionPlan {
-    pub const SCHEMA_VERSION: &'static str = "revoot.partition-plan/v2";
+    pub const SCHEMA_VERSION: &'static str = "revoot.partition-plan/v3";
 
     /// Validate every derived count, order, work-unit ID, and plan digest.
     ///
@@ -656,6 +659,7 @@ impl ReviewPartitionPlan {
             .map_err(PartitionReplayError::Configuration)?;
         if !strictly_sorted(&self.policy.excluded_prefixes)
             || !strictly_sorted(&self.policy.excluded_suffixes)
+            || !strictly_sorted(&self.policy.excluded_basename_prefixes)
         {
             return Err(PartitionReplayError::Configuration(
                 PartitionConfigurationError::Pattern,
@@ -827,6 +831,7 @@ pub fn build_partition_plan(
     let mut normalized_policy = policy.clone();
     normalized_policy.excluded_prefixes.sort();
     normalized_policy.excluded_suffixes.sort();
+    normalized_policy.excluded_basename_prefixes.sort();
     let (included, omitted) = prepare_inputs(files, &normalized_policy)?;
     let packed = pack_files(included, omitted, limits);
     finalize_plan(snapshot.into(), &normalized_policy, limits, packed)
@@ -1172,6 +1177,14 @@ fn selection_reason(
     {
         return Some(ReviewOmissionReason::SuffixPolicy);
     }
+    let basename = path.as_str().rsplit('/').next().unwrap_or(path.as_str());
+    if policy
+        .excluded_basename_prefixes
+        .iter()
+        .any(|prefix| basename.starts_with(prefix))
+    {
+        return Some(ReviewOmissionReason::PrefixPolicy);
+    }
     match file.class {
         ReviewFileClass::Generated if !policy.include_generated => {
             return Some(ReviewOmissionReason::GeneratedPolicy);
@@ -1343,6 +1356,7 @@ mod tests {
             excluded_paths: BTreeSet::new(),
             excluded_prefixes: vec!["vendor/".to_owned()],
             excluded_suffixes: vec![".min.js".to_owned()],
+            excluded_basename_prefixes: Vec::new(),
             include_generated: false,
             max_file_bytes: 1_000,
         }
@@ -1426,6 +1440,30 @@ mod tests {
         assert_eq!(plan.coverage.omitted_files, 1);
         assert!(!plan.coverage.complete);
         assert_eq!(plan.omitted[0].reason, ReviewOmissionReason::PrefixPolicy);
+    }
+
+    #[test]
+    fn basename_prefix_exclusion_applies_at_every_repository_depth() {
+        let mut selection = policy();
+        selection.excluded_basename_prefixes = vec![".env.".to_owned()];
+        let plan = build_partition_plan(
+            snapshot(),
+            &selection,
+            limits(),
+            [
+                file(".env.production", 10, '1'),
+                file("services/api/.env.example", 10, '2'),
+                file("src/lib.rs", 10, '3'),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.coverage.included_files, 1);
+        assert_eq!(plan.coverage.omitted_files, 2);
+        assert!(
+            plan.omitted
+                .iter()
+                .all(|omitted| omitted.reason == ReviewOmissionReason::PrefixPolicy)
+        );
     }
 
     #[test]

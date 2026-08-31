@@ -5,6 +5,8 @@ rust = { version = "1.97.1", profile = "default", components = ["clippy", "rustf
   "x86_64-unknown-linux-musl",
 ] }
 "cargo:cargo-nextest" = "0.9"
+"cargo:cargo-audit" = "0.22"
+"cargo:cargo-cyclonedx" = "0.5"
 "cargo:cargo-zigbuild" = "0.23"
 release-plz = "0.3"
 zig = "0.16"
@@ -28,6 +30,14 @@ run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 [tasks.test]
 description = "Run the test suite"
 run = "cargo nextest run --workspace --all-features"
+
+[tasks.audit]
+description = "Reject dependencies with known security advisories"
+run = "cargo audit --deny warnings"
+
+[tasks.sbom]
+description = "Generate a CycloneDX SBOM for the distributable CLI"
+run = "cd crates/revoot && cargo cyclonedx --format json --all --target all --spec-version 1.5 --override-filename revoot.cdx"
 
 [tasks.contracts]
 description = "Validate versioned contracts and golden vectors"
@@ -89,6 +99,7 @@ run = [
   { task = "fmt" },
   { task = "check" },
   { task = "lint" },
+  { task = "audit" },
   { task = "contracts" },
   { task = "test" },
   { task = "check:targets" },

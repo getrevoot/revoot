@@ -32,6 +32,7 @@ pub struct RepositoryReviewPolicy {
     pub guidance: Option<String>,
     pub rules: Vec<RepositoryRule>,
     pub suppressions: Vec<RepositorySuppression>,
+    pub model_context: ModelContextPolicy,
 }
 
 impl RepositoryReviewPolicy {
@@ -61,6 +62,27 @@ impl RepositoryReviewPolicy {
             .iter()
             .any(|suppression| &suppression.fingerprint == finding_key)
     }
+
+    /// Return whether a repository path may be exposed to the model.
+    ///
+    /// The built-in denylist is always applied. Repository-owned exclusions
+    /// may narrow the context further, but cannot re-enable a built-in denial.
+    #[must_use]
+    pub fn allows_model_context(&self, path: &str) -> bool {
+        !default_sensitive_context_path(path)
+            && !self
+                .model_context
+                .exclude
+                .iter()
+                .any(|pattern| context_pattern_matches(pattern, path))
+    }
+}
+
+/// Repository-owned restrictions on files that may be exposed to a model.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelContextPolicy {
+    pub exclude: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -480,6 +502,7 @@ struct TomlConfig {
     version: u64,
     review: Option<TomlReview>,
     repository: Option<TomlRepository>,
+    model_context: Option<TomlModelContext>,
     execution: Option<TomlExecution>,
     budget: Option<TomlReviewBudget>,
     publication: Option<TomlPublication>,
@@ -505,6 +528,12 @@ struct TomlReview {
 struct TomlRepository {
     guidance: Option<String>,
     generated_files: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlModelContext {
+    exclude: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -583,6 +612,7 @@ fn adapt_document(
             || document.secrets.is_some());
     let trusted_contains_repository_policy = source != ConfigSource::BaseRepository
         && (document.repository.is_some()
+            || document.model_context.is_some()
             || !document.rules.is_empty()
             || !document.suppressions.is_empty());
     let mut adapted = AdaptedInputs::default();
@@ -620,6 +650,11 @@ fn adapt_document(
                 push("review.include_generated", ConfigValue::Bool(include));
             }
             adapted.repository.guidance = repository.guidance;
+        }
+        if let Some(model_context) = document.model_context
+            && let Some(exclude) = model_context.exclude
+        {
+            adapted.repository.model_context.exclude = exclude;
         }
         if let Some(execution) = document.execution {
             if let Some(value) = execution.context_lines {
@@ -679,7 +714,7 @@ fn adapt_document(
 
     if trusted_contains_repository_policy {
         return Err(contract_error(
-            "repository guidance, rules, and suppressions require repository configuration",
+            "repository guidance, model context, rules, and suppressions require repository configuration",
         ));
     }
     if source == ConfigSource::BaseRepository {
@@ -741,6 +776,14 @@ fn validate_repository_policy(policy: &RepositoryReviewPolicy) -> Result<(), Dia
     if let Some(guidance) = &policy.guidance {
         validate_text(guidance, 8 * 1024, "repository guidance")?;
     }
+    if policy.model_context.exclude.len() > 64 {
+        return Err(contract_error(
+            "model context policy exceeds the exclusion count limit",
+        ));
+    }
+    for pattern in &policy.model_context.exclude {
+        validate_context_pattern(pattern)?;
+    }
     for rule in &policy.rules {
         if rule.paths.is_empty() || rule.paths.len() > 32 {
             return Err(contract_error(
@@ -791,6 +834,68 @@ fn validate_repository_policy(policy: &RepositoryReviewPolicy) -> Result<(), Dia
         }
     }
     Ok(())
+}
+
+fn validate_context_pattern(pattern: &str) -> Result<(), Diagnostic> {
+    let path = if let Some(prefix) = pattern.strip_suffix("/**") {
+        prefix
+    } else if let Some(suffix) = pattern.strip_prefix("**/*") {
+        if suffix.is_empty() || suffix.contains('*') || suffix.contains('/') {
+            return Err(contract_error("model context exclusion pattern is invalid"));
+        }
+        return validate_text(pattern, 256, "model context exclusion pattern");
+    } else if pattern.contains('*') {
+        return Err(contract_error(
+            "model context exclusions support exact paths, directory/**, or **/*suffix",
+        ));
+    } else {
+        pattern
+    };
+    if revoot_core::RepositoryRelativePath::try_from(path.to_owned()).is_err() {
+        return Err(contract_error("model context exclusion pattern is invalid"));
+    }
+    validate_text(pattern, 256, "model context exclusion pattern")
+}
+
+fn context_pattern_matches(pattern: &str, path: &str) -> bool {
+    pattern
+        .strip_suffix("/**")
+        .is_some_and(|prefix| path.starts_with(&format!("{prefix}/")))
+        || pattern
+            .strip_prefix("**/*")
+            .is_some_and(|suffix| path.ends_with(suffix))
+        || pattern == path
+}
+
+fn default_sensitive_context_path(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    (basename == ".env" || basename.starts_with(".env."))
+        || matches!(
+            basename,
+            ".npmrc" | ".pypirc" | ".netrc" | ".dockercfg" | "credentials" | "kubeconfig"
+        )
+        || [
+            ".pem",
+            ".key",
+            ".p12",
+            ".pfx",
+            ".jks",
+            ".keystore",
+            ".tfstate",
+            ".tfstate.backup",
+        ]
+        .iter()
+        .any(|suffix| basename.ends_with(suffix))
+        || [
+            ".aws/",
+            ".azure/",
+            ".config/gcloud/",
+            ".kube/",
+            ".ssh/",
+            ".terraform/",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix) || path.contains(&format!("/{prefix}")))
 }
 
 fn validate_string_list(values: &[String], maximum: usize, label: &str) -> Result<(), Diagnostic> {
@@ -1315,6 +1420,9 @@ max_findings = 12
 generated_files = "ignore"
 guidance = "All writes are idempotent."
 
+[model_context]
+exclude = ["private/**", "**/*.secret"]
+
 [[rules]]
 paths = ["src/payments/**"]
 focus = ["authorization", "idempotency"]
@@ -1362,9 +1470,38 @@ ticket = "ENG-42"
         );
         assert_eq!(adapted.repository.rules.len(), 1);
         assert_eq!(adapted.repository.suppressions.len(), 1);
+        assert_eq!(
+            adapted.repository.model_context.exclude,
+            ["private/**", "**/*.secret"]
+        );
         let guidance = adapted.repository.guidance_text().unwrap();
         assert!(guidance.contains("src/payments/**"));
         assert!(guidance.contains("integer cents"));
+    }
+
+    #[test]
+    fn model_context_is_fail_closed_for_sensitive_and_repository_excluded_paths() {
+        let policy = super::RepositoryReviewPolicy {
+            model_context: super::ModelContextPolicy {
+                exclude: vec!["internal/**".to_owned(), "**/*.vault".to_owned()],
+            },
+            ..super::RepositoryReviewPolicy::default()
+        };
+
+        for denied in [
+            ".env",
+            "services/api/.env.production",
+            ".aws/credentials",
+            "ops/.terraform/terraform.tfstate",
+            "certs/signing.pem",
+            "internal/runbook.md",
+            "fixtures/passwords.vault",
+        ] {
+            assert!(!policy.allows_model_context(denied), "{denied} was allowed");
+        }
+        for allowed in ["src/lib.rs", "docs/security.md"] {
+            assert!(policy.allows_model_context(allowed), "{allowed} was denied");
+        }
     }
 
     #[test]

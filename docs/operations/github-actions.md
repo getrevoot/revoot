@@ -6,8 +6,13 @@ Generate and commit the workflow:
 
 ```sh
 mkdir -p .github/workflows
-revoot init github > .github/workflows/revoot.yml
+REVOOT_IMAGE='ghcr.io/getrevoot/revoot:VERSION@sha256:DIGEST'
+revoot init github --image "$REVOOT_IMAGE" > .github/workflows/revoot.yml
 ```
+
+Copy the digest from the matching release's `image-digest.txt`. Mutable image
+tags are rejected. If you use the checked-in workflow template directly, set
+the repository variable `REVOOT_IMAGE` to the same immutable reference.
 
 Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a repository or
 organization secret. Optional Actions variables `REVOOT_PROVIDER` and
@@ -80,15 +85,16 @@ Credentials are checked in this order: `REVOOT_GITHUB_TOKEN`, `GH_TOKEN`, then
 
 After CI succeeds for a trusted push to `main`, `Publish preview image` publishes
 AMD64 `main` and immutable `sha-*` images without creating a GitHub release.
-This repository sets `REVOOT_TAG=main` to dogfood the newest green build.
+This repository sets `REVOOT_IMAGE` to an immutable preview image digest to
+dogfood a reviewed build.
 
-Manual dispatch can publish an RC or branch tag. Point `REVOOT_TAG` at that tag
-for testing, set it back to `main` afterward, or clear it to use `latest`.
+Manual dispatch can publish an RC or branch tag. Resolve that tag to its digest
+and update `REVOOT_IMAGE`; do not point the review workflow at the mutable tag.
 
 ```sh
 gh workflow run preview-image.yml --ref my-branch -f tag=rc-0.2.0-1
-gh variable set REVOOT_TAG --body rc-0.2.0-1
-gh variable set REVOOT_TAG --body main
+gh variable set REVOOT_IMAGE --body \
+  'ghcr.io/getrevoot/revoot:rc-0.2.0-1@sha256:DIGEST'
 ```
 
 ## GitHub Enterprise Server

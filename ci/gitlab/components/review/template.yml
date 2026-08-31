@@ -8,8 +8,8 @@ spec:
       default: []
       description: Jobs that must finish before review; empty starts immediately.
     image:
-      default: ghcr.io/getrevoot/revoot:latest
-      description: Versioned Revoot image tag or immutable digest.
+      description: Required immutable Revoot image reference ending in @sha256:DIGEST.
+      regex: '^[-a-zA-Z0-9._/:]+@sha256:[0-9a-f]{64}$'
     provider:
       default: auto
       description: Model provider adapter.

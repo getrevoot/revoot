@@ -550,23 +550,43 @@ impl PreparedReview {
 
     fn toolbox(
         &self,
+        repository_policy: &RepositoryReviewPolicy,
         cancellation: &CancellationToken,
-    ) -> Result<revoot_core::RepositoryToolbox, revoot_core::RepositoryToolError> {
-        match self {
-            Self::Local(prepared) => revoot_core::RepositoryToolbox::open_selected(
-                &prepared.context.root,
-                RepositoryToolLimits::default(),
-                prepared.context.repository_diffs.clone(),
-                prepared.context.repository_paths.iter().cloned(),
-                cancellation,
-            ),
-            Self::GitLab(_) | Self::GitHub(_) => revoot_core::RepositoryToolbox::open(
-                self.root(),
-                RepositoryToolLimits::default(),
-                self.repository_diffs().to_vec(),
-                cancellation,
-            ),
-        }
+    ) -> Result<revoot_core::RepositoryToolbox, Diagnostic> {
+        let paths = match self {
+            Self::Local(prepared) => prepared.context.repository_paths.clone(),
+            Self::GitLab(_) | Self::GitHub(_) => {
+                crate::embedded_git::EmbeddedRepository::discover(self.root())
+                    .and_then(|repository| repository.tracked_paths())
+                    .map_err(|_| {
+                        diagnostic(
+                            ErrorCode::RepositoryUnavailable,
+                            "tracked checkout inventory could not be established",
+                        )
+                    })?
+            }
+        };
+        let paths = paths
+            .into_iter()
+            .filter(|path| repository_policy.allows_model_context(path.as_str()));
+        let diffs = self
+            .repository_diffs()
+            .iter()
+            .filter(|diff| repository_policy.allows_model_context(diff.path.as_str()))
+            .cloned();
+        revoot_core::RepositoryToolbox::open_selected(
+            self.root(),
+            RepositoryToolLimits::default(),
+            diffs,
+            paths,
+            cancellation,
+        )
+        .map_err(|_| {
+            diagnostic(
+                ErrorCode::RepositoryUnavailable,
+                "policy-scoped checkout inventory construction failed",
+            )
+        })
     }
 
     fn is_fresh(&self) -> bool {
@@ -813,6 +833,7 @@ async fn run_async(
                 github_ci.as_ref(),
                 &string_environment,
                 resolution,
+                &resolved.repository,
                 DEFERRED_PROVIDER,
                 DEFERRED_MODEL,
                 ExplicitGitHubPullRequest {
@@ -829,6 +850,7 @@ async fn run_async(
                 &origin_policy,
                 environment,
                 resolution,
+                &resolved.repository,
                 DEFERRED_PROVIDER,
                 DEFERRED_MODEL,
                 merge_request_iid,
@@ -900,7 +922,7 @@ async fn run_local_review(
             model_id: DEFERRED_MODEL.to_owned(),
             agent_limits: agent_limits(resolution)?,
             diff_limits: diff_limits(resolution)?,
-            selection_policy: selection_policy(resolution)?,
+            selection_policy: selection_policy(resolution, &resolved.repository)?,
             partition_limits: partition_limits(resolution)?,
         },
     )
@@ -942,12 +964,7 @@ async fn execute_prepared_review(
     let attention = prepared.review_attention();
     let review_brief = prepared_review_brief(&prepared, &attention)?;
     let cancellation = CancellationToken::default();
-    let toolbox = prepared.toolbox(&cancellation).map_err(|_| {
-        diagnostic(
-            ErrorCode::RepositoryUnavailable,
-            "full-checkout inventory construction failed",
-        )
-    })?;
+    let toolbox = prepared.toolbox(&resolved.repository, &cancellation)?;
     let mut initial_omissions = prepared.initial_omissions();
     let history = if let Ok(history) = GitHistoryToolbox::open(
         prepared.root(),
@@ -1234,11 +1251,13 @@ fn apply_repository_suppressions(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn acquire_github_context(
     repository: DiscoveredGitHubRepository,
     ci: Option<&GitHubCiContext>,
     environment: &[(String, String)],
     resolution: &revoot_core::ConfigurationResolution,
+    repository_policy: &RepositoryReviewPolicy,
     provider: &str,
     model: &str,
     explicit: ExplicitGitHubPullRequest,
@@ -1336,7 +1355,7 @@ async fn acquire_github_context(
             model_id: model.to_owned(),
             agent_limits: agent_limits(resolution)?,
             diff_limits: diff_limits(resolution)?,
-            selection_policy: selection_policy(resolution)?,
+            selection_policy: selection_policy(resolution, repository_policy)?,
             partition_limits: partition_limits(resolution)?,
         },
     )
@@ -1367,11 +1386,13 @@ async fn acquire_github_context(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn acquire_gitlab_context(
     repository: DiscoveredGitRepository,
     origin_policy: &GitLabOriginPolicy,
     environment: &[(OsString, OsString)],
     resolution: &revoot_core::ConfigurationResolution,
+    repository_policy: &RepositoryReviewPolicy,
     provider: &str,
     model: &str,
     merge_request_iid: Option<MergeRequestIid>,
@@ -1447,7 +1468,7 @@ async fn acquire_gitlab_context(
             model_id: model.to_owned(),
             agent_limits: agent_limits(resolution)?,
             diff_limits: diff_limits(resolution)?,
-            selection_policy: selection_policy(resolution)?,
+            selection_policy: selection_policy(resolution, repository_policy)?,
             partition_limits: partition_limits(resolution)?,
         },
     )
@@ -2295,15 +2316,51 @@ fn partition_limits(
 
 fn selection_policy(
     resolution: &revoot_core::ConfigurationResolution,
+    repository_policy: &RepositoryReviewPolicy,
 ) -> Result<ReviewSelectionPolicy, Diagnostic> {
     let mut policy = ReviewSelectionPolicy {
-        version: "automatic-v1".to_owned(),
+        version: "automatic-v2".to_owned(),
         included_paths: BTreeSet::new(),
         included_prefixes: Vec::new(),
         included_suffixes: Vec::new(),
-        excluded_paths: BTreeSet::new(),
-        excluded_prefixes: vec![".git/".to_owned(), "vendor/".to_owned()],
-        excluded_suffixes: vec![".generated".to_owned()],
+        excluded_paths: [".env", ".npmrc", ".pypirc", ".netrc", ".dockercfg"]
+            .into_iter()
+            .map(|path| RepositoryPath::try_from(path.to_owned()).expect("built-in path is valid"))
+            .collect(),
+        excluded_prefixes: vec![
+            ".aws/".to_owned(),
+            ".azure/".to_owned(),
+            ".config/gcloud/".to_owned(),
+            ".git/".to_owned(),
+            ".kube/".to_owned(),
+            ".ssh/".to_owned(),
+            ".terraform/".to_owned(),
+            "vendor/".to_owned(),
+        ],
+        excluded_suffixes: [
+            ".env.local",
+            ".env.production",
+            ".env.staging",
+            ".generated",
+            ".jks",
+            ".key",
+            ".keystore",
+            ".p12",
+            ".pem",
+            ".pfx",
+            ".tfstate",
+            ".tfstate.backup",
+            "/.env",
+            "/.netrc",
+            "/.npmrc",
+            "/.pypirc",
+            "/credentials",
+            "/kubeconfig",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect(),
+        excluded_basename_prefixes: vec![".env.".to_owned()],
         include_generated: config_bool(resolution, "review.include_generated")?,
         max_file_bytes: 2 * 1024 * 1024,
     };
@@ -2315,6 +2372,12 @@ fn selection_policy(
     )?;
     compile_selection_patterns(
         config_string_list(resolution, "review.exclude_patterns")?,
+        &mut policy.excluded_paths,
+        &mut policy.excluded_prefixes,
+        &mut policy.excluded_suffixes,
+    )?;
+    compile_selection_patterns(
+        &repository_policy.model_context.exclude,
         &mut policy.excluded_paths,
         &mut policy.excluded_prefixes,
         &mut policy.excluded_suffixes,
