@@ -36,6 +36,18 @@ fn release_workflow_builds_packages_images_and_checksums() {
 }
 
 #[test]
+fn linux_archive_verification_uses_portable_numeric_ownership() {
+    let verifier = fs::read_to_string(workspace().join("scripts/verify-linux-artifacts.sh"))
+        .expect("Linux artifact verifier");
+
+    assert!(verifier.contains("tar --numeric-owner -tvzf"));
+    assert!(verifier.contains("$2 ~ /^[0-9]+\\/[0-9]+$/"));
+    assert!(verifier.contains("$3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/"));
+    assert!(verifier.contains("-rwxr-xr-x 0 0 revoot"));
+    assert!(!verifier.contains("*root*root*"));
+}
+
+#[test]
 fn release_preparation_is_manual_and_updates_a_pull_request() {
     let root = workspace();
     let pipeline = fs::read_to_string(root.join(".github/workflows/prepare-release.yml"))

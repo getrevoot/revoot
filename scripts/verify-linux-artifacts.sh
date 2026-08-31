@@ -42,31 +42,45 @@ verify_binary() {
 verify_archive() {
   local archive=$1
   local binary=$2
-  local listing
+  local metadata
   local first_line
   local members
   local gzip_time
   local archived_hash
   local binary_hash
 
-  listing=$(tar -tvzf "$archive")
-  first_line=${listing%%$'\n'*}
-  case "$first_line" in
-    -rwxr-xr-x*root*root*revoot) ;;
-    *)
-      echo "archive executable mode or normalized ownership is wrong: $first_line" >&2
+  metadata=$(
+    tar --numeric-owner -tvzf "$archive" | awk '
+      {
+        mode = $1
+        if ($2 ~ /^[0-9]+\/[0-9]+$/) {
+          split($2, owner, "/")
+          uid = owner[1]
+          gid = owner[2]
+        } else if ($3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/) {
+          uid = $3
+          gid = $4
+        } else {
+          exit 1
+        }
+        print mode, uid, gid, $NF
+      }
+    '
+  ) || {
+    echo "could not read numeric archive ownership: $archive" >&2
+    exit 1
+  }
+  first_line=${metadata%%$'\n'*}
+  if [[ $first_line != '-rwxr-xr-x 0 0 revoot' ]]; then
+    echo "archive executable mode or normalized ownership is wrong: $first_line" >&2
+    exit 1
+  fi
+  while read -r _mode uid gid entry; do
+    if [[ $uid != 0 || $gid != 0 ]]; then
+      echo "archive contains non-normalized ownership: $entry ($uid:$gid)" >&2
       exit 1
-      ;;
-  esac
-  while IFS= read -r entry; do
-    case "$entry" in
-      *root*root*) ;;
-      *)
-        echo "archive contains non-normalized ownership: $entry" >&2
-        exit 1
-        ;;
-    esac
-  done <<< "$listing"
+    fi
+  done <<< "$metadata"
 
   members=$(tar -tzf "$archive")
   if [[ $members != $'revoot\nLICENSE\ncompletions/revoot.bash\ncompletions/_revoot\ncompletions/revoot.fish' ]]; then
