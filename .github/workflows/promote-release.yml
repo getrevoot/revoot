@@ -1,0 +1,81 @@
+name: Promote release
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      release_pr:
+        description: Merged release pull request number to recover
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag merged release
+    if: >-
+      github.repository_owner == 'getrevoot' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.merged == true &&
+        startsWith(github.event.pull_request.head.ref, 'release-plz-')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Generate release bot token
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - name: Resolve merged release pull request
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          INPUT_PR: ${{ inputs.release_pr }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            release_pr=$INPUT_PR
+          else
+            release_pr=$EVENT_PR
+          fi
+          [[ "$release_pr" =~ ^[1-9][0-9]*$ ]]
+          pull=$(gh api "repos/$REPOSITORY/pulls/$release_pr")
+          jq -e --arg repository "$REPOSITORY" '
+            .merged_at != null and
+            .base.ref == "main" and
+            .head.repo.full_name == $repository and
+            (.head.ref | startswith("release-plz-")) and
+            (.title | test("^chore: release v[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$"))
+          ' <<<"$pull" >/dev/null
+          release_sha=$(jq -r .head.sha <<<"$pull")
+          [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'pr=%s\nsha=%s\n' "$release_pr" "$release_sha" >>"$GITHUB_OUTPUT"
+      - name: Check out release automation
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: release-automation
+          persist-credentials: false
+          ref: main
+      - name: Check out prepared release
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          path: release-source
+          persist-credentials: true
+          ref: ${{ steps.release.outputs.sha }}
+          token: ${{ steps.release-token.outputs.token }}
+      - name: Tag prepared release
+        run: >-
+          bash release-automation/scripts/tag-merged-release.sh
+          "${{ steps.release.outputs.sha }}"
+          "$GITHUB_WORKSPACE/release-source"
