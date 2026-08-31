@@ -640,12 +640,8 @@ pub async fn publish_github_findings(
                     .as_ref()
                     .is_some_and(|resolution| resolution.source == PriorReviewSource::Revoot))
         {
-            ensure_fresh(client, context).await?;
-            create_comment(client, context, publication).await?;
-            evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
-            evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
-            if thread.state != PriorReviewState::Resolved {
-                reconcile_thread_resolution(
+            if thread.state != PriorReviewState::Resolved
+                && reconcile_thread_resolution(
                     client,
                     context,
                     &thread.thread_id,
@@ -653,8 +649,16 @@ pub async fn publish_github_findings(
                     &mut thread_resolution_available,
                     &mut evidence,
                 )
-                .await?;
+                .await?
+                    == ThreadResolutionOutcome::Unavailable
+            {
+                evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
+                continue;
             }
+            ensure_fresh(client, context).await?;
+            create_comment(client, context, publication).await?;
+            evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
+            evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
             continue;
         }
         let lineage_matches = if exact_matches.is_empty() {
@@ -785,15 +789,16 @@ async fn reconcile_thread_resolution(
     resolved: bool,
     available: &mut bool,
     evidence: &mut GitHubPublicationEvidence,
-) -> Result<(), GitHubReviewError> {
+) -> Result<ThreadResolutionOutcome, GitHubReviewError> {
     if !*available {
         evidence.deferred_thread_resolutions =
             evidence.deferred_thread_resolutions.saturating_add(1);
-        return Ok(());
+        return Ok(ThreadResolutionOutcome::Unavailable);
     }
     ensure_fresh(client, context).await?;
     evidence.mutation_attempts = evidence.mutation_attempts.saturating_add(1);
-    match set_thread_resolved(client, thread_id, resolved).await? {
+    let outcome = set_thread_resolved(client, thread_id, resolved).await?;
+    match outcome {
         ThreadResolutionOutcome::Updated => {
             evidence.actions_confirmed = evidence.actions_confirmed.saturating_add(1);
             if resolved {
@@ -808,7 +813,7 @@ async fn reconcile_thread_resolution(
                 evidence.deferred_thread_resolutions.saturating_add(1);
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn occurrence_needs_current_anchor(
@@ -1596,6 +1601,153 @@ mod tests {
         assert_eq!(evidence.actions_confirmed, 0);
         assert_eq!(evidence.superseded_comments, 0);
         assert_eq!(evidence.deferred_thread_resolutions, 2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn unavailable_resolution_reuses_open_lineage_instead_of_reanchoring() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().unwrap();
+        let context = review_context();
+        let lineage = Sha256Digest::of_bytes(b"lineage");
+        let prior_marker = revoot_core::FindingLineageMarker::new(
+            lineage.clone(),
+            context.identity.head_sha.clone(),
+            Sha256Digest::of_bytes(b"prior evidence"),
+        );
+        let prior_body = format!(
+            "prior finding\n{}\n<!-- revoot:v1 scope={} fingerprint={} kind=inline -->",
+            prior_marker.render(),
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        let prior = PriorReviewContext::try_new(vec![revoot_core::PriorReviewDiscussion {
+            thread_id: "PRRT_thread".to_owned(),
+            comment_id: "41".to_owned(),
+            source: PriorReviewSource::Revoot,
+            state: PriorReviewState::Open,
+            path: Some("src/lib.rs".to_owned()),
+            line: Some(2),
+            original_line: Some(1),
+            body: prior_body.clone(),
+            replies: Vec::new(),
+            resolution: None,
+            lineage: Some(prior_marker),
+        }])
+        .unwrap();
+        let anchor_id = context.anchors.iter().next().unwrap().id.clone();
+        let current_marker = revoot_core::FindingLineageMarker::new(
+            lineage,
+            context.identity.head_sha.clone(),
+            Sha256Digest::of_bytes(b"current evidence"),
+        );
+        let candidate = PublicationCandidate {
+            target: PublicationTarget::Inline(anchor_id),
+            body: format!("recurring finding\n{}", current_marker.render()),
+        };
+        let server_body = prior_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut inventory, _) = listener.accept().await.unwrap();
+            assert!(
+                read_request(&mut inventory)
+                    .await
+                    .starts_with(b"POST /graphql ")
+            );
+            write_json(
+                &mut inventory,
+                &serde_json::json!({"data": {
+                    "viewer": {"login": "revoot-bot", "databaseId": 7},
+                    "repository": {"pullRequest": {"reviewThreads": {
+                        "nodes": [{
+                            "id": "PRRT_thread",
+                            "isResolved": false,
+                            "isOutdated": false,
+                            "path": "src/lib.rs",
+                            "line": 2,
+                            "originalLine": 1,
+                            "resolvedBy": null,
+                            "comments": {
+                                "nodes": [{
+                                    "databaseId": 41,
+                                    "body": server_body,
+                                    "author": {"login": "revoot-bot", "databaseId": 7},
+                                    "originalCommit": {"oid": "b".repeat(40)},
+                                    "createdAt": null,
+                                    "updatedAt": null
+                                }],
+                                "pageInfo": {"hasNextPage": false}
+                            }
+                        }],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }}}
+                }}),
+            )
+            .await;
+
+            let (mut user, _) = listener.accept().await.unwrap();
+            assert!(read_request(&mut user).await.starts_with(b"POST /graphql "));
+            write_json(
+                &mut user,
+                &serde_json::json!({"data": {"viewer": {"databaseId": 7}}}),
+            )
+            .await;
+
+            let (mut comments, _) = listener.accept().await.unwrap();
+            assert!(
+                read_request(&mut comments)
+                    .await
+                    .starts_with(b"GET /repos/acme/widgets/pulls/7/comments?")
+            );
+            write_json(
+                &mut comments,
+                &serde_json::json!([{"id": 41, "user": {"id": 7}, "body": prior_body}]),
+            )
+            .await;
+
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            assert!(
+                read_request(&mut fresh)
+                    .await
+                    .starts_with(b"GET /repos/acme/widgets/pulls/7 ")
+            );
+            write_json(&mut fresh, &pull_body("author text")).await;
+
+            let (mut resolve, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut resolve).await;
+            assert!(request.starts_with(b"POST /graphql "));
+            assert!(
+                request_json(&request)["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("resolveReviewThread")
+            );
+            write_json(
+                &mut resolve,
+                &serde_json::json!({
+                    "data": {"resolveReviewThread": null},
+                    "errors": [{"message": "Resource not accessible by integration"}]
+                }),
+            )
+            .await;
+        });
+        let client = GitHubClient::new_for_loopback(
+            GitHubToken::new(b"test-token".to_vec()).unwrap(),
+            address,
+        )
+        .unwrap();
+
+        let evidence =
+            publish_github_findings(&client, &context, &[candidate], &prior, &BTreeSet::new())
+                .await
+                .expect("the existing lineage remains authoritative");
+
+        server.await.unwrap();
+        assert_eq!(evidence.actions_confirmed, 1);
+        assert_eq!(evidence.mutation_attempts, 1);
+        assert_eq!(evidence.superseded_comments, 0);
+        assert_eq!(evidence.deferred_thread_resolutions, 1);
     }
 
     #[tokio::test]
