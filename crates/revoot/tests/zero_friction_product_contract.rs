@@ -15,6 +15,13 @@ use serde_json::json;
 
 static CHECKOUT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+fn immutable_image(version: &str) -> String {
+    format!(
+        "ghcr.io/getrevoot/revoot:{version}@sha256:{}",
+        "a".repeat(64)
+    )
+}
+
 struct CheckoutFixture {
     root: PathBuf,
 }
@@ -319,7 +326,8 @@ fn a_silent_review_is_a_successful_terminal_outcome() {
 #[test]
 fn generated_gitlab_include_is_minimal_and_selects_no_review_strategy() {
     let generated = render_gitlab_ci(&GitLabInitOptions {
-        component: "gitlab.com/getrevoot/revoot-ci/review".to_owned(),
+        image: immutable_image("1.2.3"),
+        component: "gitlab.com/revoot/revoot-ci/review".to_owned(),
         version: "1.2.3".to_owned(),
         provider: "anthropic".to_owned(),
         model: "auto".to_owned(),
@@ -332,8 +340,9 @@ fn generated_gitlab_include_is_minimal_and_selects_no_review_strategy() {
         lines,
         [
             "include:",
-            "  - component: gitlab.com/getrevoot/revoot-ci/review@1.2.3",
+            "  - component: gitlab.com/revoot/revoot-ci/review@1.2.3",
             "    inputs:",
+            "      image: ghcr.io/getrevoot/revoot:1.2.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "      provider: anthropic",
             "      model: auto",
             "      fork_behavior: skip",
@@ -341,7 +350,7 @@ fn generated_gitlab_include_is_minimal_and_selects_no_review_strategy() {
     );
     assert_eq!(generated.matches("component:").count(), 1);
     assert!(!generated.contains("script:"));
-    assert!(!generated.contains("image:"));
+    assert!(generated.contains("image:") && generated.contains("@sha256:"));
     assert!(!generated.contains("variables:"));
     for internal_input in ["depth:", "review_mode:", "risk:", "thoroughness:", "turns:"] {
         assert!(

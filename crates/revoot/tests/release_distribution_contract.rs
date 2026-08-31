@@ -23,6 +23,8 @@ fn release_workflow_builds_packages_images_and_checksums() {
     assert!(pipeline.contains("mise run package:macos"));
     assert!(pipeline.contains("mise run release:checksums"));
     assert!(pipeline.contains("mise run release:notes"));
+    assert!(pipeline.contains("mise run sbom"));
+    assert!(pipeline.contains("actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26"));
     assert!(!pipeline.contains("package-manager"));
     assert!(!pipeline.contains("revoot.mise.toml"));
     assert!(!pipeline.contains("revoot.rb"));
@@ -85,13 +87,15 @@ fn readme_prioritizes_ci_and_documents_distributions() {
 
     assert!(ci < local);
     assert!(local < development);
-    assert!(readme.contains("ghcr.io/getrevoot/revoot:latest review"));
+    assert!(readme.contains("ghcr.io/getrevoot/revoot:VERSION@sha256:DIGEST"));
     assert!(readme.contains("$PWD:/workspace:ro"));
     assert!(readme.contains("https://github.com/getrevoot/revoot/releases"));
     assert!(readme.contains("revoot-linux-amd64.tar.gz"));
     assert!(readme.contains("revoot-linux-arm64.tar.gz"));
     assert!(readme.contains("revoot-macos-arm64.tar.gz"));
     assert!(readme.contains("SHA256SUMS"));
+    assert!(readme.contains("CycloneDX SBOM"));
+    assert!(readme.contains("docs/security.md"));
     assert!(readme.contains("logo.svg"));
     assert!(!readme.contains("logo-dark.svg"));
     assert!(!readme.contains("mise use --global"));

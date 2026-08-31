@@ -204,6 +204,7 @@ pub enum InventoryGapReason {
     EntryLimit,
     FileLimit,
     NonUtf8Path,
+    HardLink,
     SymbolicLink,
     UnsupportedFileType,
     MetadataUnavailable,
@@ -647,6 +648,9 @@ impl RepositoryToolbox {
         if !metadata.is_file() {
             return Err(RepositoryToolError::NotRegularFile);
         }
+        if metadata.nlink() != 1 {
+            return Err(RepositoryToolError::PathChanged);
+        }
         if !expected.matches(&metadata) {
             return Err(RepositoryToolError::PathChanged);
         }
@@ -843,6 +847,14 @@ fn build_selected_inventory(
             );
             continue;
         }
+        if metadata.nlink() != 1 {
+            note_gap(
+                &mut reasons,
+                &mut omitted_entries,
+                InventoryGapReason::HardLink,
+            );
+            continue;
+        }
         let public = RepositoryFile {
             path,
             size_bytes: metadata.len(),
@@ -895,6 +907,7 @@ struct InventoriedFile {
 impl InventoriedFile {
     fn matches(&self, metadata: &fs::Metadata) -> bool {
         metadata.is_file()
+            && metadata.nlink() == 1
             && metadata.dev() == self.device
             && metadata.ino() == self.inode
             && metadata.len() == self.public.size_bytes
@@ -984,6 +997,10 @@ fn walk_directory(
                 omitted_entries,
                 InventoryGapReason::UnsupportedFileType,
             );
+            continue;
+        }
+        if metadata.nlink() != 1 {
+            note_gap(reasons, omitted_entries, InventoryGapReason::HardLink);
             continue;
         }
         if files.len() >= usize::try_from(limits.max_inventory_files).unwrap_or(usize::MAX) {
@@ -1224,6 +1241,25 @@ mod tests {
             toolbox.inventory().coverage,
             InventoryCoverage::Partial { ref reasons, .. }
                 if reasons.contains(&InventoryGapReason::SymbolicLink)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_rejects_hard_link_aliases() {
+        let fixture = Fixture::new();
+        fs::hard_link(
+            fixture.root.join("src/lib.rs"),
+            fixture.root.join("alias.rs"),
+        )
+        .expect("hard-link fixture");
+        let toolbox = toolbox(&fixture);
+        assert!(!toolbox.files.contains_key(&path("src/lib.rs")));
+        assert!(!toolbox.files.contains_key(&path("alias.rs")));
+        assert!(matches!(
+            toolbox.inventory().coverage,
+            InventoryCoverage::Partial { ref reasons, .. }
+                if reasons.contains(&InventoryGapReason::HardLink)
         ));
     }
 

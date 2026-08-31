@@ -123,8 +123,12 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - name: Publish multi-architecture image
+        id: image
         env:
           GHCR_TOKEN: ${{ github.token }}
           IMAGE: ghcr.io/${{ github.repository }}
@@ -140,6 +144,13 @@ jobs:
           digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION_TAG" | awk '/^Digest:/ {print $2; exit}')
           printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
           printf '%s\n' "$digest" > image-digest.txt
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest image provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: image-digest
@@ -153,6 +164,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -176,6 +190,19 @@ jobs:
           path: dist
       - name: Prepare release checksums
         run: mise run release:checksums
+      - name: Generate release SBOM
+        run: |
+          mise run sbom
+          cp crates/revoot/revoot.cdx.json dist/revoot.cdx.json
+      - name: Attest archive provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Attest archive SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-checksums: dist/SHA256SUMS
+          sbom-path: dist/revoot.cdx.json
       - name: Prepare release notes
         run: mise run release:notes
       - name: Publish GitHub release
@@ -190,6 +217,7 @@ jobs:
             dist/revoot-*.tar.gz
             dist/SHA256SUMS
             dist/image-digest.txt
+            dist/revoot.cdx.json
           )
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --notes-file dist/release-notes.md

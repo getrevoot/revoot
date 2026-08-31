@@ -1,7 +1,7 @@
 # Mirror the small `revoot-ci` component project into the self-managed GitLab
 # instance, then pin both its commit and the public GHCR image digest.
 include:
-  - component: $CI_SERVER_FQDN/getrevoot/revoot-ci/review@0123456789abcdef0123456789abcdef01234567
+  - component: $CI_SERVER_FQDN/revoot/revoot-ci/review@0123456789abcdef0123456789abcdef01234567
     inputs:
       image: ghcr.io/getrevoot/revoot@sha256:REPLACE_ME
       provider: auto

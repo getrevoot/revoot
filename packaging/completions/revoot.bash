@@ -12,7 +12,7 @@ _revoot() {
   case " ${COMP_WORDS[*]} " in
     *" review "*) COMPREPLY=( $(compgen -W "--base --ci --mr --pr --repo --format --output --help" -- "$current") ) ;;
     *" doctor "*) COMPREPLY=( $(compgen -W "--json --help" -- "$current") ) ;;
-    *" init gitlab "*) COMPREPLY=( $(compgen -W "--component --version --provider --model --fork-behavior --help" -- "$current") ) ;;
+    *" init gitlab "*) COMPREPLY=( $(compgen -W "--image --component --version --provider --model --fork-behavior --help" -- "$current") ) ;;
     *" init github "*) COMPREPLY=( $(compgen -W "--image --provider --model --fork-behavior --help" -- "$current") ) ;;
     *" init "*) COMPREPLY=( $(compgen -W "gitlab github" -- "$current") ) ;;
     *" config explain "*) COMPREPLY=( $(compgen -W "--json --base-config --config --context-lines --minimum-confidence --provider --model --max-files --max-input-bytes --max-findings --max-model-requests --deadline-seconds --publish --no-publish --help" -- "$current") ) ;;

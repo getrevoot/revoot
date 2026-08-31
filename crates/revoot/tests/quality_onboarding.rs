@@ -9,6 +9,13 @@ use revoot_core::{EvaluationCase, Finding, FindingCategory, Severity};
 
 const TEN_MINUTES: Duration = Duration::from_mins(10);
 
+fn immutable_image(version: &str) -> String {
+    format!(
+        "ghcr.io/getrevoot/revoot:{version}@sha256:{}",
+        "a".repeat(64)
+    )
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -186,7 +193,8 @@ fn public_corpus_records_clean_defect_and_incremental_scoring() {
 fn generated_gitlab_onboarding_contract_is_bounded_and_matches_ci_assets() {
     let started = Instant::now();
     let options = GitLabInitOptions {
-        component: "gitlab.com/getrevoot/revoot-ci/review".to_owned(),
+        image: immutable_image("0.1.0"),
+        component: "gitlab.com/revoot/revoot-ci/review".to_owned(),
         version: "0.1.0".to_owned(),
         provider: "anthropic".to_owned(),
         model: "claude-sonnet-5".to_owned(),
@@ -195,7 +203,7 @@ fn generated_gitlab_onboarding_contract_is_bounded_and_matches_ci_assets() {
     let generated = render_gitlab_ci(&options).expect("safe onboarding input must render");
 
     assert_eq!(generated.matches("include:").count(), 1);
-    assert!(generated.contains("component: gitlab.com/getrevoot/revoot-ci/review@0.1.0"));
+    assert!(generated.contains("component: gitlab.com/revoot/revoot-ci/review@0.1.0"));
     assert!(generated.contains("provider: anthropic"));
     assert!(generated.contains("model: claude-sonnet-5"));
     assert!(generated.contains("fork_behavior: skip"));
@@ -242,26 +250,35 @@ fn generated_gitlab_onboarding_contract_is_bounded_and_matches_ci_assets() {
 #[test]
 fn generated_github_onboarding_contract_is_bounded_and_matches_ci_asset() {
     let started = Instant::now();
-    let generated =
-        render_github_actions(&GitHubInitOptions::default()).expect("safe workflow inputs");
+    let image = immutable_image("0.1.0");
+    let generated = render_github_actions(&GitHubInitOptions {
+        image: image.clone(),
+        ..GitHubInitOptions::default()
+    })
+    .expect("safe workflow inputs");
     let canonical = fs::read_to_string(workspace_root().join("ci/github/revoot-review.yml"))
         .expect("canonical GitHub workflow");
     let _: serde_json::Value =
         serde_saphyr::from_str(&canonical).expect("canonical GitHub workflow must be valid YAML");
 
-    assert_eq!(generated, canonical);
+    assert_eq!(
+        generated.replace(&image, "${{ vars.REVOOT_IMAGE }}"),
+        canonical
+    );
     assert_eq!(generated.matches("revoot review --ci").count(), 1);
     assert!(generated.contains("contents: read"));
     assert!(generated.contains("packages: read"));
     assert!(generated.contains("pull-requests: write"));
     assert!(generated.contains("persist-credentials: false"));
-    assert!(generated.contains("options: --user 0:0"));
-    assert!(generated.contains("chown 0:0 \"$GITHUB_WORKSPACE\""));
+    assert!(generated.contains("--security-opt no-new-privileges"));
+    assert!(generated.contains("chown 65532:65532 \"$GITHUB_WORKSPACE\""));
+    assert!(generated.contains("chown -R 65532:65532 \"$GITHUB_WORKSPACE/.git\""));
+    assert!(generated.contains("su -p -s /bin/sh revoot"));
     assert!(generated.contains("github.event.pull_request.head.sha"));
     assert!(generated.contains("head.repo.full_name == github.repository"));
     assert!(generated.contains("REVOOT_PROVIDER: ${{ vars.REVOOT_PROVIDER || 'auto' }}"));
     assert!(generated.contains("REVOOT_MODEL: ${{ vars.REVOOT_MODEL || 'auto' }}"));
-    assert!(generated.contains("image: ghcr.io/getrevoot/revoot:latest"));
+    assert!(generated.contains("image: ghcr.io/getrevoot/revoot:0.1.0@sha256:"));
     assert!(generated.contains("REVOOT_GITHUB_TOKEN: ${{ secrets.REVOOT_GITHUB_TOKEN }}"));
     assert!(!generated.contains("pull_request_target"));
     assert!(!generated.contains("workflow_run"));
@@ -286,7 +303,7 @@ fn configuration_reference_lists_operator_environment() {
     for variable in [
         "REVOOT_PROVIDER",
         "REVOOT_MODEL",
-        "REVOOT_TAG",
+        "REVOOT_IMAGE",
         "REVOOT_REVIEW_MODEL",
         "REVOOT_REVIEW_CONTEXT_LINES",
         "REVOOT_MINIMUM_CONFIDENCE",

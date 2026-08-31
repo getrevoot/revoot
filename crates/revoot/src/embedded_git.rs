@@ -250,7 +250,7 @@ impl EmbeddedRepository {
             .collect()
     }
 
-    pub(crate) fn working_paths(
+    pub(crate) fn tracked_paths(
         &self,
     ) -> Result<BTreeSet<RepositoryRelativePath>, EmbeddedGitError> {
         let index = self
@@ -274,6 +274,17 @@ impl EmbeddedRepository {
             }
         }
 
+        Ok(paths)
+    }
+
+    pub(crate) fn working_paths(
+        &self,
+    ) -> Result<BTreeSet<RepositoryRelativePath>, EmbeddedGitError> {
+        let index = self
+            .repository
+            .index_or_empty()
+            .map_err(|_| EmbeddedGitError::IndexUnavailable)?;
+        let mut paths = self.tracked_paths()?;
         let options = self
             .repository
             .dirwalk_options()

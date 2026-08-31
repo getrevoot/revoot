@@ -138,17 +138,16 @@ fn run_init(mut args: impl Iterator<Item = String>) -> Result<i32, Diagnostic> {
     let mut options = GitLabInitOptions::default();
     while let Some(argument) = args.next() {
         let value = match argument.as_str() {
-            "--component" | "--version" | "--provider" | "--model" | "--fork-behavior" => {
-                args.next().ok_or_else(|| {
-                    Diagnostic::new(
-                        ErrorCode::CliInvalidArgument,
-                        format!("{argument} requires a value"),
-                    )
-                })?
-            }
+            "--component" | "--version" | "--image" | "--provider" | "--model"
+            | "--fork-behavior" => args.next().ok_or_else(|| {
+                Diagnostic::new(
+                    ErrorCode::CliInvalidArgument,
+                    format!("{argument} requires a value"),
+                )
+            })?,
             "--help" | "-h" => {
                 println!(
-                    "USAGE:\n  revoot init gitlab [--component PATH] [--version VERSION] [--provider NAME] [--model NAME] [--fork-behavior report-only|skip]"
+                    "USAGE:\n  revoot init gitlab --image IMAGE@sha256:DIGEST [--component PATH] [--version VERSION] [--provider NAME] [--model NAME] [--fork-behavior report-only|skip]"
                 );
                 return Ok(0);
             }
@@ -162,6 +161,7 @@ fn run_init(mut args: impl Iterator<Item = String>) -> Result<i32, Diagnostic> {
         match argument.as_str() {
             "--component" => options.component = value,
             "--version" => options.version = value,
+            "--image" => options.image = value,
             "--provider" => options.provider = value,
             "--model" => options.model = value,
             "--fork-behavior" => options.fork_behavior = value,
@@ -188,7 +188,7 @@ fn run_init_github(mut args: impl Iterator<Item = String>) -> Result<i32, Diagno
             }
             "--help" | "-h" => {
                 println!(
-                    "USAGE:\n  revoot init github [--image IMAGE] [--provider NAME] [--model NAME] [--fork-behavior skip|report-only]"
+                    "USAGE:\n  revoot init github --image IMAGE@sha256:DIGEST [--provider NAME] [--model NAME] [--fork-behavior skip|report-only]"
                 );
                 return Ok(0);
             }

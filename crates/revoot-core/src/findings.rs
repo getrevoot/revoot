@@ -133,6 +133,7 @@ pub enum FindingsValidationError {
     MarkerInjection,
     QuickAction,
     UnsafeUrlScheme,
+    ExternalLink,
 }
 
 impl FindingsEnvelope {
@@ -193,6 +194,7 @@ enum ContentError {
     MarkerInjection,
     QuickAction,
     UnsafeUrlScheme,
+    ExternalLink,
 }
 
 const fn map_content_error(
@@ -205,6 +207,7 @@ const fn map_content_error(
         ContentError::MarkerInjection => FindingsValidationError::MarkerInjection,
         ContentError::QuickAction => FindingsValidationError::QuickAction,
         ContentError::UnsafeUrlScheme => FindingsValidationError::UnsafeUrlScheme,
+        ContentError::ExternalLink => FindingsValidationError::ExternalLink,
     }
 }
 
@@ -223,8 +226,12 @@ fn validate_plain_text(value: &str) -> Result<(), ContentError> {
     {
         return Err(ContentError::ControlCharacter);
     }
-    if value.to_ascii_lowercase().contains(REVOOT_MARKER_PREFIX) {
+    let lowercase = value.to_ascii_lowercase();
+    if lowercase.contains(REVOOT_MARKER_PREFIX) {
         return Err(ContentError::MarkerInjection);
+    }
+    if contains_link_or_image(value, &lowercase) {
+        return Err(ContentError::ExternalLink);
     }
     Ok(())
 }
@@ -246,6 +253,9 @@ fn validate_markdown(value: &str, max_bytes: usize) -> Result<(), ContentError> 
     if contains_unsafe_url(&lowercase) {
         return Err(ContentError::UnsafeUrlScheme);
     }
+    if contains_link_or_image(value, &lowercase) {
+        return Err(ContentError::ExternalLink);
+    }
     if value
         .lines()
         .any(|line| line.trim_start().starts_with('/') && !line.trim_start().starts_with("//"))
@@ -253,6 +263,14 @@ fn validate_markdown(value: &str, max_bytes: usize) -> Result<(), ContentError> 
         return Err(ContentError::QuickAction);
     }
     Ok(())
+}
+
+fn contains_link_or_image(value: &str, lowercase: &str) -> bool {
+    value.contains("](")
+        || value.contains("![")
+        || ["http://", "https://", "mailto:"]
+            .into_iter()
+            .any(|scheme| lowercase.contains(scheme))
 }
 
 fn contains_unsafe_url(lowercase: &str) -> bool {
@@ -709,6 +727,25 @@ mod tests {
         unsafe_envelope.findings[0].explanation =
             "The parsed data: value is ordinary prose.".to_owned();
         assert_eq!(unsafe_envelope.validate(), Ok(()));
+
+        unsafe_envelope.findings[0].explanation =
+            "Inspect [this report](https://attacker.invalid/collect).".to_owned();
+        assert_eq!(
+            unsafe_envelope.validate(),
+            Err(FindingsValidationError::ExternalLink)
+        );
+        unsafe_envelope.findings[0].explanation =
+            "![tracking pixel](relative-image.png)".to_owned();
+        assert_eq!(
+            unsafe_envelope.validate(),
+            Err(FindingsValidationError::ExternalLink)
+        );
+        unsafe_envelope.findings[0].explanation = "Safe explanation.".to_owned();
+        unsafe_envelope.findings[0].title = "See https://attacker.invalid".to_owned();
+        assert_eq!(
+            unsafe_envelope.validate(),
+            Err(FindingsValidationError::ExternalLink)
+        );
     }
 
     #[test]
