@@ -17,7 +17,7 @@ fn github_ci_is_the_canonical_pull_request_gate() {
     let _: serde_json::Value =
         serde_saphyr::from_str(&pipeline).expect("GitHub pipeline must be valid YAML");
 
-    assert_eq!(pipeline.matches("mise run ci").count(), 1);
+    assert_eq!(pipeline.matches("mise run verify").count(), 1);
     assert!(pipeline.contains("pull_request:"));
     assert!(pipeline.contains("branches:\n      - main"));
     assert!(pipeline.contains("contents: read"));

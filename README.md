@@ -133,7 +133,7 @@ your `PATH`.
 
 ```sh
 mise install
-mise run ci
+mise run verify
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and
