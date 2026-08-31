@@ -16,6 +16,15 @@ messages, so edit the pull request when an entry needs clearer user-facing
 wording. Merge it after the version, lockfile, generated CI image tags, and
 changelog agree.
 
+The release-plz task uses a narrow Cargo wrapper for its git-only comparison of
+the previous tag. For release-plz's workspace-package command only, the wrapper
+temporarily makes the unpublished internal crate eligible for Cargo's local
+workspace registry, supplies the version missing from the bootstrap tag, and
+adds `--no-verify`. It then unpacks Cargo's locally generated archives for
+release-plz and restores both manifests with a trap. Normal project packaging
+and all other Cargo commands are forwarded unchanged, no crate is published,
+and `mise run verify` remains the release build gate.
+
 Both release workflows authenticate as the repository's release GitHub App using
 the `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY` Actions secrets. The App must
 be installed only on the repositories it releases and have repository Contents

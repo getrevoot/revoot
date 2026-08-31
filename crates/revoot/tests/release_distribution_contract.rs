@@ -48,6 +48,36 @@ fn linux_archive_verification_uses_portable_numeric_ownership() {
 }
 
 #[test]
+fn workspace_path_dependencies_remain_packageable() {
+    let manifest = fs::read_to_string(workspace().join("Cargo.toml")).expect("workspace manifest");
+    let dependency = manifest
+        .lines()
+        .find(|line| line.starts_with("revoot-core = "))
+        .expect("revoot-core workspace dependency");
+
+    assert!(dependency.contains("version = \""));
+    assert!(dependency.contains("path = \"crates/revoot-core\""));
+
+    let task_file = fs::read_to_string(workspace().join("mise.toml")).expect("mise tasks");
+    assert!(task_file.contains("bash scripts/run-release-plz.sh release-pr"));
+
+    let cargo_wrapper = fs::read_to_string(workspace().join("scripts/release-plz-cargo.sh"))
+        .expect("Cargo wrapper");
+    assert!(cargo_wrapper.contains("${1:-} == package"));
+    assert!(cargo_wrapper.contains("--allow-dirty) allow_dirty=true"));
+    assert!(cargo_wrapper.contains("--workspace) workspace=true"));
+    assert!(cargo_wrapper.contains("--no-verify"));
+    assert!(cargo_wrapper.contains("publish.workspace = true"));
+    assert!(cargo_wrapper.contains("print \"publish = true\""));
+    assert!(cargo_wrapper.contains("revoot-core = { path = "));
+    assert!(cargo_wrapper.contains("workspace_version=$(awk"));
+    assert!(cargo_wrapper.contains("trap restore_manifests EXIT HUP INT TERM"));
+    assert!(cargo_wrapper.contains("archives=(\"$package_root\"/*.crate)"));
+    assert!(cargo_wrapper.contains("tar -xzf \"$archive\" -C \"$package_root\""));
+    assert!(cargo_wrapper.contains("exec \"$real_cargo\" \"$@\""));
+}
+
+#[test]
 fn release_preparation_is_manual_and_updates_a_pull_request() {
     let root = workspace();
     let pipeline = fs::read_to_string(root.join(".github/workflows/prepare-release.yml"))

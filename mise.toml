@@ -72,7 +72,7 @@ run = "bash scripts/check-release-version.sh"
 
 [tasks."release:pr"]
 description = "Open or update the release preparation pull request"
-run = "release-plz release-pr --config release-plz.toml"
+run = "bash scripts/run-release-plz.sh release-pr --config release-plz.toml"
 
 [tasks."release:notes"]
 description = "Extract the current tagged release notes from the changelog"

@@ -6,6 +6,15 @@ All notable changes to Revoot are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/getrevoot/revoot/compare/v0.1.0...v0.1.1) - 2026-08-31
+
+### Fixed
+
+- *(ci)* preserve downloaded review artifact
+- *(gitlab)* support runner-owned checkouts
+- *(release)* verify archive ownership across GNU tar and BSD tar
+- *(release)* package git-only workspaces with unpublished internal crates
+
 ## [0.1.0](https://github.com/getrevoot/revoot/releases/tag/v0.1.0) - 2026-08-31
 
 ### Changed
