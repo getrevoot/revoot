@@ -58,5 +58,7 @@ the matching changelog section as the GitHub release notes. Stable releases also
 update `latest`; prereleases do not. Deployment examples always use the immutable
 digest rather than these convenience tags.
 
-If a job fails, fix it and rerun the failed workflow. Never create release tags
-by hand or move a published version tag to a different commit.
+If a job fails because of a transient infrastructure problem, rerun the failed
+workflow. If a deterministic defect in the tagged source caused the failure,
+fix it on `main` and prepare the next patch release. Never create release tags
+by hand or move an existing version tag to a different commit.
