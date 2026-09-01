@@ -41,7 +41,10 @@ run = "cd crates/revoot && cargo cyclonedx --format json --all --target all --sp
 
 [tasks.contracts]
 description = "Validate versioned contracts and golden vectors"
-run = "cargo test --locked -p revoot-core"
+run = [
+  "cargo test --locked -p revoot-core",
+  "cargo test --locked -p revoot --test versioned_contract_artifacts",
+]
 
 [tasks."check:targets"]
 description = "Validate both supported Linux musl targets with the pinned Zig toolchain"

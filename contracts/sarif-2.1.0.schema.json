@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.revoot.dev/sarif-2.1.0.schema.json",
+  "title": "Revoot SARIF 2.1.0 output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "$schema", "runs"],
+  "properties": {
+    "version": { "const": "2.1.0" },
+    "$schema": { "const": "https://json.schemastore.org/sarif-2.1.0.json" },
+    "runs": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/run" } }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text"],
+      "properties": { "text": { "type": "string", "minLength": 1, "maxLength": 8192 } }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "shortDescription"],
+      "properties": {
+        "id": { "enum": ["revoot.correctness", "revoot.security", "revoot.reliability", "revoot.performance", "revoot.maintainability"] },
+        "name": { "enum": ["Correctness", "Security", "Reliability", "Performance", "Maintainability"] },
+        "shortDescription": { "$ref": "#/$defs/message" }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selectedFiles", "fullyReadFiles", "sampledFiles", "manifestOnlyFiles", "deliveredHighRiskHunks", "requiredHighRiskHunks", "explicitDeferrals", "failedGroups", "policyVersion"],
+      "properties": {
+        "selectedFiles": { "$ref": "#/$defs/count" },
+        "fullyReadFiles": { "$ref": "#/$defs/count" },
+        "sampledFiles": { "$ref": "#/$defs/count" },
+        "manifestOnlyFiles": { "$ref": "#/$defs/count" },
+        "deliveredHighRiskHunks": { "$ref": "#/$defs/count" },
+        "requiredHighRiskHunks": { "$ref": "#/$defs/count" },
+        "explicitDeferrals": { "$ref": "#/$defs/count" },
+        "failedGroups": { "$ref": "#/$defs/count" },
+        "policyVersion": { "const": "revoot.risk-adaptive-coverage/v1" }
+      }
+    },
+    "count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ruleId", "level", "message", "locations", "partialFingerprints", "properties"],
+      "properties": {
+        "ruleId": { "enum": ["revoot.correctness", "revoot.security", "revoot.reliability", "revoot.performance", "revoot.maintainability"] },
+        "level": { "enum": ["error", "warning", "note"] },
+        "message": { "$ref": "#/$defs/message" },
+        "locations": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/$defs/location" } },
+        "partialFingerprints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["revootFindingKey/v1"],
+          "properties": { "revootFindingKey/v1": { "$ref": "#/$defs/digest" } }
+        },
+        "properties": { "$ref": "#/$defs/resultProperties" }
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["physicalLocation"],
+      "properties": {
+        "physicalLocation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["artifactLocation", "region"],
+          "properties": {
+            "artifactLocation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["uri", "uriBaseId"],
+              "properties": {
+                "uri": { "type": "string", "minLength": 1 },
+                "uriBaseId": { "const": "%SRCROOT%" }
+              }
+            },
+            "region": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["startLine", "endLine"],
+              "properties": {
+                "startLine": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+                "endLine": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "resultProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["anchorId", "workUnitId", "confidencePercent", "diffSide", "contentSha256"],
+      "properties": {
+        "anchorId": { "type": "string", "pattern": "^ga1_[0-9a-f]{64}$" },
+        "workUnitId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "confidencePercent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "diffSide": { "enum": ["old", "new", "both"] },
+        "oldLine": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "newLine": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "contentSha256": { "$ref": "#/$defs/digest" },
+        "lineageSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "invocations", "results", "properties"],
+      "properties": {
+        "tool": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["driver"],
+          "properties": {
+            "driver": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "informationUri", "rules"],
+              "properties": {
+                "name": { "const": "Revoot" },
+                "informationUri": { "const": "https://github.com/getrevoot/revoot" },
+                "rules": { "type": "array", "maxItems": 5, "items": { "$ref": "#/$defs/rule" } }
+              }
+            }
+          }
+        },
+        "invocations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["executionSuccessful"],
+            "properties": { "executionSuccessful": { "const": true } }
+          }
+        },
+        "results": { "type": "array", "maxItems": 250, "items": { "$ref": "#/$defs/result" } },
+        "properties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["snapshotSha256", "partial", "coverage"],
+          "properties": {
+            "snapshotSha256": { "$ref": "#/$defs/digest" },
+            "partial": { "type": "boolean" },
+            "coverage": { "$ref": "#/$defs/coverage" }
+          }
+        }
+      }
+    }
+  }
+}

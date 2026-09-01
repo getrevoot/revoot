@@ -1,0 +1,115 @@
+{
+  "schema_version": "revoot.review-report/v3",
+  "state": "complete",
+  "snapshot_sha256": "abee6b73cd685ca172c7516021f7b1e24c1a07cfd4cb3bfeaafb2d5a7852ae6b",
+  "partition_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "findings": [
+    {
+      "work_unit_id": "wu-contract",
+      "anchor_id": "ga1_7db4f19b0c22b30a4572b3b9c8e37f541bffe8b586f4ac7deccd17eca20dbdd2",
+      "coordinate": {
+        "path": "src/new #name.rs",
+        "side": "new",
+        "line": 7
+      },
+      "finding_key": "46874df85a2006fd9724210fb29ba6b68466323a87df92dd565e87fd431158a6",
+      "content_sha256": "0d951b8524158d6f428ed5702c37b3b5d58e8cd706c89e67d86b915c9f217d0f",
+      "severity": "high",
+      "confidence_percent": 95,
+      "category": "security",
+      "title": "Validation can be bypassed",
+      "explanation": "The changed operation runs before the required validation.",
+      "evidence": "The issued addition anchor identifies the unguarded operation.",
+      "rendered_body": "**[Revoot](https://github.com/getrevoot/revoot)**\n\n| Severity | Category | Confidence |\n| --- | --- | --- |\n| 🟠 **P2 (High)** | Security | High |\n\n### Validation can be bypassed\n\nThe changed operation runs before the required validation.\n\nThe issued addition anchor identifies the unguarded operation."
+    }
+  ],
+  "overview": {
+    "text": "Review completed with one verified finding.",
+    "content_sha256": "7a9520482b02b2722b40658a07fe834b29f726c69da3015626edae054194b35b"
+  },
+  "lineage": [],
+  "publication": {
+    "planned_findings": 1,
+    "published_findings": 1,
+    "suppressed_findings": 0,
+    "publication_complete": true
+  },
+  "selection": {
+    "changed_files": 3,
+    "selected_files": 3,
+    "omitted_files": 0,
+    "selected_diff_bytes": 128,
+    "omission_reasons": {}
+  },
+  "strategy": {
+    "effort": "medium",
+    "grouping_source": "deterministic",
+    "group_count": 1,
+    "max_parallel_groups": 4
+  },
+  "coverage": {
+    "policy_version": "revoot.risk-adaptive-coverage/v1",
+    "high_risk_files": 1,
+    "standard_risk_files": 1,
+    "low_risk_files": 1,
+    "fully_read_files": 1,
+    "sampled_files": 1,
+    "manifest_only_files": 1,
+    "delivered_high_risk_hunks": 2,
+    "required_high_risk_hunks": 2,
+    "explicit_deferrals": 1,
+    "failed_groups": 0
+  },
+  "usage": {
+    "phases": [
+      {
+        "phase": "grouping",
+        "model_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0,
+        "cost_microusd": 0
+      },
+      {
+        "phase": "planning",
+        "model_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0,
+        "cost_microusd": 0
+      },
+      {
+        "phase": "review",
+        "model_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0,
+        "cost_microusd": 0
+      },
+      {
+        "phase": "verification",
+        "model_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0,
+        "cost_microusd": 0
+      },
+      {
+        "phase": "adjudication",
+        "model_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "tool_calls": 0,
+        "cost_microusd": 0
+      }
+    ],
+    "totals": {
+      "model_requests": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "tool_calls": 0,
+      "cost_microusd": 0
+    }
+  },
+  "report_sha256": "fe924e3391d7af6deaba1872c559c8f781a9bbcc1f192dda70ab15a9a210f6ef"
+}

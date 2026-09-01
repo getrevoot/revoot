@@ -1,0 +1,72 @@
+{
+  "schema_version": "revoot.delegation/v1",
+  "snapshot": {
+    "repository_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+    "working_tree_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "exact_diff_manifest_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "partition_sha256": "6bc6c10844a608ef06ec4a05d62fd6d5f4160fe11cfec032622e20b69ef126ff",
+  "policy_digests": {
+    "selection_policy_sha256": "dada6cc03883c48531fc41b48d3c931c5a1059faec356f80ec824d79d522e468",
+    "repository_policy_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "rule_set_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "files": [
+    {
+      "path": {
+        "old_path": "src/high.rs",
+        "new_path": "src/high.rs",
+        "kind": "modified"
+      },
+      "class": "text",
+      "tier": "high",
+      "selected_input_bytes": 40,
+      "anchor_count": 1,
+      "work_unit_id": "wu2_f01c336a566bfa6f43b8b0cace203b94785d661d01a06d5df9044478ec93a534",
+      "rule_group_ids": [
+        "rust"
+      ]
+    },
+    {
+      "path": {
+        "old_path": "tests/standard.rs",
+        "new_path": "tests/standard.rs",
+        "kind": "modified"
+      },
+      "class": "text",
+      "tier": "standard",
+      "selected_input_bytes": 40,
+      "anchor_count": 1,
+      "work_unit_id": "wu2_f01c336a566bfa6f43b8b0cace203b94785d661d01a06d5df9044478ec93a534",
+      "rule_group_ids": [
+        "rust",
+        "tests"
+      ]
+    }
+  ],
+  "exclusions": [],
+  "rule_groups": [
+    {
+      "id": "rust",
+      "rule_ids": [
+        "correctness"
+      ],
+      "matched_paths": [
+        "src/high.rs",
+        "tests/standard.rs"
+      ]
+    },
+    {
+      "id": "tests",
+      "rule_ids": [
+        "test-quality"
+      ],
+      "matched_paths": [
+        "tests/standard.rs"
+      ]
+    }
+  ],
+  "manifest_sha256": "a58b072b410a80679f09db77a0a3d63455da39b019d108ff91a6dbc3708ee5df"
+}

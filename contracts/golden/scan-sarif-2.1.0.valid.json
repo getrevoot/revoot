@@ -1,0 +1,78 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Revoot",
+          "informationUri": "https://github.com/getrevoot/revoot",
+          "rules": [
+            {
+              "id": "revoot.reliability",
+              "name": "Reliability",
+              "shortDescription": {
+                "text": "Revoot Reliability finding"
+              }
+            }
+          ]
+        }
+      },
+      "invocations": [
+        {
+          "executionSuccessful": true
+        }
+      ],
+      "results": [
+        {
+          "ruleId": "revoot.reliability",
+          "level": "note",
+          "message": {
+            "text": "Finding 3: exact verified evidence."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/new%20%23name.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 9,
+                  "endLine": 9
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "revootFindingKey/v1": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          "properties": {
+            "anchorId": "ga1_85677d83a9053cee7cd20f128cdbc320523df2944612b009f63e5d8397d48e4e",
+            "workUnitId": "wu-contract",
+            "confidencePercent": 91,
+            "diffSide": "both",
+            "oldLine": 8,
+            "newLine": 9,
+            "contentSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        }
+      ],
+      "properties": {
+        "snapshotSha256": "abee6b73cd685ca172c7516021f7b1e24c1a07cfd4cb3bfeaafb2d5a7852ae6b",
+        "partial": true,
+        "coverage": {
+          "selectedFiles": 3,
+          "fullyReadFiles": 1,
+          "sampledFiles": 1,
+          "manifestOnlyFiles": 0,
+          "deliveredHighRiskHunks": 1,
+          "requiredHighRiskHunks": 2,
+          "explicitDeferrals": 1,
+          "failedGroups": 1,
+          "policyVersion": "revoot.risk-adaptive-coverage/v1"
+        }
+      }
+    }
+  ]
+}
