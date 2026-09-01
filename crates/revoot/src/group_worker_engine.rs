@@ -16,13 +16,14 @@ use revoot_core::review_packet::{
 use revoot_core::{
     AgentBudget, AgentBudgetLimits, AgentBudgetUsage, AnchorId, AnchorTable, CancellationToken,
     CandidateForVerification, ChangedPath, CodeSearchRequest, CompleteGroupRejection,
-    CoverageCompletionGate, GroupCompletion, GroupCoverageLedger, GroupPartialCause, LineRange,
-    ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRole, ModelTool,
+    CoverageCompletionGate, CursorTool, GroupCompletion, GroupCoverageLedger, GroupPartialCause,
+    LineRange, ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRole, ModelTool,
     PreparedVerificationBatch, PriorReviewContext, ProviderAdapter, RepositoryPath,
     RepositoryRelativePath, RepositoryToolbox, ReviewBudgetBroker, ReviewBudgetUsage,
     ReviewCallUsage, ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
     ReviewWorkerCheckpoint, ReviewWorkerError, ReviewWorkerPhase, ReviewWorkerPlan,
-    ReviewWorkerState, Sha256Digest, UnreadHunkDisposition, WorkUnitId, prepare_verification_batch,
+    ReviewWorkerState, Sha256Digest, ToolCursorBinding, ToolCursorStore, ToolPageRequest,
+    ToolResultLimits, UnreadHunkDisposition, WorkUnitId, prepare_verification_batch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,10 +35,13 @@ use crate::review_rule_bundle::ReviewRuleBundle;
 #[cfg(test)]
 use crate::diff_artifact::MAX_INLINE_GROUP_DIFF_BYTES;
 #[cfg(test)]
-use revoot_core::review_packet::ReviewPacketCompleteDiff;
+use revoot_core::review_packet::{ReviewPacketAnchorBrief, ReviewPacketCompleteDiff};
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 32;
 const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+const WORKER_PAGE_BYTES: u32 = 30 * 1024;
+const DEFAULT_SEARCH_RESULTS: u32 = 200;
+const MAX_SEARCH_RESULTS: u32 = 500;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_BYTES: usize = 32_000;
 const MAX_REQUEST_INPUT_TOKENS: u64 = 32_000;
@@ -245,6 +249,9 @@ struct WorkerRuntime<'a> {
     history: Option<&'a GitHistoryToolbox>,
     prior_review: &'a PriorReviewContext,
     rule_bundle: &'a ReviewRuleBundle,
+    cursors: ToolCursorStore,
+    cursor_handle_digest: Sha256Digest,
+    cursor_snapshot_digest: Sha256Digest,
     prior_review_cursor: usize,
     local_budget: AgentBudget,
     coverage_gate: Option<CoverageCompletionGate>,
@@ -305,6 +312,18 @@ pub async fn run_group_worker(
             | revoot_core::AnchorPosition::Context { .. } => anchor.path.new_path.clone(),
         })
         .collect::<BTreeSet<_>>();
+    let mut cursor_secret = [0_u8; 32];
+    getrandom::fill(&mut cursor_secret).map_err(|_| GroupWorkerError::Packet)?;
+    let cursors = ToolCursorStore::new(
+        cursor_secret,
+        ToolResultLimits {
+            max_result_bytes: WORKER_PAGE_BYTES,
+            ..ToolResultLimits::default()
+        },
+    )
+    .map_err(|_| GroupWorkerError::Packet)?;
+    let cursor_handle_digest = Sha256Digest::of_bytes(request.plan.group_id.as_bytes());
+    let cursor_snapshot_digest = request.initial_packet.group_brief.snapshot_sha256.clone();
     let mut runtime = WorkerRuntime {
         toolbox,
         diff_store,
@@ -319,6 +338,9 @@ pub async fn run_group_worker(
         history: request.history.as_deref(),
         prior_review: &request.prior_review,
         rule_bundle: &request.rule_bundle,
+        cursors,
+        cursor_handle_digest,
+        cursor_snapshot_digest,
         prior_review_cursor: 0,
         local_budget,
         coverage_gate: Some(request.coverage_gate),
@@ -883,9 +905,17 @@ struct FindingSummaryWire<'a> {
 #[derive(Serialize)]
 struct FileBriefWire<'a> {
     path: &'a RepositoryPath,
+    work_unit_id: &'a WorkUnitId,
     tier: revoot_core::ReviewValueTier,
     changed_lines: u32,
     hunk_ids: &'a [String],
+    anchors: Vec<AnchorBriefWire<'a>>,
+}
+
+#[derive(Serialize)]
+struct AnchorBriefWire<'a> {
+    anchor_id: &'a AnchorId,
+    position: revoot_core::AnchorPosition,
 }
 
 #[derive(Serialize)]
@@ -952,9 +982,18 @@ fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<Stri
         .iter()
         .map(|file| FileBriefWire {
             path: &file.path,
+            work_unit_id: &file.work_unit_id,
             tier: file.tier,
             changed_lines: file.changed_lines,
             hunk_ids: &file.hunk_ids,
+            anchors: file
+                .anchors
+                .iter()
+                .map(|anchor| AnchorBriefWire {
+                    anchor_id: &anchor.anchor_id,
+                    position: anchor.position,
+                })
+                .collect(),
         })
         .collect();
     let diff = match &packet.diff_context {
@@ -1049,7 +1088,7 @@ fn model_tools() -> Vec<ModelTool> {
         ("read_diff", json!({"type":"object","required":["reads"],"properties":{"reads":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","required":["path","hunk_id","page"],"properties":{"path":{"type":"string"},"hunk_id":{"type":"string"},"page":{"type":"integer","minimum":1}},"additionalProperties":false}}},"additionalProperties":false})),
         ("search_diff", search_schema()),
         ("read_file", json!({"type":"object","required":["reads"],"properties":{"reads":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","required":["path","start_line","end_line"],"properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"additionalProperties":false}}},"additionalProperties":false})),
-        ("find_files", json!({"type":"object","required":["query","glob","max_results"],"properties":{"query":{"type":"string"},"glob":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":false})),
+        ("find_files", json!({"type":"object","required":["query","glob"],"properties":{"query":{"type":"string"},"glob":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":MAX_SEARCH_RESULTS,"default":DEFAULT_SEARCH_RESULTS},"cursor":{"type":["string","null"],"maxLength":128},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":WORKER_PAGE_BYTES},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":MAX_SEARCH_RESULTS}},"additionalProperties":false})),
         ("search_code", search_schema()),
         ("list_change_commits", json!({"type":"object","required":["max_results"],"properties":{"max_results":{"type":"integer","minimum":1,"maximum":256}},"additionalProperties":false})),
         ("show_commit_context", json!({"type":"object","required":["commit"],"properties":{"commit":{"type":"string"}},"additionalProperties":false})),
@@ -1069,7 +1108,7 @@ fn model_tools() -> Vec<ModelTool> {
 }
 
 fn search_schema() -> Value {
-    json!({"type":"object","required":["query","regex","case_sensitive","paths","max_results"],"properties":{"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"kind":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":false})
+    json!({"type":"object","required":["query","regex","case_sensitive","paths"],"properties":{"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"kind":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":MAX_SEARCH_RESULTS,"default":DEFAULT_SEARCH_RESULTS},"cursor":{"type":["string","null"],"maxLength":128},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":WORKER_PAGE_BYTES},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":MAX_SEARCH_RESULTS}},"additionalProperties":false})
 }
 
 fn validate_provider_response(
@@ -1138,7 +1177,14 @@ struct SearchArgs {
     paths: Vec<String>,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default = "default_search_results")]
     max_results: u32,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    max_result_bytes: Option<u32>,
+    #[serde(default)]
+    max_matches: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -1160,7 +1206,18 @@ struct ReadFileItem {
 struct FindFilesArgs {
     query: String,
     glob: bool,
+    #[serde(default = "default_search_results")]
     max_results: u32,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    max_result_bytes: Option<u32>,
+    #[serde(default)]
+    max_matches: Option<u16>,
+}
+
+const fn default_search_results() -> u32 {
+    DEFAULT_SEARCH_RESULTS
 }
 
 #[derive(Deserialize)]
@@ -1351,6 +1408,15 @@ fn execute_search_diff(
     runtime: &mut WorkerRuntime<'_>,
 ) -> Result<Value, ToolExecutionError> {
     let args = strict_input::<SearchArgs>(input)?;
+    validate_search_paging(args.max_results, args.max_result_bytes, args.max_matches)?;
+    let query_binding = json!({
+        "query": args.query.clone(),
+        "regex": args.regex,
+        "case_sensitive": args.case_sensitive,
+        "paths": args.paths.clone(),
+        "kind": args.kind.clone(),
+        "max_results": args.max_results,
+    });
     let paths = assigned_search_paths(args.paths, runtime)?;
     let kind = match args.kind.as_deref().unwrap_or("any") {
         "any" => DiffSearchKind::Any,
@@ -1370,7 +1436,27 @@ fn execute_search_diff(
             max_results: args.max_results,
         })
         .map_err(|_| recoverable("diff_search"))?;
-    let value = serde_json::to_value(result).map_err(|_| recoverable("serialization"))?;
+    let items = result
+        .matches
+        .into_iter()
+        .map(|item| serde_json::to_value(item).map_err(|_| recoverable("serialization")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let page = paginate_worker_items(
+        CursorTool::SearchDiff,
+        &query_binding,
+        &items,
+        args.cursor.as_deref(),
+        args.max_result_bytes,
+        args.max_matches,
+        runtime,
+    )?;
+    let value = json!({
+        "metadata": {
+            "scanned_files": result.scanned_files,
+            "search_truncated": result.truncated,
+        },
+        "page": page,
+    });
     record_evidence(&value, runtime)
 }
 
@@ -1415,14 +1501,15 @@ fn execute_find_files(
     runtime: &mut WorkerRuntime<'_>,
 ) -> Result<Value, ToolExecutionError> {
     let args = strict_input::<FindFilesArgs>(input)?;
-    if args.query.is_empty()
-        || args.query.len() > 512
-        || args.query.contains(['\0', '\n', '\r'])
-        || args.max_results == 0
-        || args.max_results > 500
-    {
+    validate_search_paging(args.max_results, args.max_result_bytes, args.max_matches)?;
+    if args.query.is_empty() || args.query.len() > 512 || args.query.contains(['\0', '\n', '\r']) {
         return Err(recoverable("find_files"));
     }
+    let query_binding = json!({
+        "query": args.query.clone(),
+        "glob": args.glob,
+        "max_results": args.max_results,
+    });
     let matcher = args
         .glob
         .then(|| globset::Glob::new(&args.query).map(|glob| glob.compile_matcher()))
@@ -1454,7 +1541,23 @@ fn execute_find_files(
             runtime.clock.now_millis(),
         )
         .map_err(|_| ToolExecutionError::Partial(GroupWorkerPartialReason::Budget))?;
-    Ok(json!({"paths":matching,"truncated":truncated}))
+    let items = matching
+        .into_iter()
+        .map(|path| serde_json::to_value(path).map_err(|_| recoverable("serialization")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let page = paginate_worker_items(
+        CursorTool::FindFiles,
+        &query_binding,
+        &items,
+        args.cursor.as_deref(),
+        args.max_result_bytes,
+        args.max_matches,
+        runtime,
+    )?;
+    Ok(json!({
+        "metadata": {"search_truncated": truncated},
+        "page": page,
+    }))
 }
 
 fn execute_search_code(
@@ -1462,6 +1565,14 @@ fn execute_search_code(
     runtime: &mut WorkerRuntime<'_>,
 ) -> Result<Value, ToolExecutionError> {
     let args = strict_input::<SearchArgs>(input)?;
+    validate_search_paging(args.max_results, args.max_result_bytes, args.max_matches)?;
+    let query_binding = json!({
+        "query": args.query.clone(),
+        "regex": args.regex,
+        "case_sensitive": args.case_sensitive,
+        "paths": args.paths.clone(),
+        "max_results": args.max_results,
+    });
     let paths = repository_search_paths(args.paths, runtime)?;
     let result = runtime
         .toolbox
@@ -1478,7 +1589,28 @@ fn execute_search_code(
             runtime.clock.now_millis(),
         )
         .map_err(|_| repository_partial(runtime))?;
-    let value = serde_json::to_value(result).map_err(|_| recoverable("serialization"))?;
+    let items = result
+        .matches
+        .into_iter()
+        .map(|item| serde_json::to_value(item).map_err(|_| recoverable("serialization")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let page = paginate_worker_items(
+        CursorTool::SearchCode,
+        &query_binding,
+        &items,
+        args.cursor.as_deref(),
+        args.max_result_bytes,
+        args.max_matches,
+        runtime,
+    )?;
+    let value = json!({
+        "metadata": {
+            "scanned_files": result.scanned_files,
+            "skipped_files": result.skipped_files,
+            "search_truncated": result.truncated,
+        },
+        "page": page,
+    });
     record_evidence(&value, runtime)
 }
 
@@ -1797,6 +1929,77 @@ fn repository_search_paths(
     Ok(paths)
 }
 
+fn validate_search_paging(
+    max_results: u32,
+    max_result_bytes: Option<u32>,
+    max_matches: Option<u16>,
+) -> Result<(), ToolExecutionError> {
+    if max_results == 0
+        || max_results > MAX_SEARCH_RESULTS
+        || max_result_bytes.is_some_and(|value| value == 0 || value > WORKER_PAGE_BYTES)
+        || max_matches.is_some_and(|value| value == 0 || u32::from(value) > MAX_SEARCH_RESULTS)
+    {
+        return Err(recoverable("search_bounds"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paginate_worker_items(
+    tool: CursorTool,
+    query: &Value,
+    items: &[Value],
+    cursor: Option<&str>,
+    max_result_bytes: Option<u32>,
+    max_matches: Option<u16>,
+    runtime: &WorkerRuntime<'_>,
+) -> Result<Value, ToolExecutionError> {
+    paginate_bound_items(
+        tool,
+        query,
+        items,
+        cursor,
+        max_result_bytes,
+        max_matches,
+        &runtime.cursors,
+        &runtime.cursor_handle_digest,
+        &runtime.cursor_snapshot_digest,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paginate_bound_items(
+    tool: CursorTool,
+    query: &Value,
+    items: &[Value],
+    cursor: Option<&str>,
+    max_result_bytes: Option<u32>,
+    max_matches: Option<u16>,
+    cursors: &ToolCursorStore,
+    handle_digest: &Sha256Digest,
+    snapshot_digest: &Sha256Digest,
+) -> Result<Value, ToolExecutionError> {
+    let query_bytes = serde_json::to_vec(query).map_err(|_| recoverable("serialization"))?;
+    let binding = ToolCursorBinding {
+        handle_digest: handle_digest.clone(),
+        snapshot_digest: snapshot_digest.clone(),
+        tool,
+        query_digest: Sha256Digest::of_bytes(&query_bytes),
+    };
+    let page = cursors
+        .paginate(
+            &binding,
+            items,
+            cursor,
+            ToolPageRequest {
+                max_result_bytes,
+                max_matches,
+            },
+        )
+        .map_err(|_| recoverable("search_cursor"))?;
+    serde_json::to_value(page).map_err(|_| recoverable("serialization"))
+}
+
 struct PreparedEvidence {
     evidence_id: String,
     delivered: Value,
@@ -2104,6 +2307,8 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct DiscoveringInlineProvider;
+
     impl ProviderAdapter for CancellationAwareProvider {
         fn adapter_id(&self) -> &'static str {
             "fake"
@@ -2177,6 +2382,55 @@ mod tests {
                 .expect("requests")
                 .push(request.clone());
             let response = self.responses.lock().expect("responses").pop_front();
+            Box::pin(async move {
+                response.ok_or_else(|| ProviderError::new(ProviderErrorKind::Protocol, None, false))
+            })
+        }
+    }
+
+    impl ProviderAdapter for DiscoveringInlineProvider {
+        fn adapter_id(&self) -> &'static str {
+            "discovering-inline"
+        }
+
+        fn complete<'a>(
+            &'a self,
+            request: &'a ModelRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> ProviderFuture<'a> {
+            let response = request.messages.first().and_then(|message| {
+                let [ModelContent::Text { text }] = message.content.as_slice() else {
+                    return None;
+                };
+                let packet: Value = serde_json::from_str(text).ok()?;
+                let file = packet["files"].as_array()?.first()?;
+                let work_unit_id = file["work_unit_id"].as_str()?;
+                let anchor_id = file["anchors"].as_array()?.first()?["anchor_id"].as_str()?;
+                let evidence_id = packet["diff"]["evidence_id"].as_str()?;
+                Some(batched_response(vec![
+                    (
+                        1,
+                        "submit_candidate_finding",
+                        json!({"candidate": {
+                            "candidate_id": "candidate-1",
+                            "work_unit_id": work_unit_id,
+                            "finding": {
+                                "anchor_id": anchor_id,
+                                "severity": "medium",
+                                "confidence_percent": 90,
+                                "category": "correctness",
+                                "title": "Changed behavior is incorrect",
+                                "explanation": "The new value violates the expected behavior.",
+                                "evidence": "The complete inline diff shows the changed value.",
+                                "suggested_replacement": null,
+                                "lineage_id": null
+                            },
+                            "evidence_references": [evidence_id]
+                        }}),
+                    ),
+                    (2, "complete_group", complete_call()),
+                ]))
+            });
             Box::pin(async move {
                 response.ok_or_else(|| ProviderError::new(ProviderErrorKind::Protocol, None, false))
             })
@@ -2378,6 +2632,7 @@ mod tests {
                 group_plan_sha256: plan_sha,
                 files: vec![ReviewPacketFileBrief {
                     path: provider_path(),
+                    work_unit_id: trusted_work_unit_id.clone(),
                     tier,
                     changed_lines,
                     hunk_ids: file_manifest
@@ -2385,6 +2640,7 @@ mod tests {
                         .iter()
                         .map(|hunk| hunk.hunk_id.clone())
                         .collect(),
+                    anchors: Vec::new(),
                 }],
             },
             policy: ReviewPacketPolicy {
@@ -2549,6 +2805,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_code_accepts_the_five_hundred_result_ceiling_without_partial_failure() {
+        let budgeted = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let provider = FakeProvider::new(vec![batched_response(vec![
+            (
+                1,
+                "search_code",
+                json!({
+                    "query":"new",
+                    "regex":false,
+                    "case_sensitive":true,
+                    "paths":["src/lib.rs"],
+                    "max_results":MAX_SEARCH_RESULTS
+                }),
+            ),
+            (2, "complete_group", complete_call()),
+        ])]);
+        let output = run(budgeted, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        let search_evidence = output
+            .evidence
+            .iter()
+            .find(|evidence| evidence.content.contains("scanned_files"))
+            .expect("search evidence");
+        assert!(search_evidence.content.len() <= MAX_TOOL_RESULT_BYTES);
+        let delivered: Value = serde_json::from_str(&search_evidence.content).expect("result JSON");
+        assert_eq!(
+            delivered["result"]["page"]["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
     async fn medium_effort_runs_two_fresh_review_rounds() {
         let budgeted = fixture(
             ReviewEffort::Medium,
@@ -2594,33 +2890,24 @@ mod tests {
         )
         .expect("anchors");
         let anchor_id = anchors.iter().next().expect("anchor").id.clone();
+        fixture.request.initial_packet.group_brief.files[0].anchors =
+            vec![ReviewPacketAnchorBrief {
+                anchor_id: anchor_id.clone(),
+                position: AnchorPosition::addition(1).expect("position"),
+            }];
         fixture.request.anchor_table = anchors;
         fixture.request.issued_anchors = BTreeSet::from([anchor_id.clone()]);
-        let evidence_id = inline_evidence_id(&Sha256Digest::of_bytes(DIFF.as_bytes()));
-        let provider = FakeProvider::new(vec![batched_response(vec![
-            (
-                1,
-                "submit_candidate_finding",
-                json!({"candidate": {
-                    "candidate_id": "candidate-1",
-                    "work_unit_id": work_unit_id(),
-                    "finding": {
-                        "anchor_id": anchor_id,
-                        "severity": "medium",
-                        "confidence_percent": 90,
-                        "category": "correctness",
-                        "title": "Changed behavior is incorrect",
-                        "explanation": "The new value violates the expected behavior.",
-                        "evidence": "The complete inline diff shows the changed value.",
-                        "suggested_replacement": null,
-                        "lineage_id": null
-                    },
-                    "evidence_references": [evidence_id]
-                }}),
-            ),
-            (2, "complete_group", complete_call()),
-        ])]);
-        let output = run(fixture, &provider).await;
+        let output = run_group_worker(
+            &DiscoveringInlineProvider,
+            fixture.request,
+            &fixture.toolbox,
+            &fixture.store,
+            &fixture.budget,
+            &fixture.cancellation,
+            &FixedClock,
+        )
+        .await
+        .expect("worker output");
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(output.candidates.candidates.len(), 1);
         assert_eq!(output.evidence.len(), 1);
@@ -3315,6 +3602,123 @@ mod tests {
                 "submit_candidate_finding",
                 "complete_group",
             ]
+        );
+    }
+
+    #[test]
+    fn search_tool_schemas_default_to_two_hundred_and_allow_five_hundred() {
+        for name in ["find_files", "search_code", "search_diff"] {
+            let tool = model_tools()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .expect("search tool");
+            assert_eq!(
+                tool.input_schema["properties"]["max_results"]["default"],
+                DEFAULT_SEARCH_RESULTS
+            );
+            assert_eq!(
+                tool.input_schema["properties"]["max_results"]["maximum"],
+                MAX_SEARCH_RESULTS
+            );
+            assert!(
+                !tool.input_schema["required"]
+                    .as_array()
+                    .expect("required fields")
+                    .iter()
+                    .any(|field| field == "max_results")
+            );
+        }
+    }
+
+    #[test]
+    fn worker_search_cursors_are_bounded_repeatable_and_tamper_resistant() {
+        let cursors = ToolCursorStore::new(
+            [9; 32],
+            ToolResultLimits {
+                max_result_bytes: WORKER_PAGE_BYTES,
+                ..ToolResultLimits::default()
+            },
+        )
+        .expect("cursor store");
+        let handle = Sha256Digest::of_bytes(b"group");
+        let snapshot = Sha256Digest::of_bytes(b"snapshot");
+        let query = json!({"query":"needle","max_results":MAX_SEARCH_RESULTS});
+        let items = (0..250)
+            .map(|index| json!({"index":index}))
+            .collect::<Vec<_>>();
+        let first = paginate_bound_items(
+            CursorTool::SearchCode,
+            &query,
+            &items,
+            None,
+            None,
+            Some(100),
+            &cursors,
+            &handle,
+            &snapshot,
+        )
+        .unwrap_or_else(|_| panic!("first page"));
+        assert_eq!(first["items"].as_array().map(Vec::len), Some(100));
+        assert!(serde_json::to_vec(&first).expect("page JSON").len() <= WORKER_PAGE_BYTES as usize);
+        let cursor = first["next_cursor"].as_str().expect("next cursor");
+        let second = paginate_bound_items(
+            CursorTool::SearchCode,
+            &query,
+            &items,
+            Some(cursor),
+            None,
+            Some(100),
+            &cursors,
+            &handle,
+            &snapshot,
+        )
+        .unwrap_or_else(|_| panic!("second page"));
+        let repeated = paginate_bound_items(
+            CursorTool::SearchCode,
+            &query,
+            &items,
+            Some(cursor),
+            None,
+            Some(100),
+            &cursors,
+            &handle,
+            &snapshot,
+        )
+        .unwrap_or_else(|_| panic!("repeated page"));
+        assert_eq!(second["page_number"], 2);
+        assert_eq!(second["items"], repeated["items"]);
+
+        let mut tampered = cursor.as_bytes().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'0' { b'1' } else { b'0' };
+        let tampered = String::from_utf8(tampered).expect("UTF-8 cursor");
+        assert!(
+            paginate_bound_items(
+                CursorTool::SearchCode,
+                &query,
+                &items,
+                Some(&tampered),
+                None,
+                Some(100),
+                &cursors,
+                &handle,
+                &snapshot,
+            )
+            .is_err()
+        );
+        assert!(
+            paginate_bound_items(
+                CursorTool::SearchDiff,
+                &query,
+                &items,
+                Some(cursor),
+                None,
+                Some(100),
+                &cursors,
+                &handle,
+                &snapshot,
+            )
+            .is_err()
         );
     }
 

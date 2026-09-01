@@ -10,14 +10,15 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::{
-    AnchorId, FindingCategory, RepositoryPath, ReviewValueTier, ReviewWorkerCheckpoint, Severity,
-    Sha256Digest,
+    AnchorId, AnchorPosition, FindingCategory, RepositoryPath, ReviewValueTier,
+    ReviewWorkerCheckpoint, Severity, Sha256Digest, WorkUnitId,
 };
 
 const MAX_INLINE_DIFF_BYTES: u64 = 16_384;
 const MAX_REQUEST_INPUT_TOKENS: u64 = 32_000;
 const MAX_GROUP_FILES: usize = 10;
 const MAX_HUNKS_PER_FILE: usize = 4_096;
+const MAX_ANCHORS_PER_GROUP: usize = 10_000;
 const MAX_RULE_IDS: usize = 1_024;
 const MAX_SUMMARY_IDS: usize = 256;
 const MAX_CANDIDATES: usize = 25;
@@ -38,13 +39,22 @@ pub enum ReviewPacketPurpose {
     Adjudication,
 }
 
+/// One source-free issued anchor coordinate visible in the group brief.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewPacketAnchorBrief {
+    pub anchor_id: AnchorId,
+    pub position: AnchorPosition,
+}
+
 /// One selected file in the immutable compact group brief.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewPacketFileBrief {
     pub path: RepositoryPath,
+    pub work_unit_id: WorkUnitId,
     pub tier: ReviewValueTier,
     pub changed_lines: u32,
     pub hunk_ids: Vec<String>,
+    pub anchors: Vec<ReviewPacketAnchorBrief>,
 }
 
 /// Snapshot-bound immutable brief repeated on each fresh turn.
@@ -558,15 +568,37 @@ fn validate_brief(brief: &ReviewPacketGroupBrief) -> Result<(), ReviewPacketErro
             .files
             .windows(2)
             .all(|pair| pair[0].path < pair[1].path)
+        || brief
+            .files
+            .iter()
+            .try_fold(0_usize, |total, file| total.checked_add(file.anchors.len()))
+            .is_none_or(|total| total > MAX_ANCHORS_PER_GROUP)
     {
         return Err(ReviewPacketError::Brief);
     }
     for file in &brief.files {
-        if validate_ids(&file.hunk_ids, MAX_HUNKS_PER_FILE).is_err() {
+        if !valid_id(file.work_unit_id.as_str())
+            || validate_ids(&file.hunk_ids, MAX_HUNKS_PER_FILE).is_err()
+            || !file
+                .anchors
+                .windows(2)
+                .all(|pair| pair[0].anchor_id < pair[1].anchor_id)
+            || file.anchors.iter().any(|anchor| {
+                !valid_id(anchor.anchor_id.as_str()) || !valid_anchor_position(anchor.position)
+            })
+        {
             return Err(ReviewPacketError::Brief);
         }
     }
     Ok(())
+}
+
+const fn valid_anchor_position(position: AnchorPosition) -> bool {
+    match position {
+        AnchorPosition::Addition { new_line } => new_line != 0,
+        AnchorPosition::Deletion { old_line } => old_line != 0,
+        AnchorPosition::Context { old_line, new_line } => old_line != 0 && new_line != 0,
+    }
 }
 
 fn validate_policy(policy: &ReviewPacketPolicy) -> Result<(), ReviewPacketError> {
@@ -689,9 +721,11 @@ mod tests {
             group_plan_sha256: digest('c'),
             files: vec![ReviewPacketFileBrief {
                 path: path("src/lib.rs"),
+                work_unit_id: serde_json::from_value(serde_json::json!("work-unit-1")).unwrap(),
                 tier: ReviewValueTier::High,
                 changed_lines: 10,
                 hunk_ids: vec!["hunk-1".to_owned()],
+                anchors: Vec::new(),
             }],
         }
     }

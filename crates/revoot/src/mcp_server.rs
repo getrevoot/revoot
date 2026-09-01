@@ -34,6 +34,8 @@ const MCP_RESULT_BYTES: usize = 32 * 1024;
 const MCP_PAGE_BYTES: u32 = 30 * 1024;
 const MCP_SOURCE_SLICE_BYTES: u64 = 24 * 1024;
 const MAX_LIVE_REVIEWS: usize = 8;
+const DEFAULT_SEARCH_RESULTS: u32 = 200;
+const MAX_SEARCH_RESULTS: u32 = 500;
 
 struct OpenReview {
     root: PathBuf,
@@ -378,7 +380,7 @@ impl RevootMcpServer {
                 self.paginate(&review, arguments, CursorTool::ReadFile, &items)
             }
             "revoot_find_files" => {
-                let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+                let query = string_argument(arguments, "query")?;
                 let glob = arguments
                     .get("glob")
                     .and_then(Value::as_bool)
@@ -390,12 +392,8 @@ impl RevootMcpServer {
                             .map_err(|_| "invalid file glob")
                     })
                     .transpose()?;
-                let maximum = arguments
-                    .get("max_results")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(200)
-                    .min(500);
-                let files = review
+                let maximum = search_result_limit(arguments)?;
+                let mut files = review
                     .toolbox
                     .inventory()
                     .files
@@ -406,18 +404,28 @@ impl RevootMcpServer {
                             |matcher| matcher.is_match(file.path.as_str()),
                         )
                     })
-                    .take(usize::try_from(maximum).unwrap_or(500))
+                    .take(
+                        usize::try_from(maximum)
+                            .unwrap_or(usize::MAX)
+                            .saturating_add(1),
+                    )
                     .map(|file| &file.path)
                     .collect::<Vec<_>>();
+                let search_truncated = files.len() > usize::try_from(maximum).unwrap_or(usize::MAX);
+                files.truncate(usize::try_from(maximum).unwrap_or(usize::MAX));
                 let items = files
                     .into_iter()
                     .map(|path| serde_json::to_value(path).map_err(|_| "serialization failed"))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.paginate(&review, arguments, CursorTool::FindFiles, &items)
+                let page = self.paginate(&review, arguments, CursorTool::FindFiles, &items)?;
+                Ok(json!({
+                    "metadata": {"search_truncated": search_truncated},
+                    "page": page,
+                }))
             }
             "revoot_search_code" => {
                 let query = string_argument(arguments, "query")?.to_owned();
-                let maximum = u32_argument(arguments, "max_results")?.min(500);
+                let maximum = search_result_limit(arguments)?;
                 let mut budget = local_budget()?;
                 let result = review
                     .toolbox
@@ -479,7 +487,7 @@ impl RevootMcpServer {
                             .unwrap_or(true),
                         paths: path_arguments(arguments, "paths")?,
                         kind,
-                        max_results: u32_argument(arguments, "max_results")?.min(500),
+                        max_results: search_result_limit(arguments)?,
                     })
                     .map_err(|_| "diff search unavailable")?;
                 let metadata = json!({
@@ -649,9 +657,9 @@ fn tool_definitions() -> Vec<Tool> {
         ("revoot_list_changed_files", "List changed-file and hunk metadata", json!({"handle":{"type":"string"},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
         ("revoot_read_diff", "Read one or more exact diff hunk pages", json!({"handle":{"type":"string"},"path":{"type":"string"},"hunk_id":{"type":"string"},"page":{"type":"integer","minimum":1},"reads":{"type":"array","maxItems":32,"items":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string"},"hunk_id":{"type":"string"},"page":{"type":"integer","minimum":1}},"required":["path","hunk_id","page"]}},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":32}})),
         ("revoot_read_file", "Read one or more bounded post-change file ranges", json!({"handle":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"ranges":{"type":"array","maxItems":32,"items":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path","start_line","end_line"]}},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":32}})),
-        ("revoot_find_files", "Find tracked allowlisted files", json!({"handle":{"type":"string"},"query":{"type":"string"},"glob":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
-        ("revoot_search_code", "Search allowlisted snapshot code", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
-        ("revoot_search_diff", "Search exact diff artifacts", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"kind":{"enum":["any","added","deleted","context"]},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
+        ("revoot_find_files", "Find tracked allowlisted files", json!({"handle":{"type":"string"},"query":{"type":"string"},"glob":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":MAX_SEARCH_RESULTS,"default":DEFAULT_SEARCH_RESULTS},"cursor":{"type":["string","null"],"maxLength":128},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":MAX_SEARCH_RESULTS}})),
+        ("revoot_search_code", "Search allowlisted snapshot code", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"max_results":{"type":"integer","minimum":1,"maximum":MAX_SEARCH_RESULTS,"default":DEFAULT_SEARCH_RESULTS},"cursor":{"type":["string","null"],"maxLength":128},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":MAX_SEARCH_RESULTS}})),
+        ("revoot_search_diff", "Search exact diff artifacts", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"kind":{"enum":["any","added","deleted","context"]},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"max_results":{"type":"integer","minimum":1,"maximum":MAX_SEARCH_RESULTS,"default":DEFAULT_SEARCH_RESULTS},"cursor":{"type":["string","null"],"maxLength":128},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":MAX_SEARCH_RESULTS}})),
         ("revoot_get_rules", "Resolve effective bounded guidance for a path", json!({"handle":{"type":"string"},"path":{"type":"string"},"rule_ids":{"type":["array","null"],"minItems":1,"maxItems":32,"items":{"type":"string"}},"after_id":{"type":["string","null"]}})),
         ("revoot_validate_findings", "Validate findings against issued anchors", json!({"handle":{"type":"string"},"findings":{"type":"object"}})),
     ].into_iter().map(|(name, description, properties)| {
@@ -659,9 +667,9 @@ fn tool_definitions() -> Vec<Tool> {
             "revoot_list_changed_files"
             | "revoot_read_diff"
             | "revoot_read_file"
-            | "revoot_find_files" => &["handle"],
-            "revoot_search_code" => &["handle", "query", "max_results"],
-            "revoot_search_diff" => &["handle", "query", "kind", "max_results"],
+            => &["handle"],
+            "revoot_find_files" | "revoot_search_code" => &["handle", "query"],
+            "revoot_search_diff" => &["handle", "query", "kind"],
             "revoot_get_rules" => &["handle", "path"],
             "revoot_validate_findings" => &["handle", "findings"],
             _ => &[],
@@ -699,6 +707,20 @@ fn u32_argument(arguments: &JsonObject, name: &str) -> Result<u32, &'static str>
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or("missing integer argument")
+}
+
+fn search_result_limit(arguments: &JsonObject) -> Result<u32, &'static str> {
+    let maximum = match arguments.get("max_results") {
+        None => DEFAULT_SEARCH_RESULTS,
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("invalid search result limit")?,
+    };
+    if maximum == 0 || maximum > MAX_SEARCH_RESULTS {
+        return Err("invalid search result limit");
+    }
+    Ok(maximum)
 }
 
 fn diff_read_arguments(
@@ -1185,6 +1207,32 @@ mod tests {
             assert!(properties.contains_key("cursor"));
             assert_eq!(properties["max_result_bytes"]["maximum"], MCP_RESULT_BYTES);
         }
+        for name in [
+            "revoot_find_files",
+            "revoot_search_code",
+            "revoot_search_diff",
+        ] {
+            let schema = &tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .expect("search tool")
+                .input_schema;
+            assert_eq!(
+                schema["properties"]["max_results"]["default"],
+                DEFAULT_SEARCH_RESULTS
+            );
+            assert_eq!(
+                schema["properties"]["max_results"]["maximum"],
+                MAX_SEARCH_RESULTS
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .expect("required fields")
+                    .iter()
+                    .any(|field| field == "max_results")
+            );
+        }
         assert_eq!(
             tools
                 .iter()
@@ -1327,6 +1375,94 @@ mod tests {
         assert!(small.content.is_empty());
         let oversized = bounded_success(json!({"body":"x".repeat(MCP_RESULT_BYTES)}));
         assert_eq!(oversized.is_error, Some(true));
+    }
+
+    #[test]
+    fn search_defaults_and_cursors_continue_deterministically_and_fail_closed() {
+        assert_eq!(
+            search_result_limit(&JsonObject::new()),
+            Ok(DEFAULT_SEARCH_RESULTS)
+        );
+        assert_eq!(
+            search_result_limit(
+                json!({"max_results":MAX_SEARCH_RESULTS})
+                    .as_object()
+                    .expect("limit")
+            ),
+            Ok(MAX_SEARCH_RESULTS)
+        );
+        assert_eq!(
+            search_result_limit(
+                json!({"max_results":MAX_SEARCH_RESULTS + 1})
+                    .as_object()
+                    .expect("limit")
+            ),
+            Err("invalid search result limit")
+        );
+
+        let fixture = RepositoryFixture::new();
+        let server = RevootMcpServer::new(fixture.path()).expect("server");
+        let opened = server
+            .open_review(
+                json!({"repository_root":fixture.path(),"base":"main"})
+                    .as_object()
+                    .expect("open arguments"),
+                &CancellationToken::default(),
+            )
+            .expect("open review");
+        let handle = opened["handle"].as_str().expect("handle");
+        let mut arguments = json!({
+            "handle":handle,
+            "query":".",
+            "glob":false,
+            "max_matches":1,
+            "max_result_bytes":1024
+        });
+        let first = server
+            .execute(
+                "revoot_find_files",
+                arguments.as_object().expect("search arguments"),
+                &CancellationToken::default(),
+            )
+            .expect("first page");
+        assert_eq!(first["page"]["page_number"], 1);
+        assert_eq!(first["page"]["items"].as_array().map(Vec::len), Some(1));
+        assert!(serde_json::to_vec(&first).expect("first JSON").len() <= MCP_RESULT_BYTES);
+        let cursor = first["page"]["next_cursor"]
+            .as_str()
+            .expect("next cursor")
+            .to_owned();
+        arguments["cursor"] = json!(cursor);
+        let second = server
+            .execute(
+                "revoot_find_files",
+                arguments.as_object().expect("search arguments"),
+                &CancellationToken::default(),
+            )
+            .expect("second page");
+        let repeated = server
+            .execute(
+                "revoot_find_files",
+                arguments.as_object().expect("search arguments"),
+                &CancellationToken::default(),
+            )
+            .expect("repeated page");
+        assert_eq!(second["page"]["page_number"], 2);
+        assert_eq!(second["page"]["items"], repeated["page"]["items"]);
+
+        let cursor = arguments["cursor"].as_str().expect("cursor");
+        let mut tampered = cursor.as_bytes().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'0' { b'1' } else { b'0' };
+        arguments["cursor"] = json!(String::from_utf8(tampered).expect("UTF-8 cursor"));
+        assert_eq!(
+            server.execute(
+                "revoot_find_files",
+                arguments.as_object().expect("search arguments"),
+                &CancellationToken::default(),
+            ),
+            Err("invalid or stale cursor")
+        );
     }
 
     #[tokio::test]

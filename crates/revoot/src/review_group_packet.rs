@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use revoot_core::review_packet::{
-    ReviewPacketCompleteDiff, ReviewPacketComposer, ReviewPacketComposition,
-    ReviewPacketDiffManifest, ReviewPacketFileBrief, ReviewPacketGroupBrief, ReviewPacketInput,
-    ReviewPacketPolicy, ReviewPacketPurpose, ReviewPacketTokenEstimates,
+    ReviewPacketAnchorBrief, ReviewPacketCompleteDiff, ReviewPacketComposer,
+    ReviewPacketComposition, ReviewPacketDiffManifest, ReviewPacketFileBrief,
+    ReviewPacketGroupBrief, ReviewPacketInput, ReviewPacketPolicy, ReviewPacketPurpose,
+    ReviewPacketTokenEstimates,
 };
 use revoot_core::{
     AnchorId, AnchorPosition, AnchorTable, ChangedPath, CoverageCompletionGate, RepositoryPath,
@@ -117,7 +118,13 @@ pub fn prepare_review_group_packet(
         .collect();
     let coverage_gate = CoverageCompletionGate::new(coverage, &metadata_only_renames)
         .map_err(|_| ReviewGroupPacketError::Coverage)?;
-    let initial_packet = build_initial_packet(group_input, artifacts, bindings, &indexed_files)?;
+    let initial_packet = build_initial_packet(
+        group_input,
+        artifacts,
+        &anchor_table,
+        bindings,
+        &indexed_files,
+    )?;
     let mut composer = ReviewPacketComposer::new(
         group_input.group.id.as_str().to_owned(),
         group_input.group_plan_sha256.clone(),
@@ -427,10 +434,11 @@ fn worker_metrics(
 fn build_initial_packet(
     input: &TrustedReviewGroupInput,
     artifacts: &DiffArtifactStore,
+    anchor_table: &AnchorTable,
     bindings: &ReviewGroupPacketBindings,
     indexed_artifacts: &BTreeMap<RepositoryPath, DiffFileManifest>,
 ) -> Result<ReviewPacketInput, ReviewGroupPacketError> {
-    let files = packet_file_briefs(input)?;
+    let files = packet_file_briefs(input, anchor_table)?;
     let mut rule_ids = input
         .files
         .iter()
@@ -502,6 +510,7 @@ fn build_initial_packet(
 
 fn packet_file_briefs(
     input: &TrustedReviewGroupInput,
+    anchor_table: &AnchorTable,
 ) -> Result<Vec<ReviewPacketFileBrief>, ReviewGroupPacketError> {
     let mut files = input
         .files
@@ -520,18 +529,36 @@ fn packet_file_briefs(
                 .iter()
                 .try_fold(0_u32, |total, hunk| total.checked_add(hunk.changed_lines))
                 .ok_or(ReviewGroupPacketError::CountBinding)?;
-            let tier = input
+            let group_file = input
                 .group
                 .files
                 .iter()
                 .find(|group_file| group_file.path.new_path == file.manifest.path)
-                .ok_or(ReviewGroupPacketError::PathBinding)?
-                .tier;
+                .ok_or(ReviewGroupPacketError::PathBinding)?;
+            let mut anchors = group_file
+                .anchor_ids
+                .iter()
+                .map(|anchor_id| {
+                    let anchor = anchor_table
+                        .resolve(anchor_id.as_str())
+                        .ok_or(ReviewGroupPacketError::AnchorBinding)?;
+                    if anchor.path != group_file.path {
+                        return Err(ReviewGroupPacketError::AnchorBinding);
+                    }
+                    Ok(ReviewPacketAnchorBrief {
+                        anchor_id: anchor.id.clone(),
+                        position: anchor.position,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            anchors.sort_by(|left, right| left.anchor_id.cmp(&right.anchor_id));
             Ok(ReviewPacketFileBrief {
                 path: file.manifest.path.clone(),
-                tier,
+                work_unit_id: file.work_unit_id.clone(),
+                tier: group_file.tier,
                 changed_lines,
                 hunk_ids,
+                anchors,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -708,6 +735,18 @@ mod tests {
             ReviewPacketDiffContext::InlineComplete { .. }
         ));
         assert_eq!(prepared.initial_packet.group_brief.files.len(), 2);
+        for file in &prepared.initial_packet.group_brief.files {
+            assert_eq!(
+                prepared.work_unit_ids_by_path.get(&file.path),
+                Some(&file.work_unit_id)
+            );
+            assert_eq!(file.anchors.len(), 1);
+            assert!(prepared.issued_anchors.contains(&file.anchors[0].anchor_id));
+            assert!(matches!(
+                file.anchors[0].position,
+                AnchorPosition::Addition { new_line: 1 }
+            ));
+        }
         assert_eq!(prepared.initial_packet.unresolved_coverage_ids.len(), 2);
         assert!(
             prepared

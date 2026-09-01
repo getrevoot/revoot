@@ -129,7 +129,7 @@ impl Default for RepositoryToolLimits {
             max_file_bytes: 2 * 1024 * 1024,
             max_read_bytes: 256 * 1024,
             max_search_bytes: 8 * 1024 * 1024,
-            max_search_matches: 200,
+            max_search_matches: 500,
             max_list_results: 2_000,
             max_diff_bytes: 2 * 1024 * 1024,
         }

@@ -355,7 +355,6 @@ impl DiffArtifactStore {
         };
         let mut results = Vec::new();
         let mut scanned_files = 0_u32;
-        let mut result_bytes = 0_usize;
         let mut truncated = false;
         for path in requested {
             let artifact = self
@@ -385,19 +384,10 @@ impl DiffArtifactStore {
                         continue;
                     }
                     let excerpt = truncate_utf8(line, 512);
-                    let added = path
-                        .as_str()
-                        .len()
-                        .saturating_add(hunk.manifest.hunk_id.len())
-                        .saturating_add(excerpt.len())
-                        .saturating_add(32);
-                    if results.len() >= usize::try_from(request.max_results).unwrap_or(usize::MAX)
-                        || result_bytes.saturating_add(added) > MAX_TOOL_RESULT_BYTES
-                    {
+                    if results.len() >= usize::try_from(request.max_results).unwrap_or(usize::MAX) {
                         truncated = true;
                         break;
                     }
-                    result_bytes = result_bytes.saturating_add(added);
                     results.push(DiffSearchMatch {
                         path: path.clone(),
                         hunk_id: hunk.manifest.hunk_id.clone(),
