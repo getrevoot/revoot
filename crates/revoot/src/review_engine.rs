@@ -738,7 +738,7 @@ pub async fn run_review(
                             | ReviewEngineErrorKind::CandidateContract
                     ) =>
                 {
-                    (recoverable_tool_error(error.kind), true)
+                    (recoverable_tool_error(error), true)
                 }
                 Err(error) => return Err(error),
             };
@@ -755,9 +755,13 @@ pub async fn run_review(
     }
 }
 
-fn recoverable_tool_error(kind: ReviewEngineErrorKind) -> String {
-    match kind {
-        ReviewEngineErrorKind::CandidateContract => {
+fn recoverable_tool_error(error: ReviewEngineError) -> String {
+    match (error.kind, error.budget_dimension) {
+        (
+            ReviewEngineErrorKind::ToolContract,
+            Some(ReviewBudgetDimension::ToolResultBytes),
+        ) => r#"{"error":"tool_result_too_large","retryable":true,"action":"request a narrower line range or search scope"}"#.to_owned(),
+        (ReviewEngineErrorKind::CandidateContract, _) => {
             r#"{"error":"candidate_contract","retryable":true}"#.to_owned()
         }
         _ => r#"{"error":"tool_contract","retryable":true}"#.to_owned(),
@@ -1452,9 +1456,12 @@ fn strict_input<T: for<'de> Deserialize<'de>>(input: Value) -> Result<T, ReviewE
 fn encode_tool_result(value: &Value, maximum: u64) -> Result<String, ReviewEngineError> {
     let encoded = serde_json::to_string(value).map_err(|_| internal())?;
     if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > maximum {
-        return Err(ReviewEngineError::budget(
-            ReviewBudgetDimension::ToolResultBytes,
-        ));
+        return Err(ReviewEngineError {
+            kind: ReviewEngineErrorKind::ToolContract,
+            provider_kind: None,
+            provider_status: None,
+            budget_dimension: Some(ReviewBudgetDimension::ToolResultBytes),
+        });
     }
     Ok(encoded)
 }
@@ -2322,6 +2329,24 @@ mod tests {
                 })
             })
         }));
+    }
+
+    #[test]
+    fn oversized_tool_result_requests_a_narrower_scope_without_raising_limits() {
+        let error = encode_tool_result(&json!({"content": "x".repeat(128)}), 64)
+            .expect_err("oversized result");
+        assert_eq!(error.kind, ReviewEngineErrorKind::ToolContract);
+        assert_eq!(
+            error.budget_dimension,
+            Some(ReviewBudgetDimension::ToolResultBytes)
+        );
+        let recovery = recoverable_tool_error(error);
+        assert!(recovery.contains("tool_result_too_large"));
+        assert!(recovery.contains("narrower line range"));
+        assert_eq!(
+            ReviewEngineLimits::default().max_tool_result_bytes,
+            64 * 1024
+        );
     }
 
     #[tokio::test]
