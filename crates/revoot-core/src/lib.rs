@@ -18,6 +18,7 @@ pub mod partition;
 pub mod provider;
 pub mod publication;
 pub mod repository;
+pub mod review_group;
 pub mod review_history;
 pub mod snapshot;
 
@@ -105,6 +106,13 @@ pub use repository::{
     RepositoryDiff, RepositoryFile, RepositoryInventory, RepositoryLimitError, RepositoryPathError,
     RepositoryRelativePath, RepositoryToolError, RepositoryToolLimits, RepositoryToolbox,
     SearchMatch, SearchRequest, SearchResult, ShowDiffResult,
+};
+pub use review_group::{
+    CoverageError, CoverageRequirement, CoverageRequirementKind, FileCoverageLedger,
+    GroupCoverageLedger, HunkCoverage, ProposedReviewGroup, ReviewEffort, ReviewGroup,
+    ReviewGroupFile, ReviewGroupId, ReviewGroupLimits, ReviewGroupPlan, ReviewGroupPlanError,
+    ReviewGroupingSource, UnreadHunkDisposition, UnreadHunkDispositionKind,
+    build_review_group_plan,
 };
 pub use review_history::{
     PriorReviewContext, PriorReviewContextError, PriorReviewDiscussion, PriorReviewReply,

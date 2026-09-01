@@ -424,6 +424,15 @@ impl RepositoryToolbox {
         &self.inventory
     }
 
+    /// Iterate the exact trusted diffs without charging a model tool budget.
+    ///
+    /// This setup-only view allows the runtime to materialize private indexed
+    /// artifacts before any model call. It does not expose checkout paths or
+    /// bytes outside the current process.
+    pub fn exact_diffs(&self) -> impl Iterator<Item = (&RepositoryRelativePath, &str)> {
+        self.diffs.iter().map(|(path, text)| (path, text.as_str()))
+    }
+
     /// List files below an optional repository-relative prefix.
     ///
     /// # Errors

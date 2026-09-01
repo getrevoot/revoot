@@ -19,6 +19,10 @@ similar = "2.7"
 libc = "0.2"
 revoot-core = { version = "0.2.0", path = "crates/revoot-core" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+httpdate = "1"
+globset = "0.4"
+regex = "1"
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +31,7 @@ sha2 = "0.10"
 sha1 = "0.10"
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+tempfile = "3"
 webpki-roots = "1"
 
 [profile.release]
