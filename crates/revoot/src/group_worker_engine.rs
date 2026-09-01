@@ -838,7 +838,7 @@ fn rebase_packet(
             })
         })
         .collect::<Result<Vec<_>, GroupWorkerError>>()?;
-    input.unresolved_coverage_ids = runtime
+    let mut unresolved_coverage_ids: Vec<String> = runtime
         .coverage_gate
         .as_ref()
         .map(|gate| gate.ledger().missing_requirements())
@@ -849,6 +849,9 @@ fn rebase_packet(
             format!("coverage:{}", Sha256Digest::of_bytes(&encoded).as_str())
         })
         .collect();
+    unresolved_coverage_ids.sort();
+    unresolved_coverage_ids.dedup();
+    input.unresolved_coverage_ids = unresolved_coverage_ids;
     input.recent_exchange = recent_exchange;
     input.complete_diff = None;
     input.token_estimates.inline_request_tokens = None;
@@ -1093,7 +1096,9 @@ const fn worker_phase_name(phase: ReviewWorkerPhase) -> &'static str {
 
 fn model_tools() -> Vec<ModelTool> {
     let checkpoint = json!({"type":"object","required":["hypotheses","evidence_references","unresolved_coverage"],"properties":{"hypotheses":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}},"evidence_references":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":128}},"unresolved_coverage":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}}},"additionalProperties":false});
-    let plan_summary = json!({"type":"object","required":["focus_area_ids","hunk_ids","dependency_question_ids","risk_hypothesis_ids"],"properties":{"focus_area_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128}},"hunk_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128}},"dependency_question_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128}},"risk_hypothesis_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128}}},"additionalProperties":false});
+    let plan_id =
+        json!({"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._/:\\-]+$"});
+    let plan_summary = json!({"type":"object","required":["focus_area_ids","hunk_ids","dependency_question_ids","risk_hypothesis_ids"],"properties":{"focus_area_ids":{"type":"array","maxItems":256,"items":plan_id.clone()},"hunk_ids":{"type":"array","maxItems":256,"items":plan_id.clone()},"dependency_question_ids":{"type":"array","maxItems":256,"items":plan_id.clone()},"risk_hypothesis_ids":{"type":"array","maxItems":256,"items":plan_id}},"additionalProperties":false});
     let finding = json!({"type":"object","required":["anchor_id","severity","confidence_percent","category","title","explanation","evidence"],"properties":{"anchor_id":{"type":"string","maxLength":128},"severity":{"type":"string","enum":["critical","high","medium","low","info"]},"confidence_percent":{"type":"integer","minimum":0,"maximum":100},"category":{"type":"string","enum":["correctness","security","reliability","performance","maintainability"]},"title":{"type":"string","maxLength":160},"explanation":{"type":"string","maxLength":4000},"evidence":{"type":"string","maxLength":2000},"lineage_id":{"type":["string","null"],"maxLength":64},"suggested_replacement":{"type":["string","null"],"maxLength":8000}},"additionalProperties":false});
     let candidate = json!({"type":"object","required":["candidate_id","work_unit_id","finding","evidence_references"],"properties":{"candidate_id":{"type":"string","maxLength":128},"work_unit_id":{"type":"string","maxLength":128},"finding":finding,"evidence_references":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","maxLength":128}}},"additionalProperties":false});
     let summary = json!({"type":"object","required":["text","assumptions"],"properties":{"text":{"type":"string","maxLength":4096},"assumptions":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}}},"additionalProperties":false});
@@ -1745,7 +1750,9 @@ fn execute_checkpoint(
             let plan_summary = args
                 .plan_summary
                 .ok_or_else(|| recoverable("plan_summary"))?;
-            runtime.plan_summary = Some(plan_summary.into());
+            let mut plan_summary = ReviewPacketPlanSummary::from(plan_summary);
+            normalize_plan_summary(&mut plan_summary)?;
+            runtime.plan_summary = Some(plan_summary);
             state
                 .finish_planning(args.checkpoint.clone())
                 .map_err(|_| recoverable("transition"))?;
@@ -1765,6 +1772,31 @@ fn execute_checkpoint(
     }
     runtime.checkpoint = args.checkpoint;
     Ok(json!({"status":"accepted"}))
+}
+
+fn normalize_plan_summary(summary: &mut ReviewPacketPlanSummary) -> Result<(), ToolExecutionError> {
+    for ids in [
+        &mut summary.focus_area_ids,
+        &mut summary.hunk_ids,
+        &mut summary.dependency_question_ids,
+        &mut summary.risk_hypothesis_ids,
+    ] {
+        if ids.len() > 256
+            || ids.iter().any(|id| {
+                id.is_empty()
+                    || id.len() > 128
+                    || !id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
+                    })
+            })
+        {
+            return Err(recoverable("plan_summary"));
+        }
+        ids.sort();
+        ids.dedup();
+    }
+    Ok(())
 }
 
 fn execute_candidate(
@@ -2899,6 +2931,22 @@ mod tests {
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(output.provider_turns, 2);
         assert_eq!(provider.calls(), 2);
+    }
+
+    #[test]
+    fn plan_summary_ids_are_canonicalized_before_rebasing() {
+        let mut summary = ReviewPacketPlanSummary {
+            focus_area_ids: vec!["zeta".to_owned(), "alpha".to_owned(), "alpha".to_owned()],
+            hunk_ids: vec!["hunk:2".to_owned(), "hunk:1".to_owned()],
+            dependency_question_ids: Vec::new(),
+            risk_hypothesis_ids: vec!["risk/security".to_owned()],
+        };
+        assert!(normalize_plan_summary(&mut summary).is_ok());
+        assert_eq!(summary.focus_area_ids, ["alpha", "zeta"]);
+        assert_eq!(summary.hunk_ids, ["hunk:1", "hunk:2"]);
+
+        summary.focus_area_ids = vec!["not a safe id".to_owned()];
+        assert!(normalize_plan_summary(&mut summary).is_err());
     }
 
     #[tokio::test]
