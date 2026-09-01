@@ -484,8 +484,8 @@ fn valid_hunk_id(hunk_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ChangedPath, DiffHazardFileInput, DiffHazardHunkInput, DiffHazardToken,
-        DiffHunkLineClasses, ReviewGroupFile, classify_diff_hazards,
+        classify_diff_hazards, ChangedPath, DiffHazardFileInput, DiffHazardHunkInput,
+        DiffHazardToken, DiffHunkLineClasses, ReviewGroupFile,
     };
     use serde_json::json;
 

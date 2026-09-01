@@ -29,6 +29,7 @@ pub mod repository;
 pub mod review_budget;
 pub mod review_group;
 pub mod review_history;
+pub mod review_packet;
 pub mod review_preview;
 pub mod review_report;
 pub mod review_tools;
