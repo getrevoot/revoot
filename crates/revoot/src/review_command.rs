@@ -16,9 +16,11 @@ use revoot_core::{
     GitLabOriginPolicy, GitLabProjectIdentity, GitLabVerificationInput, GitLabWireLimits, GitSha,
     IpCidr, IssuedWorkUnitAnchors, MergeRequestIid, PartitionLimits, PublicationCandidate,
     PublicationTarget, PullRequestNumber, RankedFinding, RepositoryPath, RepositoryRelativePath,
-    RepositoryToolLimits, ReviewOmissionReason, ReviewOutcome, ReviewPartitionPlan,
-    ReviewSelectionPolicy, ReviewSnapshotIdentity, ReviewValueTier, Severity, SnapshotReadiness,
-    UnifiedDiffLimits, classify_gitlab_ci_environment, parse_project_response,
+    RepositoryToolLimits, ReviewGroupingSource, ReviewOmissionReason, ReviewOutcome,
+    ReviewPartitionPlan, ReviewPreview, ReviewPreviewGroupInput, ReviewPreviewRule,
+    ReviewPreviewRuleSource, ReviewPreviewStrategy, ReviewSelectionPolicy, ReviewSnapshotIdentity,
+    ReviewValueTier, Severity, SnapshotReadiness, UnifiedDiffLimits, build_review_group_plan,
+    build_review_preview, classify_gitlab_ci_environment, parse_project_response,
     validate_rank_and_render,
 };
 use rustls::pki_types::pem::{PemObject, SectionKind};
@@ -87,6 +89,9 @@ use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
 };
 use crate::review_strategy_config::{ReviewStrategyConfiguration, strategy_from_resolved};
+use crate::rule_diagnostics::{
+    RepositoryRuleMetadata, RuleDiagnosticPolicy, RulePrecedenceSource, diagnose_rules,
+};
 
 const REPORT_SCHEMA_VERSION: &str = "revoot.review-report/v3";
 const MODEL_CATALOG_SCHEMA_VERSION: &str = "revoot.model-catalog/v1";
@@ -137,6 +142,15 @@ struct ReviewOutput<'a> {
     provider: &'a str,
     model: &'a str,
     review: &'a CanonicalReviewReport,
+}
+
+enum ReviewCommandResult {
+    Review {
+        provider: String,
+        model: String,
+        report: CanonicalReviewReport,
+    },
+    Preview(ReviewPreview),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -715,15 +729,27 @@ pub fn run(
                 "failed to start the review runtime",
             )
         })?;
-    let (provider, model, report) = runtime.block_on(run_async(
+    let result = runtime.block_on(run_async(
         &environment,
         current_directory,
         args.ci,
+        args.preview,
         args.base_ref.as_deref(),
         args.merge_request_iid,
         args.pull_request_number,
         args.github_repository.clone(),
     ))?;
+    let (provider, model, report) = match result {
+        ReviewCommandResult::Review {
+            provider,
+            model,
+            report,
+        } => (provider, model, report),
+        ReviewCommandResult::Preview(preview) => {
+            emit_preview(&args, &preview)?;
+            return Ok(0);
+        }
+    };
     emit_report(&args, &provider, &model, &report)?;
     if report.publication.reason == Some("github_thread_resolution_unavailable") {
         eprintln!(
@@ -744,16 +770,17 @@ fn set_operator_environment(environment: &mut Vec<(OsString, OsString)>, name: &
     environment.push((OsString::from(name), OsString::from(value)));
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_async(
     environment: &[(OsString, OsString)],
     current_directory: &Path,
     ci_requested: bool,
+    preview: bool,
     explicit_base: Option<&str>,
     merge_request_iid: Option<MergeRequestIid>,
     pull_request_number: Option<PullRequestNumber>,
     explicit_github_repository: Option<GitHubRepositorySlug>,
-) -> Result<(String, String, CanonicalReviewReport), Diagnostic> {
+) -> Result<ReviewCommandResult, Diagnostic> {
     if merge_request_iid.is_some()
         && (pull_request_number.is_some() || explicit_github_repository.is_some())
     {
@@ -787,24 +814,25 @@ async fn run_async(
             "both GitHub and GitLab CI contexts are present",
         ));
     }
-    if matches!(gitlab_ci, revoot_core::GitLabCiContext::ForkMismatch { .. })
+    if !preview
+        && matches!(gitlab_ci, revoot_core::GitLabCiContext::ForkMismatch { .. })
         && matches!(
             fork_behavior(&string_environment)?,
             GitLabForkBehavior::Skip
         )
     {
-        return Ok((
-            "not_used".to_owned(),
-            "not_used".to_owned(),
-            skipped_fork_review_report(),
-        ));
+        return Ok(ReviewCommandResult::Review {
+            provider: "not_used".to_owned(),
+            model: "not_used".to_owned(),
+            report: skipped_fork_review_report(),
+        });
     }
     let explicit_host = ci_requested
         || merge_request_iid.is_some()
         || pull_request_number.is_some()
         || explicit_github_repository.is_some();
     if github_ci.is_none() && !gitlab_ci_active && !explicit_host {
-        return run_local_review(environment, current_directory, explicit_base).await;
+        return run_local_review(environment, current_directory, explicit_base, preview).await;
     }
     if explicit_base.is_some() {
         return Err(diagnostic(
@@ -924,6 +952,10 @@ async fn run_async(
             "CI base configuration identity does not match the authoritative review snapshot",
         ));
     }
+    if preview {
+        return build_prepared_preview(&prepared, &resolved, &strategy)
+            .map(ReviewCommandResult::Preview);
+    }
     let job_url = ci_job_url(&string_environment, &prepared)?;
     if prepared.partition().work_units.is_empty() {
         let provider = "deterministic".to_owned();
@@ -932,7 +964,11 @@ async fn run_async(
         report.publication =
             publish_with_checkpoint(&prepared, &report, &provider, &model, job_url.as_deref(), 0)
                 .await;
-        return Ok((provider, model, report));
+        return Ok(ReviewCommandResult::Review {
+            provider,
+            model,
+            report,
+        });
     }
     let credentials =
         DiscoveredCredentials::discover(environment.iter().cloned()).map_err(|_| {
@@ -944,14 +980,21 @@ async fn run_async(
     let provider = select_provider(config_string(resolution, "review.provider")?, &credentials)?;
     let model = select_model(&provider, config_string(resolution, "review.model")?)?;
     prepared.bind_provider_model(&provider, &model)?;
-    execute_prepared_review(provider, model, credentials, resolved, prepared, job_url).await
+    execute_prepared_review(provider, model, credentials, resolved, prepared, job_url)
+        .await
+        .map(|(provider, model, report)| ReviewCommandResult::Review {
+            provider,
+            model,
+            report,
+        })
 }
 
 async fn run_local_review(
     environment: &[(OsString, OsString)],
     current_directory: &Path,
     explicit_base: Option<&str>,
-) -> Result<(String, String, CanonicalReviewReport), Diagnostic> {
+    preview: bool,
+) -> Result<ReviewCommandResult, Diagnostic> {
     let capture = capture_local_git(current_directory, explicit_base).map_err(|error| {
         diagnostic(ErrorCode::RepositoryUnavailable, error.to_string()).with_remediation(
             "run inside a Git repository with an available default-branch history, or pass --base <ref>",
@@ -964,12 +1007,12 @@ async fn run_local_review(
         None,
         environment.iter().cloned(),
     )?;
-    if capture.is_empty() {
-        return Ok((
-            "not_used".to_owned(),
-            "not_used".to_owned(),
-            no_changes_report(),
-        ));
+    if capture.is_empty() && !preview {
+        return Ok(ReviewCommandResult::Review {
+            provider: "not_used".to_owned(),
+            model: "not_used".to_owned(),
+            report: no_changes_report(),
+        });
     }
     let resolution = &resolved.effective;
     let strategy = typed_review_strategy(&resolved)?;
@@ -986,12 +1029,16 @@ async fn run_local_review(
     )
     .map_err(|error| diagnostic(ErrorCode::ReviewFailed, error.to_string()))?;
     let mut prepared = PreparedReview::Local(Box::new(PreparedLocalReview { context }));
+    if preview {
+        return build_prepared_preview(&prepared, &resolved, &strategy)
+            .map(ReviewCommandResult::Preview);
+    }
     if prepared.partition().work_units.is_empty() {
-        return Ok((
-            "not_used".to_owned(),
-            "not_used".to_owned(),
-            no_model_review_report(&prepared),
-        ));
+        return Ok(ReviewCommandResult::Review {
+            provider: "not_used".to_owned(),
+            model: "not_used".to_owned(),
+            report: no_model_review_report(&prepared),
+        });
     }
     let credentials =
         DiscoveredCredentials::discover(environment.iter().cloned()).map_err(|_| {
@@ -1003,7 +1050,177 @@ async fn run_local_review(
     let provider = select_provider(config_string(resolution, "review.provider")?, &credentials)?;
     let model = select_model(&provider, config_string(resolution, "review.model")?)?;
     prepared.bind_provider_model(&provider, &model)?;
-    execute_prepared_review(provider, model, credentials, resolved, prepared, None).await
+    execute_prepared_review(provider, model, credentials, resolved, prepared, None)
+        .await
+        .map(|(provider, model, report)| ReviewCommandResult::Review {
+            provider,
+            model,
+            report,
+        })
+}
+
+fn build_prepared_preview(
+    prepared: &PreparedReview,
+    resolved: &ResolvedReviewConfiguration,
+    strategy: &ReviewStrategyConfiguration,
+) -> Result<ReviewPreview, Diagnostic> {
+    let partition = prepared.partition();
+    let group_plan =
+        build_review_group_plan(partition, None, ReviewGroupingSource::DeterministicFallback)
+            .map_err(|_| preview_contract_error("deterministic preview grouping failed"))?;
+    let changed_lines = preview_changed_lines(prepared)?;
+    let group_inputs = group_plan
+        .groups
+        .iter()
+        .map(|group| {
+            let (maximum, total) =
+                group
+                    .files
+                    .iter()
+                    .try_fold((0_u32, 0_u32), |(maximum, total), file| {
+                        let lines =
+                            changed_lines
+                                .get(&file.path.new_path)
+                                .copied()
+                                .ok_or_else(|| {
+                                    preview_contract_error("preview diff metadata is incomplete")
+                                })?;
+                        total
+                            .checked_add(lines)
+                            .map(|total| (maximum.max(lines), total))
+                            .ok_or_else(|| preview_contract_error("preview line count overflowed"))
+                    })?;
+            let metadata_bytes = u64::try_from(
+                serde_json::to_vec(group)
+                    .map_err(|_| preview_contract_error("preview metadata serialization failed"))?
+                    .len(),
+            )
+            .map_err(|_| preview_contract_error("preview metadata is too large"))?;
+            let estimated_initial_input_tokens = group
+                .input_bytes
+                .checked_add(metadata_bytes)
+                .and_then(|tokens| tokens.checked_add(1_024))
+                .ok_or_else(|| preview_contract_error("preview token estimate overflowed"))?;
+            Ok(ReviewPreviewGroupInput {
+                group_id: group.id.clone(),
+                exact_diff_bytes: group.input_bytes,
+                max_file_changed_lines: maximum,
+                total_changed_lines: total,
+                estimated_initial_input_tokens,
+            })
+        })
+        .collect::<Result<Vec<_>, Diagnostic>>()?;
+    let rules = preview_rules(partition, &resolved.repository)?;
+    let budgets = agent_limits(&resolved.effective, strategy)?;
+    let preview_strategy = ReviewPreviewStrategy {
+        effort: strategy.effort,
+        rounds_per_group: strategy.effort.rounds(),
+        max_turns_per_group: strategy.effort.max_group_turns(),
+        max_parallel_groups: strategy.max_parallel_groups,
+        budgets,
+        max_inline_diff_bytes: strategy.max_inline_diff_bytes,
+        target_request_input_tokens: strategy.target_request_input_tokens,
+        max_request_output_tokens: strategy.max_request_output_tokens,
+    };
+    build_review_preview(
+        partition,
+        &group_plan,
+        preview_strategy,
+        group_inputs,
+        rules,
+    )
+    .map_err(|_| preview_contract_error("review preview construction failed"))
+}
+
+fn preview_changed_lines(
+    prepared: &PreparedReview,
+) -> Result<BTreeMap<RepositoryPath, u32>, Diagnostic> {
+    prepared
+        .repository_diffs()
+        .iter()
+        .map(|diff| {
+            let path = RepositoryPath::try_from(diff.path.as_str().to_owned())
+                .map_err(|_| preview_contract_error("preview contains an unsafe diff path"))?;
+            let lines = diff
+                .text
+                .lines()
+                .try_fold(0_u32, |count, line| {
+                    if (line.starts_with('+') && !line.starts_with("+++"))
+                        || (line.starts_with('-') && !line.starts_with("---"))
+                    {
+                        count.checked_add(1)
+                    } else {
+                        Some(count)
+                    }
+                })
+                .ok_or_else(|| preview_contract_error("preview line count overflowed"))?;
+            Ok((path, lines))
+        })
+        .collect()
+}
+
+fn preview_rules(
+    partition: &ReviewPartitionPlan,
+    repository: &RepositoryReviewPolicy,
+) -> Result<Vec<ReviewPreviewRule>, Diagnostic> {
+    let selected_paths = partition
+        .work_units
+        .iter()
+        .flat_map(|unit| unit.files.iter())
+        .map(|file| file.path.new_path.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let policy = RuleDiagnosticPolicy {
+        base_guidance_present: repository.guidance.is_some(),
+        repository_rules: repository
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| RepositoryRuleMetadata {
+                id: format!("repository:rule-{index:03}"),
+                path_patterns: rule.paths.clone(),
+            })
+            .collect(),
+    };
+    let mut indexed =
+        BTreeMap::<(ReviewPreviewRuleSource, String), BTreeSet<RepositoryPath>>::new();
+    let paths = selected_paths.into_iter().collect::<Vec<_>>();
+    for batch in paths.chunks(32) {
+        let diagnostics = diagnose_rules(batch.iter().cloned(), &policy)
+            .map_err(|_| preview_contract_error("preview rule resolution failed"))?;
+        for path in diagnostics.paths {
+            let repository_path = RepositoryPath::try_from(path.path.as_str().to_owned())
+                .map_err(|_| preview_contract_error("preview contains an unsafe rule path"))?;
+            for trace in path.trace.into_iter().filter(|trace| trace.active) {
+                let source = match trace.source {
+                    RulePrecedenceSource::CompiledSafety => ReviewPreviewRuleSource::CompiledSafety,
+                    RulePrecedenceSource::BaseConfiguration => {
+                        ReviewPreviewRuleSource::BaseConfiguration
+                    }
+                    RulePrecedenceSource::RepositoryRule => ReviewPreviewRuleSource::RepositoryRule,
+                    RulePrecedenceSource::EmbeddedRule => ReviewPreviewRuleSource::EmbeddedLanguage,
+                    RulePrecedenceSource::GenericRule => ReviewPreviewRuleSource::Generic,
+                };
+                for id in trace.rule_ids {
+                    indexed
+                        .entry((source, id))
+                        .or_default()
+                        .insert(repository_path.clone());
+                }
+            }
+        }
+    }
+    Ok(indexed
+        .into_iter()
+        .map(|((source, id), matched_paths)| ReviewPreviewRule {
+            id,
+            source,
+            matched_paths: matched_paths.into_iter().collect(),
+        })
+        .collect())
+}
+
+fn preview_contract_error(message: &'static str) -> Diagnostic {
+    diagnostic(ErrorCode::ContractInvalid, message)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2300,6 +2517,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<ReviewArgs>, 
             "--base cannot be combined with --ci, --mr, --pr, or --repo",
         ));
     }
+    if parsed.preview && parsed.format == OutputFormat::Sarif {
+        return Err(diagnostic(
+            ErrorCode::CliInvalidArgument,
+            "review preview supports human or json output, not sarif",
+        ));
+    }
     Ok(Some(parsed))
 }
 
@@ -2967,6 +3190,42 @@ fn emit_report(
     Ok(())
 }
 
+fn emit_preview(args: &ReviewArgs, preview: &ReviewPreview) -> Result<(), Diagnostic> {
+    let output = match args.format {
+        OutputFormat::Human => preview.human(),
+        OutputFormat::Json => String::from_utf8(preview.canonical_json().map_err(|_| {
+            diagnostic(
+                ErrorCode::ContractInvalid,
+                "review preview serialization failed",
+            )
+        })?)
+        .map(|value| format!("{value}\n"))
+        .map_err(|_| {
+            diagnostic(
+                ErrorCode::ContractInvalid,
+                "review preview serialization produced invalid UTF-8",
+            )
+        })?,
+        OutputFormat::Sarif => {
+            return Err(diagnostic(
+                ErrorCode::CliInvalidArgument,
+                "review preview supports human or json output, not sarif",
+            ));
+        }
+    };
+    if let Some(path) = &args.output {
+        write_report_atomically(path, output.as_bytes()).map_err(|_| {
+            diagnostic(
+                ErrorCode::RepositoryUnavailable,
+                "review preview output could not be written",
+            )
+        })?;
+    } else {
+        print!("{output}");
+    }
+    Ok(())
+}
+
 fn render_sarif(report: &CanonicalReviewReport) -> Result<String, Diagnostic> {
     let results = report
         .findings
@@ -3080,7 +3339,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use revoot_core::{
-        AgentBudgetLimits, AgentBudgetUsage, AnchorId, FindingCategory, MergeRequestIid,
+        AgentBudgetLimits, AgentBudgetUsage, AnchorId, ErrorCode, FindingCategory, MergeRequestIid,
         PullRequestNumber, RankedFinding, Severity, Sha256Digest,
     };
 
@@ -3322,6 +3581,54 @@ mod tests {
         )
         .expect("binary-only review succeeds");
         assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn local_preview_needs_no_selected_provider_credential() {
+        let repository = CleanLocalRepository::new();
+        fs::write(
+            repository.0.join("README.md"),
+            "# changed without a provider credential\n",
+        )
+        .expect("changed fixture");
+        let output = repository.0.join("preview.json");
+        let exit = super::run(
+            [
+                "--preview".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+                "--output".to_owned(),
+                output.to_string_lossy().into_owned(),
+            ]
+            .into_iter(),
+            [(OsString::from("REVOOT_PROVIDER"), OsString::from("openai"))],
+            &repository.0,
+        )
+        .expect("preview returns before provider credential discovery");
+        assert_eq!(exit, 0);
+
+        let preview: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).expect("preview output"))
+                .expect("preview json");
+        assert_eq!(
+            preview["schema_version"],
+            revoot_core::ReviewPreview::SCHEMA_VERSION
+        );
+        assert_eq!(preview["grouping_source"], "deterministic_fallback");
+        assert_eq!(preview["groups"].as_array().map(Vec::len), Some(1));
+        assert!(preview.get("provider").is_none());
+        assert!(preview.get("model").is_none());
+    }
+
+    #[test]
+    fn parser_rejects_sarif_preview_before_review_preparation() {
+        let error = parse_args(
+            ["--preview", "--format", "sarif"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("SARIF preview is unsupported");
+        assert_eq!(error.code, ErrorCode::CliInvalidArgument);
     }
 
     #[test]
