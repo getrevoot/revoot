@@ -75,6 +75,13 @@ fn distribution_surfaces_retain_third_party_notices() {
     assert!(builder.contains("docker cp"));
     assert!(builder.contains("image-THIRD_PARTY_NOTICES.md"));
     assert!(builder.contains("image-embedded-review-rules-LICENSE.md"));
+
+    let dogfood =
+        fs::read_to_string(root.join(".github/workflows/revoot.yml")).expect("dogfood workflow");
+    assert!(dogfood.contains("THIRD_PARTY_NOTICES.md > image-context/THIRD_PARTY_NOTICES.md"));
+    assert!(dogfood.contains(
+        "licenses/embedded-review-rules-LICENSE.md > image-context/embedded-review-rules-LICENSE.md"
+    ));
 }
 
 #[test]

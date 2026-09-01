@@ -67,6 +67,9 @@ jobs:
         run: |
           mkdir image-context
           tar -xOzf image-input/revoot-linux-amd64.tar.gz revoot > image-context/revoot
+          tar -xOzf image-input/revoot-linux-amd64.tar.gz LICENSE > image-context/LICENSE
+          tar -xOzf image-input/revoot-linux-amd64.tar.gz THIRD_PARTY_NOTICES.md > image-context/THIRD_PARTY_NOTICES.md
+          tar -xOzf image-input/revoot-linux-amd64.tar.gz licenses/embedded-review-rules-LICENSE.md > image-context/embedded-review-rules-LICENSE.md
           chmod 0555 image-context/revoot
           cp packaging/oci/Dockerfile image-context/Dockerfile
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
