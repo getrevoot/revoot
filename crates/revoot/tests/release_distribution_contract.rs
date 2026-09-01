@@ -221,6 +221,8 @@ fn release_version_guard_binds_tag_package_and_changelog() {
         &["init"][..],
         &["config", "user.name", "Revoot Test"][..],
         &["config", "user.email", "test@example.invalid"][..],
+        &["config", "commit.gpgSign", "false"][..],
+        &["config", "tag.gpgSign", "false"][..],
         &["add", "."][..],
         &["commit", "-m", "test: release fixture"][..],
         &["tag", "-a", "v0.1.0", "-m", "Revoot v0.1.0"][..],
@@ -280,6 +282,8 @@ fn merged_release_tagger_is_validated_and_idempotent() {
         &["init", "-b", "main"][..],
         &["config", "user.name", "Revoot Test"][..],
         &["config", "user.email", "test@example.invalid"][..],
+        &["config", "commit.gpgSign", "false"][..],
+        &["config", "tag.gpgSign", "false"][..],
         &["add", "."][..],
         &["commit", "-m", "chore: release v0.1.0"][..],
     ] {

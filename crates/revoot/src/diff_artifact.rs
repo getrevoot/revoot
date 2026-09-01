@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use revoot_core::{
-    FileCoverageLedger, GroupCoverageLedger, HunkCoverage, RepositoryPath, RepositoryRelativePath,
-    ReviewGroup, Sha256Digest,
+    AnchorPosition, FileCoverageLedger, GroupCoverageLedger, HunkCoverage, RepositoryPath,
+    RepositoryRelativePath, ReviewGroup, Sha256Digest,
 };
 use serde::Serialize;
 use tempfile::{Builder, TempDir};
 
-pub const DEFAULT_DIFF_PAGE_BYTES: usize = 32 * 1024;
+pub const DEFAULT_DIFF_PAGE_BYTES: usize = 24 * 1024;
 pub const MAX_INLINE_GROUP_DIFF_BYTES: u64 = 16 * 1024;
 pub const MAX_DIFF_SEARCH_MATCHES: u32 = 500;
 
@@ -61,6 +61,11 @@ pub struct DiffHunkPage {
     pub page: u32,
     pub total_pages: u32,
     pub content: String,
+    /// Exact changed-side coordinates physically present in this page. This is
+    /// trusted runtime metadata and is deliberately not serialized to models;
+    /// callers expose only matching opaque anchor IDs.
+    #[serde(skip)]
+    pub positions: BTreeSet<AnchorPosition>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,13 +172,25 @@ impl DiffArtifactStore {
         diffs: impl IntoIterator<Item = (&'a RepositoryRelativePath, &'a str)>,
         page_bytes: usize,
     ) -> Result<Self, DiffArtifactError> {
+        Self::create_with_parent(diffs, page_bytes, None)
+    }
+
+    fn create_with_parent<'a>(
+        diffs: impl IntoIterator<Item = (&'a RepositoryRelativePath, &'a str)>,
+        page_bytes: usize,
+        temporary_parent: Option<&Path>,
+    ) -> Result<Self, DiffArtifactError> {
         if page_bytes == 0 || page_bytes > MAX_TOOL_RESULT_BYTES {
             return Err(DiffArtifactError::InvalidLimit);
         }
-        let directory = Builder::new()
-            .prefix("revoot-review-")
-            .tempdir()
-            .map_err(|_| DiffArtifactError::TemporaryDirectory)?;
+        let mut builder = Builder::new();
+        builder.prefix("revoot-review-");
+        let directory = if let Some(parent) = temporary_parent {
+            builder.tempdir_in(parent)
+        } else {
+            builder.tempdir()
+        }
+        .map_err(|_| DiffArtifactError::TemporaryDirectory)?;
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .map_err(|_| DiffArtifactError::InvalidPermissions)?;
         let mut artifacts = BTreeMap::new();
@@ -313,6 +330,7 @@ impl DiffArtifactStore {
             page,
             total_pages: hunk.manifest.pages,
             content,
+            positions: page_positions(&text, hunk, start, end)?,
         })
     }
 
@@ -452,6 +470,78 @@ impl DiffArtifactStore {
     }
 }
 
+fn page_positions(
+    text: &str,
+    hunk: &IndexedHunk,
+    page_start: usize,
+    page_end: usize,
+) -> Result<BTreeSet<AnchorPosition>, DiffArtifactError> {
+    let (hunk_start, hunk_end) = hunk
+        .pages
+        .first()
+        .zip(hunk.pages.last())
+        .map(|(first, last)| (first.0, last.1))
+        .ok_or(DiffArtifactError::InvalidDiff)?;
+    let body = text
+        .get(hunk_start..hunk_end)
+        .ok_or(DiffArtifactError::ContentChanged)?;
+    let mut old_line = hunk.manifest.old_start;
+    let mut new_line = hunk.manifest.new_start;
+    let mut offset = hunk_start;
+    let mut positions = BTreeSet::new();
+    for (index, line) in body.split_inclusive('\n').enumerate() {
+        let line_start = offset;
+        offset = offset
+            .checked_add(line.len())
+            .ok_or(DiffArtifactError::InvalidDiff)?;
+        if index == 0 {
+            continue;
+        }
+        let in_page = line_start >= page_start && line_start < page_end;
+        match line.as_bytes().first().copied() {
+            Some(b'-') => {
+                if in_page {
+                    positions.insert(
+                        AnchorPosition::deletion(old_line)
+                            .map_err(|_| DiffArtifactError::InvalidDiff)?,
+                    );
+                }
+                old_line = old_line
+                    .checked_add(1)
+                    .ok_or(DiffArtifactError::InvalidDiff)?;
+            }
+            Some(b'+') => {
+                if in_page {
+                    positions.insert(
+                        AnchorPosition::addition(new_line)
+                            .map_err(|_| DiffArtifactError::InvalidDiff)?,
+                    );
+                }
+                new_line = new_line
+                    .checked_add(1)
+                    .ok_or(DiffArtifactError::InvalidDiff)?;
+            }
+            Some(b' ') => {
+                if in_page {
+                    positions.insert(
+                        AnchorPosition::context(old_line, new_line)
+                            .map_err(|_| DiffArtifactError::InvalidDiff)?,
+                    );
+                }
+                old_line = old_line
+                    .checked_add(1)
+                    .ok_or(DiffArtifactError::InvalidDiff)?;
+                new_line = new_line
+                    .checked_add(1)
+                    .ok_or(DiffArtifactError::InvalidDiff)?;
+            }
+            Some(b'\\') => {}
+            _ => return Err(DiffArtifactError::InvalidDiff),
+        }
+    }
+    Ok(positions)
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), DiffArtifactError> {
     let mut options = OpenOptions::new();
     options
@@ -463,7 +553,10 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), DiffArtifactError> {
     file.write_all(bytes).map_err(|_| DiffArtifactError::Io)?;
     file.sync_all().map_err(|_| DiffArtifactError::Io)?;
     let metadata = file.metadata().map_err(|_| DiffArtifactError::Io)?;
-    if !metadata.is_file() || metadata.nlink() != 1 || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
         return Err(DiffArtifactError::InvalidPermissions);
     }
     Ok(())
@@ -479,7 +572,7 @@ fn read_verified(artifact: &DiffArtifact) -> Result<String, DiffArtifactError> {
     if !metadata.is_file()
         || metadata.nlink() != 1
         || metadata.len() != artifact.size_bytes
-        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.permissions().mode() & 0o777 != 0o600
     {
         return Err(DiffArtifactError::ContentChanged);
     }
@@ -711,6 +804,9 @@ fn truncate_utf8(value: &str, maximum: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
 
     fn relative(value: &str) -> RepositoryRelativePath {
@@ -729,8 +825,29 @@ mod tests {
             let text = diff();
             let store = DiffArtifactStore::create([(&path, text.as_str())], 64).unwrap();
             root = store.directory_path().to_path_buf();
-            assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o077, 0);
+            let debug = format!("{store:?}");
+            assert!(!debug.contains(path.as_str()));
+            assert!(!debug.contains("github_pat_example"));
+            assert!(!debug.contains(&root.to_string_lossy().into_owned()));
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
             let manifest = store.manifest(std::slice::from_ref(&path)).unwrap();
+            let entries = fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[0].file_name().and_then(|name| name.to_str()),
+                Some(format!("{}.diff", manifest[0].sha256.as_str()).as_str())
+            );
+            assert_eq!(
+                fs::metadata(&entries[0]).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!entries[0].to_string_lossy().contains("src/lib.rs"));
             assert_eq!(manifest[0].hunks.len(), 2);
             assert!(manifest[0].hunks[1].hazardous);
             let page = store
@@ -767,5 +884,125 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn oversized_hunk_pages_issue_only_positions_present_on_each_page() {
+        let path = relative("src/lib.rs");
+        let text = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -7,2 +7,2 @@\n-old-one\n-old-two\n+new-one\n+new-two\n";
+        let store = DiffArtifactStore::create([(&path, text)], 24).expect("store");
+        let manifest = store
+            .manifest(std::slice::from_ref(&path))
+            .expect("manifest");
+        let hunk = &manifest[0].hunks[0];
+        assert!(hunk.pages > 1);
+
+        let mut observed = BTreeSet::new();
+        for page_number in 1..=hunk.pages {
+            let page = store
+                .read_hunk_page(&path, &hunk.hunk_id, page_number)
+                .expect("page");
+            assert!(observed.is_disjoint(&page.positions));
+            observed.extend(page.positions);
+        }
+        assert_eq!(
+            observed,
+            BTreeSet::from([
+                AnchorPosition::deletion(7).expect("position"),
+                AnchorPosition::deletion(8).expect("position"),
+                AnchorPosition::addition(7).expect("position"),
+                AnchorPosition::addition(8).expect("position"),
+            ])
+        );
+    }
+
+    #[test]
+    fn symlink_hardlink_and_content_tampering_fail_closed() {
+        let path = relative("src/private-name.rs");
+        let text = diff();
+
+        let store = DiffArtifactStore::create([(&path, text.as_str())], 64).unwrap();
+        let artifact = only_artifact_path(&store);
+        let alias = store.directory_path().join("alias.diff");
+        fs::hard_link(&artifact, &alias).unwrap();
+        assert_eq!(
+            read_first_page(&store, &path),
+            Err(DiffArtifactError::ContentChanged)
+        );
+        assert!(!format!("{:?}", read_first_page(&store, &path)).contains("private-name"));
+        drop(store);
+
+        let store = DiffArtifactStore::create([(&path, text.as_str())], 64).unwrap();
+        let artifact = only_artifact_path(&store);
+        fs::write(&artifact, "x".repeat(text.len())).unwrap();
+        assert_eq!(
+            read_first_page(&store, &path),
+            Err(DiffArtifactError::ContentChanged)
+        );
+        drop(store);
+
+        let store = DiffArtifactStore::create([(&path, text.as_str())], 64).unwrap();
+        let artifact = only_artifact_path(&store);
+        let target = store.directory_path().join("target");
+        fs::write(&target, text.as_bytes()).unwrap();
+        fs::remove_file(&artifact).unwrap();
+        symlink(&target, &artifact).unwrap();
+        assert_eq!(read_first_page(&store, &path), Err(DiffArtifactError::Io));
+        assert!(!DiffArtifactError::Io.to_string().contains(path.as_str()));
+        assert!(
+            !DiffArtifactError::Io
+                .to_string()
+                .contains("github_pat_example")
+        );
+    }
+
+    #[test]
+    fn midway_creation_failure_removes_private_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let valid_path = relative("src/valid.rs");
+        let invalid_path = relative("src/invalid.rs");
+        let text = diff();
+        let error = DiffArtifactStore::create_with_parent(
+            [
+                (&valid_path, text.as_str()),
+                (&invalid_path, "@@ invalid\n"),
+            ],
+            64,
+            Some(parent.path()),
+        )
+        .expect_err("second artifact fails after first write");
+        assert_eq!(error, DiffArtifactError::InvalidDiff);
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn panic_unwind_removes_private_directory() {
+        let path = relative("src/lib.rs");
+        let text = diff();
+        let store = DiffArtifactStore::create([(&path, text.as_str())], 64).unwrap();
+        let directory = store.directory_path().to_path_buf();
+        let unwind = catch_unwind(AssertUnwindSafe(move || {
+            let _owned_store = store;
+            panic!("test unwind");
+        }));
+        assert!(unwind.is_err());
+        assert!(!directory.exists());
+    }
+
+    fn only_artifact_path(store: &DiffArtifactStore) -> PathBuf {
+        let entries = fs::read_dir(store.directory_path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        entries.into_iter().next().unwrap()
+    }
+
+    fn read_first_page(
+        store: &DiffArtifactStore,
+        path: &RepositoryRelativePath,
+    ) -> Result<DiffHunkPage, DiffArtifactError> {
+        let manifest = store.manifest(std::slice::from_ref(path)).unwrap();
+        store.read_hunk_page(path, &manifest[0].hunks[0].hunk_id, 1)
     }
 }

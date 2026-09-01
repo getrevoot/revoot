@@ -11,7 +11,7 @@ use std::path::Path;
 
 use revoot_core::{
     ConfigSource, ConfigValue, ConfigurationResolution, Diagnostic, ErrorCode, GitSha,
-    ReviewBudgetLimits, ReviewEffort,
+    ReviewBudgetLimits, ReviewEffort, review_budget::conservative_model_cost_limit,
 };
 use serde::Serialize;
 
@@ -65,7 +65,8 @@ impl Default for ReviewStrategyConfiguration {
                 max_output_tokens,
                 max_tool_calls: u32::try_from(DEFAULT_TOOL_CALLS)
                     .expect("compiled tool limit fits u32"),
-                max_cost_microusd: ReviewBudgetLimits::default().max_cost_microusd,
+                max_cost_microusd: conservative_model_cost_limit(DEFAULT_MODEL_REQUESTS)
+                    .expect("compiled request ceiling has a representable cost reservation"),
                 max_elapsed_millis: DEFAULT_DEADLINE_SECONDS * 1_000,
             },
         }
@@ -257,6 +258,8 @@ fn build_aggregate_budget(
         .checked_mul(MAX_REQUEST_OUTPUT_TOKENS)
         .ok_or(ReviewStrategyConfigError::AggregateBudget)?
         .min(scalars.max_model_tokens);
+    let maximum_aggregate_cost = conservative_model_cost_limit(scalars.max_model_requests)
+        .ok_or(ReviewStrategyConfigError::AggregateBudget)?;
     let aggregate_budget = ReviewBudgetLimits {
         max_model_requests: u32::try_from(scalars.max_model_requests).map_err(|_| {
             ReviewStrategyConfigError::InvalidValue(ReviewStrategyField::ModelRequests)
@@ -265,7 +268,7 @@ fn build_aggregate_budget(
         max_output_tokens: maximum_aggregate_output,
         max_tool_calls: u32::try_from(scalars.max_tool_calls)
             .map_err(|_| ReviewStrategyConfigError::InvalidValue(ReviewStrategyField::ToolCalls))?,
-        max_cost_microusd: ReviewBudgetLimits::default().max_cost_microusd,
+        max_cost_microusd: maximum_aggregate_cost,
         max_elapsed_millis: scalars
             .deadline_seconds
             .checked_mul(1_000)
@@ -403,6 +406,7 @@ fn strategy_diagnostic(error: ReviewStrategyConfigError) -> Diagnostic {
 mod tests {
     use std::fs;
 
+    use revoot_core::review_budget::CONSERVATIVE_MODEL_CALL_COST_MICROUSD;
     use tempfile::TempDir;
 
     use super::*;
@@ -415,6 +419,10 @@ mod tests {
         assert_eq!(strategy.effort, ReviewEffort::Medium);
         assert_eq!(strategy.max_parallel_groups, 4);
         assert_eq!(strategy.aggregate_budget.max_model_requests, 64);
+        assert_eq!(
+            strategy.aggregate_budget.max_cost_microusd,
+            64 * CONSERVATIVE_MODEL_CALL_COST_MICROUSD
+        );
         assert_eq!(strategy.aggregate_budget.max_model_tokens, 300_000);
         assert_eq!(strategy.aggregate_budget.max_tool_calls, 256);
         assert_eq!(strategy.aggregate_budget.max_elapsed_millis, 600_000);
@@ -443,6 +451,10 @@ mod tests {
         assert_eq!(strategy.effort, ReviewEffort::High);
         assert_eq!(strategy.max_parallel_groups, 8);
         assert_eq!(strategy.aggregate_budget.max_model_requests, 256);
+        assert_eq!(
+            strategy.aggregate_budget.max_cost_microusd,
+            256 * CONSERVATIVE_MODEL_CALL_COST_MICROUSD
+        );
         assert_eq!(strategy.aggregate_budget.max_model_tokens, 2_000_000);
         assert_eq!(strategy.aggregate_budget.max_tool_calls, 2_048);
         assert_eq!(strategy.aggregate_budget.max_elapsed_millis, 1_000);
@@ -456,6 +468,10 @@ mod tests {
         );
         let strategy = resolve(root.path(), []).expect("strategy");
         assert_eq!(strategy.aggregate_budget.max_model_requests, 12);
+        assert_eq!(
+            strategy.aggregate_budget.max_cost_microusd,
+            12 * CONSERVATIVE_MODEL_CALL_COST_MICROUSD
+        );
         assert_eq!(strategy.aggregate_budget.max_model_tokens, 200_000);
         assert_eq!(strategy.aggregate_budget.max_tool_calls, 100);
         assert_eq!(strategy.aggregate_budget.max_elapsed_millis, 300_000);

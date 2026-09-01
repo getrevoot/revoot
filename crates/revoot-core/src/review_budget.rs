@@ -9,6 +9,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+/// Conservative monetary capacity reserved for one model request when direct
+/// provider adapters cannot report an authoritative monetary cost.
+pub const CONSERVATIVE_MODEL_CALL_COST_MICROUSD: u64 = 500_000;
+
+/// Derive aggregate conservative monetary capacity from a request ceiling.
+#[must_use]
+pub const fn conservative_model_cost_limit(max_model_requests: u64) -> Option<u64> {
+    max_model_requests.checked_mul(CONSERVATIVE_MODEL_CALL_COST_MICROUSD)
+}
+
 /// Review-wide limits shared by every review worker.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -25,12 +35,14 @@ pub struct ReviewBudgetLimits {
 
 impl Default for ReviewBudgetLimits {
     fn default() -> Self {
+        let max_model_requests = 64;
         Self {
-            max_model_requests: 64,
+            max_model_requests,
             max_model_tokens: 300_000,
             max_output_tokens: 64 * 4_096,
             max_tool_calls: 256,
-            max_cost_microusd: 5_000_000,
+            max_cost_microusd: conservative_model_cost_limit(u64::from(max_model_requests))
+                .expect("compiled request ceiling has a representable cost reservation"),
             max_elapsed_millis: 10 * 60 * 1_000,
         }
     }
@@ -704,6 +716,55 @@ mod tests {
     fn broker_and_permit_are_send_sync() {
         assert_send_sync::<ReviewBudgetBroker>();
         assert_send_sync::<ReviewModelPermit>();
+    }
+
+    #[test]
+    fn default_cost_capacity_admits_every_default_request_reservation() {
+        let defaults = ReviewBudgetLimits::default();
+        assert_eq!(
+            defaults.max_cost_microusd,
+            u64::from(defaults.max_model_requests) * CONSERVATIVE_MODEL_CALL_COST_MICROUSD
+        );
+        let broker = ReviewBudgetBroker::new(defaults, 0).expect("default broker");
+        for now in 0..defaults.max_model_requests {
+            broker
+                .reserve_model_request(
+                    ReviewModelReservation {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cost_microusd: CONSERVATIVE_MODEL_CALL_COST_MICROUSD,
+                    },
+                    u64::from(now),
+                )
+                .expect("request capacity must not be shortened by cost capacity")
+                .commit(
+                    Some(ReviewModelUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cost_microusd: CONSERVATIVE_MODEL_CALL_COST_MICROUSD,
+                    }),
+                    u64::from(now),
+                )
+                .expect("reported use is within its reservation");
+        }
+        assert!(matches!(
+            broker.reserve_model_request(
+                ReviewModelReservation {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_microusd: CONSERVATIVE_MODEL_CALL_COST_MICROUSD,
+                },
+                u64::from(defaults.max_model_requests)
+            ),
+            Err(ReviewBudgetError::Exhausted(
+                ReviewBudgetDimension::ModelRequests
+            ))
+        ));
+        assert_eq!(
+            conservative_model_cost_limit(u64::MAX),
+            None,
+            "derivation must fail rather than saturate"
+        );
     }
 
     #[test]

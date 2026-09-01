@@ -675,7 +675,8 @@ mod tests {
                 max_repository_bytes: 32 * 1024 * 1024,
                 max_input_tokens: 295_904,
                 max_output_tokens: 4_096,
-                max_cost_microusd: 5_000_000,
+                max_cost_microusd: crate::review_budget::conservative_model_cost_limit(64)
+                    .expect("fixture request ceiling has a representable cost reservation"),
                 max_candidate_findings: 25,
                 max_elapsed_millis: 600_000,
             },

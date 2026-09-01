@@ -17,7 +17,9 @@ use revoot_core::{
 use crate::group_scheduler::{
     GroupFailureReason, GroupPartialReason, GroupScheduleSnapshot, GroupScheduleStatus,
 };
-use crate::review_engine::{PriorFindingDisposition, PriorFindingDispositionKind, ReviewCoverage};
+use crate::review_contracts::{
+    PriorFindingDisposition, PriorFindingDispositionKind, ReviewCoverage,
+};
 use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
 
 const MAX_PUBLISHED_FINDINGS: usize = 25;

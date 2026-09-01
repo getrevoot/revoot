@@ -7,24 +7,29 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use revoot::config::RepositoryReviewPolicy;
 use revoot::egress_setup::authorize_standard_provider;
+use revoot::group_worker_engine::GroupWorkerClock;
 use revoot::providers::ApiKey;
 use revoot::providers::anthropic::{AnthropicAdapter, AnthropicConfig};
 use revoot::providers::openai::{OpenAiAdapter, OpenAiConfig};
-use revoot::review_engine::{
-    IndependentReviewBrief, MonotonicClock, ReviewAnchor, ReviewEngineLimits, ReviewEngineRequest,
-    run_review,
+use revoot::review_adjudicator::ReviewAdjudicatorClock;
+use revoot::review_grouper::ReviewGrouperClock;
+use revoot::review_verifier::ReviewVerifierClock;
+use revoot::reviewer_policy::{REVIEWER_POLICY_VERSION, tool_first_reviewer_system_policy};
+use revoot::tool_first_engine::{
+    ToolFirstEngineLimits, ToolFirstEngineRequest, run_tool_first_engine,
 };
 use revoot_core::{
-    AgentBudgetLimits, AgentBudgetUsage, AgentTool, AnchorPosition, AnchorTable, CancellationToken,
-    ChangedPath, DiffRefs, DiffVersionId, DiffVersionRecord, EvaluationCase, EvaluationThresholds,
-    ExpectedDefect, FileChangeKind, Finding, FindingCategory, GitLabDiffVersionIdentity, GitSha,
-    MergeRequestIid, PartitionLimits, ProjectId, ProviderAdapter, RepositoryDiff, RepositoryPath,
-    RepositoryRelativePath, RepositoryToolLimits, RepositoryToolbox, ReviewFileClass,
-    ReviewFileInput, ReviewInvocation, ReviewObject, ReviewObjectRole, ReviewOutcome,
-    ReviewSelectionPolicy, ReviewValue, ReviewValueReason, ReviewValueTier, Sha256Digest,
-    SnapshotScope, UnifiedDiffLimits, build_partition_plan, evaluate_corpus,
-    parse_gitlab_file_diff,
+    AgentBudgetUsage, AnchorPosition, AnchorTable, CancellationToken, ChangedPath, DiffRefs,
+    DiffVersionId, DiffVersionRecord, EvaluationCase, EvaluationThresholds, ExpectedDefect,
+    FileChangeKind, Finding, FindingCategory, GitLabDiffVersionIdentity, GitSha, MergeRequestIid,
+    PartitionLimits, ProjectId, ProviderAdapter, RepositoryDiff, RepositoryPath,
+    RepositoryRelativePath, RepositoryToolLimits, RepositoryToolbox, ReviewBudgetBroker,
+    ReviewBudgetLimits, ReviewEffort, ReviewFileClass, ReviewFileInput, ReviewObject,
+    ReviewObjectRole, ReviewOutcome, ReviewSelectionPolicy, ReviewValue, ReviewValueReason,
+    ReviewValueTier, Sha256Digest, SnapshotScope, UnifiedDiffLimits, build_partition_plan,
+    evaluate_corpus, parse_gitlab_file_diff,
 };
 use serde::{Deserialize, Serialize};
 
@@ -95,7 +100,25 @@ impl Drop for MaterializedCheckout {
 
 struct CaseClock(Instant);
 
-impl MonotonicClock for CaseClock {
+impl ReviewGrouperClock for CaseClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl GroupWorkerClock for CaseClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl ReviewVerifierClock for CaseClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl ReviewAdjudicatorClock for CaseClock {
     fn now_millis(&self) -> u64 {
         u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -156,24 +179,18 @@ fn expected_position(defect: &ExpectedScenarioDefect) -> AnchorPosition {
     }
 }
 
-fn tools() -> BTreeSet<AgentTool> {
-    BTreeSet::from([
-        AgentTool::ListFiles,
-        AgentTool::ReadFile,
-        AgentTool::Search,
-        AgentTool::ShowDiff,
-        AgentTool::SubmitCandidateFinding,
-        AgentTool::SubmitReviewSummary,
-    ])
-}
-
 #[allow(clippy::too_many_lines)]
 fn prepare_case(
     scenario: &EvaluationScenario,
-    adapter: &dyn ProviderAdapter,
+    adapter: &std::sync::Arc<dyn ProviderAdapter>,
     model: &str,
     cancellation: &CancellationToken,
-) -> (MaterializedCheckout, ReviewEngineRequest, EvaluationCase) {
+) -> (
+    MaterializedCheckout,
+    ToolFirstEngineRequest<CaseClock>,
+    std::sync::Arc<CaseClock>,
+    EvaluationCase,
+) {
     assert_eq!(scenario.schema_version, "revoot.evaluation-scenario/v1");
     let changed_path = ChangedPath {
         old_path: RepositoryPath::try_from(scenario.old_path.clone()).unwrap(),
@@ -215,94 +232,63 @@ fn prepare_case(
         cancellation,
     )
     .expect("full scenario checkout inventory");
-    let anchor_catalog = anchors
-        .iter()
-        .map(|anchor| {
-            format!(
-                "{} => {} {:?}",
-                anchor.id.as_str(),
-                anchor.path.new_path.as_str(),
-                anchor.position
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let prompt = format!(
-        "Review work unit evaluation for changed path {}. Start with show_diff, then inspect the full checkout as needed. Use only these exact anchors for candidate findings:\n{}",
-        scenario.new_path, anchor_catalog
-    );
-    let request = ReviewEngineRequest {
-        invocation: ReviewInvocation {
-            review_id: format!("live-evaluation-{}", scenario.case_id.replace('/', "-")),
-            snapshot: snapshot.clone().into(),
-            work_unit_ids: BTreeSet::from(["evaluation".to_owned()]),
-            provider_adapter: adapter.adapter_id().to_owned(),
-            model_id: model.to_owned(),
-            allowed_tools: tools(),
-            limits: AgentBudgetLimits::default(),
+    let partition = build_partition_plan(
+        snapshot,
+        &ReviewSelectionPolicy {
+            version: "selection-v1".to_owned(),
+            included_paths: BTreeSet::new(),
+            included_prefixes: Vec::new(),
+            included_suffixes: Vec::new(),
+            excluded_paths: BTreeSet::new(),
+            excluded_prefixes: Vec::new(),
+            excluded_suffixes: Vec::new(),
+            excluded_basename_prefixes: Vec::new(),
+            include_generated: false,
+            max_file_bytes: 2 * 1024 * 1024,
         },
-        partition: build_partition_plan(
-            snapshot,
-            &ReviewSelectionPolicy {
-                version: "selection-v1".to_owned(),
-                included_paths: BTreeSet::new(),
-                included_prefixes: Vec::new(),
-                included_suffixes: Vec::new(),
-                excluded_paths: BTreeSet::new(),
-                excluded_prefixes: Vec::new(),
-                excluded_suffixes: Vec::new(),
-                excluded_basename_prefixes: Vec::new(),
-                include_generated: false,
-                max_file_bytes: 2 * 1024 * 1024,
+        PartitionLimits {
+            max_files: 10,
+            max_total_bytes: 2 * 1024 * 1024,
+            max_work_units: 10,
+            max_files_per_work_unit: 10,
+            max_bytes_per_work_unit: 2 * 1024 * 1024,
+            max_anchors_per_work_unit: 10_000,
+        },
+        [ReviewFileInput {
+            path: changed_path,
+            class: ReviewFileClass::Text,
+            review_value: ReviewValue {
+                tier: ReviewValueTier::Standard,
+                score: 100,
+                reasons: BTreeSet::from([ReviewValueReason::SourceCode]),
             },
-            PartitionLimits {
-                max_files: 10,
-                max_total_bytes: 2 * 1024 * 1024,
-                max_work_units: 10,
-                max_files_per_work_unit: 10,
-                max_bytes_per_work_unit: 2 * 1024 * 1024,
-                max_anchors_per_work_unit: 10_000,
-            },
-            [ReviewFileInput {
-                path: changed_path,
-                class: ReviewFileClass::Text,
-                review_value: ReviewValue {
-                    tier: ReviewValueTier::Standard,
-                    score: 100,
-                    reasons: BTreeSet::from([ReviewValueReason::SourceCode]),
-                },
-                objects: vec![ReviewObject {
-                    role: ReviewObjectRole::ExactDiff,
-                    content_sha256: Sha256Digest::of_bytes(scenario.exact_diff.as_bytes()),
-                    size_bytes: u64::try_from(scenario.exact_diff.len()).unwrap_or(u64::MAX),
-                }],
-                anchor_ids: anchors.iter().map(|anchor| anchor.id.clone()).collect(),
+            objects: vec![ReviewObject {
+                role: ReviewObjectRole::ExactDiff,
+                content_sha256: Sha256Digest::of_bytes(scenario.exact_diff.as_bytes()),
+                size_bytes: u64::try_from(scenario.exact_diff.len()).unwrap_or(u64::MAX),
             }],
-        )
-        .expect("valid evaluation partition"),
-        toolbox,
+            anchor_ids: anchors.iter().map(|anchor| anchor.id.clone()).collect(),
+        }],
+    )
+    .expect("valid evaluation partition");
+    let clock = std::sync::Arc::new(CaseClock(Instant::now()));
+    let mut limits = ToolFirstEngineLimits::new(model);
+    limits.effort = ReviewEffort::Medium;
+    let request = ToolFirstEngineRequest {
+        provider: std::sync::Arc::clone(adapter),
+        toolbox: std::sync::Arc::new(toolbox),
         history: None,
         prior_review: revoot_core::PriorReviewContext::default(),
-        anchors: anchors
-            .iter()
-            .map(|anchor| {
-                (
-                    anchor.id.as_str().to_owned(),
-                    ReviewAnchor {
-                        path: RepositoryRelativePath::try_from(
-                            anchor.path.new_path.as_str().to_owned(),
-                        )
-                        .expect("anchor checkout path"),
-                        position: anchor.position,
-                    },
-                )
-            })
-            .collect(),
-        review_brief: IndependentReviewBrief::try_new(prompt)
-            .expect("valid independent evaluation brief"),
-        repository_guidance: None,
+        anchor_table: anchors,
+        partition,
+        rule_policy: RepositoryReviewPolicy::default(),
+        budget: ReviewBudgetBroker::new(ReviewBudgetLimits::default(), 0).expect("review budget"),
+        cancellation: cancellation.clone(),
+        clock: std::sync::Arc::clone(&clock),
+        limits,
+        system_policy_id: format!("{REVIEWER_POLICY_VERSION}.tool-first"),
+        system_policy: tool_first_reviewer_system_policy(),
         initial_omissions: Vec::new(),
-        limits: ReviewEngineLimits::default(),
     };
     let case = EvaluationCase {
         schema_version: EvaluationCase::SCHEMA_VERSION.to_owned(),
@@ -310,7 +296,7 @@ fn prepare_case(
         clean_change: scenario.clean_change,
         expected_defects,
     };
-    (checkout, request, case)
+    (checkout, request, clock, case)
 }
 
 fn outcome_parts(outcome: ReviewOutcome) -> (&'static str, Vec<Finding>, AgentBudgetUsage) {
@@ -353,7 +339,7 @@ fn required_model(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is required for live quality evaluation"))
 }
 
-fn adapter() -> (Box<dyn ProviderAdapter>, String, String) {
+fn adapter() -> (std::sync::Arc<dyn ProviderAdapter>, String, String) {
     match std::env::var("REVOOT_LIVE_EVALUATION_PROVIDER").as_deref() {
         Ok("anthropic") => {
             let model = required_model("REVOOT_LIVE_ANTHROPIC_MODEL");
@@ -366,7 +352,7 @@ fn adapter() -> (Box<dyn ProviderAdapter>, String, String) {
                 &authorization,
             )
             .expect("Anthropic adapter");
-            (Box::new(adapter), "anthropic".to_owned(), model)
+            (std::sync::Arc::new(adapter), "anthropic".to_owned(), model)
         }
         Ok("openai") => {
             let model = required_model("REVOOT_LIVE_OPENAI_MODEL");
@@ -379,7 +365,7 @@ fn adapter() -> (Box<dyn ProviderAdapter>, String, String) {
                 &authorization,
             )
             .expect("OpenAI adapter");
-            (Box::new(adapter), "openai".to_owned(), model)
+            (std::sync::Arc::new(adapter), "openai".to_owned(), model)
         }
         _ => panic!("REVOOT_LIVE_EVALUATION_PROVIDER must be anthropic or openai"),
     }
@@ -393,14 +379,13 @@ async fn live_full_checkout_quality() {
     let mut observations = Vec::new();
     for scenario in scenarios {
         let cancellation = CancellationToken::default();
-        let (_checkout, request, evaluation) =
-            prepare_case(&scenario, adapter.as_ref(), &model, &cancellation);
-        let clock = CaseClock(Instant::now());
-        let report = run_review(adapter.as_ref(), request, cancellation, &clock)
+        let (_checkout, request, clock, evaluation) =
+            prepare_case(&scenario, &adapter, &model, &cancellation);
+        let report = run_tool_first_engine(request)
             .await
             .unwrap_or_else(|error| panic!("{} review failed: {error}", scenario.case_id));
-        let elapsed_millis = clock.now_millis();
-        let (outcome, findings, _usage) = outcome_parts(report.outcome);
+        let elapsed_millis = ReviewGrouperClock::now_millis(clock.as_ref());
+        let (outcome, findings, _usage) = outcome_parts(report.result.outcome);
         let score = evaluation.score(&findings).expect("valid quality score");
         observations.push((evaluation, findings));
         assert!(

@@ -312,6 +312,7 @@ fn worker_request(
         initial_packet: packet.initial_packet,
         work_unit_ids_by_path: packet.work_unit_ids_by_path,
         assigned_paths: packet.assigned_paths,
+        assigned_file_paths: packet.assigned_file_paths,
         issued_anchors: packet.issued_anchors,
         anchor_table: packet.anchor_table,
         coverage_gate: packet.coverage_gate,

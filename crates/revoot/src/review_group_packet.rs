@@ -8,7 +8,7 @@ use revoot_core::review_packet::{
     ReviewPacketPolicy, ReviewPacketPurpose, ReviewPacketTokenEstimates,
 };
 use revoot_core::{
-    AnchorId, AnchorPosition, AnchorTable, CoverageCompletionGate, RepositoryPath,
+    AnchorId, AnchorPosition, AnchorTable, ChangedPath, CoverageCompletionGate, RepositoryPath,
     RepositoryRelativePath, ReviewEffort, ReviewGroupMetrics, ReviewSnapshotIdentity,
     ReviewWorkerCheckpoint, ReviewWorkerPlan, Sha256Digest, WorkUnitId,
 };
@@ -45,6 +45,8 @@ pub struct PreparedReviewGroupPacket {
     pub anchor_table: AnchorTable,
     pub coverage_gate: CoverageCompletionGate,
     pub assigned_paths: BTreeSet<RepositoryRelativePath>,
+    /// Exact trusted old/new path pairs for every assigned file.
+    pub assigned_file_paths: BTreeSet<ChangedPath>,
     pub issued_anchors: BTreeSet<AnchorId>,
     pub work_unit_ids_by_path: BTreeMap<RepositoryPath, WorkUnitId>,
 }
@@ -95,6 +97,7 @@ pub fn prepare_review_group_packet(
     validate_bindings(group_input, &anchor_table, bindings)?;
     let indexed_files = validate_group_files(group_input, artifacts)?;
     let assigned_paths = assigned_paths(group_input)?;
+    let assigned_file_paths = assigned_file_paths(group_input)?;
     let work_unit_ids_by_path = work_unit_bindings(group_input)?;
     let issued_anchors = validate_anchors(group_input, &anchor_table, &work_unit_ids_by_path)?;
     let metrics = worker_metrics(group_input)?;
@@ -135,6 +138,7 @@ pub fn prepare_review_group_packet(
         anchor_table,
         coverage_gate,
         assigned_paths,
+        assigned_file_paths,
         issued_anchors,
         work_unit_ids_by_path,
     })
@@ -292,6 +296,23 @@ fn assigned_paths(
                 .map_err(|_| ReviewGroupPacketError::PathBinding)
         })
         .collect()
+}
+
+fn assigned_file_paths(
+    input: &TrustedReviewGroupInput,
+) -> Result<BTreeSet<ChangedPath>, ReviewGroupPacketError> {
+    let paths = input
+        .group
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    if paths.len() != input.group.files.len()
+        || paths.iter().any(|path| path.semantic_issue().is_some())
+    {
+        return Err(ReviewGroupPacketError::PathBinding);
+    }
+    Ok(paths)
 }
 
 fn work_unit_bindings(
@@ -635,6 +656,7 @@ mod tests {
         )
         .expect("prepared packet");
         assert_eq!(prepared.assigned_paths.len(), 2);
+        assert_eq!(prepared.assigned_file_paths.len(), 2);
         assert_eq!(prepared.issued_anchors.len(), 2);
         assert_eq!(prepared.work_unit_ids_by_path.len(), 2);
         assert_eq!(
@@ -694,6 +716,38 @@ mod tests {
                 .rule_ids
                 .contains(&"rust.md".to_owned())
         );
+    }
+
+    #[test]
+    fn metadata_only_rename_preserves_exact_old_and_new_authority() {
+        let fixture = metadata_only_rename_fixture("src/legacy.rs", "src/current.rs");
+        let expected_path = fixture.path.clone();
+        let setup = setup(&[fixture], 1);
+        assert_eq!(setup.group_input.group.anchor_count, 0);
+        assert!(setup.group_input.files[0].manifest.metadata_only);
+        let prepared = prepare_review_group_packet(
+            &setup.group_input,
+            &setup.store,
+            setup.anchor_table,
+            &setup.bindings,
+            ReviewEffort::Low,
+        )
+        .expect("metadata-only rename packet");
+        assert!(prepared.issued_anchors.is_empty());
+        assert_eq!(
+            prepared.assigned_file_paths,
+            BTreeSet::from([expected_path.clone()])
+        );
+        let old_binding = prepared
+            .work_unit_ids_by_path
+            .get(&expected_path.old_path)
+            .expect("old-path binding");
+        let new_binding = prepared
+            .work_unit_ids_by_path
+            .get(&expected_path.new_path)
+            .expect("new-path binding");
+        assert_eq!(old_binding, new_binding);
+        assert_eq!(prepared.work_unit_ids_by_path.len(), 2);
     }
 
     #[test]
@@ -889,6 +943,23 @@ mod tests {
         fixture(path, &format!("+{}\n", "x".repeat(17_000)))
     }
 
+    fn metadata_only_rename_fixture(old_path: &str, new_path: &str) -> Fixture {
+        let old_path = RepositoryPath::try_from(old_path.to_owned()).expect("old path");
+        let new_path = RepositoryPath::try_from(new_path.to_owned()).expect("new path");
+        Fixture {
+            diff: format!(
+                "diff --git a/{old} b/{new}\nsimilarity index 100%\nrename from {old}\nrename to {new}\n",
+                old = old_path.as_str(),
+                new = new_path.as_str()
+            ),
+            path: ChangedPath {
+                old_path,
+                new_path,
+                kind: FileChangeKind::Renamed,
+            },
+        }
+    }
+
     fn fixture(path: &str, added: &str) -> Fixture {
         let repository_path = RepositoryPath::try_from(path.to_owned()).expect("path");
         let changed = ChangedPath {
@@ -909,14 +980,17 @@ mod tests {
         let snapshot = snapshot(b's');
         let anchor_table = AnchorTable::build(
             snapshot.clone(),
-            fixtures.iter().map(|fixture| CommentableLine {
-                path: fixture.path.clone(),
-                position: AnchorPosition::addition(1).expect("position"),
-                exact_line_digest: Sha256Digest::of_bytes(
-                    fixture.path.new_path.as_str().as_bytes(),
-                ),
-                context_digest: Sha256Digest::of_bytes(fixture.diff.as_bytes()),
-            }),
+            fixtures
+                .iter()
+                .filter(|fixture| fixture.diff.contains("@@"))
+                .map(|fixture| CommentableLine {
+                    path: fixture.path.clone(),
+                    position: AnchorPosition::addition(1).expect("position"),
+                    exact_line_digest: Sha256Digest::of_bytes(
+                        fixture.path.new_path.as_str().as_bytes(),
+                    ),
+                    context_digest: Sha256Digest::of_bytes(fixture.diff.as_bytes()),
+                }),
         )
         .expect("anchors");
         let partition = partition(

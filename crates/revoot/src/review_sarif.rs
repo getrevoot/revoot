@@ -5,9 +5,63 @@
 //! by the core SARIF renderer from the immutable anchor table.
 
 use revoot_core::{
-    AnchorTable, RankedFinding, ReviewReportCoverage, ReviewReportState, SarifCoverageMetadata,
-    SarifError, SarifLog, SarifRunMetadata, render_sarif,
+    AnchorTable, RankedFinding, ReviewReportCoverage, ReviewReportError, ReviewReportState,
+    ReviewReportV3, SarifCoverageMetadata, SarifError, SarifLog, SarifRunMetadata, render_sarif,
 };
+
+/// Fail-closed error for canonical report or SARIF validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewSarifError {
+    Report(ReviewReportError),
+    Sarif(SarifError),
+}
+
+impl std::fmt::Display for ReviewSarifError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Report(_) => "canonical review report is not bound to the trusted anchors",
+            Self::Sarif(_) => "review SARIF rendering failed",
+        })
+    }
+}
+
+impl std::error::Error for ReviewSarifError {}
+
+/// Render a canonical version-3 report through its trusted anchor table.
+///
+/// The report is replay-validated against `anchors` before any SARIF result is
+/// emitted. Report coordinates are never used as an independent or fallback
+/// location source.
+///
+/// # Errors
+///
+/// Fails closed for an invalid report, snapshot mismatch, unknown anchor,
+/// coordinate mismatch, line zero, or invalid SARIF coverage/content.
+pub fn render_report_v3_sarif(
+    report: &ReviewReportV3,
+    anchors: &AnchorTable,
+) -> Result<SarifLog, ReviewSarifError> {
+    report
+        .validate_against_anchors(anchors)
+        .map_err(ReviewSarifError::Report)?;
+    let findings = report
+        .findings
+        .iter()
+        .map(|finding| RankedFinding {
+            work_unit_id: finding.work_unit_id.clone(),
+            anchor_id: finding.anchor_id.clone(),
+            severity: finding.severity,
+            confidence_percent: finding.confidence_percent,
+            category: finding.category,
+            finding_key: finding.finding_key.clone(),
+            content_digest: finding.content_sha256.clone(),
+            lineage_id: finding.lineage_id.clone(),
+            rendered_body: finding.rendered_body.clone(),
+        })
+        .collect::<Vec<_>>();
+    render_review_sarif(&findings, anchors, report.state, &report.coverage)
+        .map_err(ReviewSarifError::Sarif)
+}
 
 /// Render ranked review findings as deterministic SARIF 2.1.0.
 ///
@@ -67,12 +121,19 @@ pub fn render_review_sarif(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use serde_json::json;
 
     use super::*;
     use revoot_core::{
-        AnchorPosition, ChangedPath, CommentableLine, FileChangeKind, FindingCategory, GitSha,
-        LocalSnapshotIdentity, RepositoryPath, ReviewSnapshotIdentity, Severity, Sha256Digest,
+        AnchorPosition, ChangedPath, CommentableLine, FileChangeKind, Finding, FindingCategory,
+        FindingsEnvelope, GitSha, LocalSnapshotIdentity, RepositoryPath, ReviewEffort,
+        ReviewGroupingSource, ReviewReportFinding, ReviewReportFindingCoordinate,
+        ReviewReportFindingSide, ReviewReportOverview, ReviewReportPhase, ReviewReportPhaseUsage,
+        ReviewReportPublication, ReviewReportSelection, ReviewReportStrategy, ReviewReportUsage,
+        ReviewReportUsageTotals, ReviewSnapshotIdentity, Severity, Sha256Digest,
+        validate_rank_and_render,
     };
 
     fn digest(marker: char) -> Sha256Digest {
@@ -159,7 +220,115 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn report(anchors: &AnchorTable) -> ReviewReportV3 {
+        let anchor = anchors
+            .iter()
+            .find(|anchor| matches!(anchor.position, AnchorPosition::Addition { .. }))
+            .expect("addition anchor");
+        let source = Finding {
+            anchor_id: anchor.id.as_str().to_owned(),
+            severity: Severity::High,
+            confidence_percent: 95,
+            category: FindingCategory::Security,
+            title: "Validation can be bypassed".to_owned(),
+            explanation: "The changed operation runs before the required validation.".to_owned(),
+            evidence: "The issued addition anchor identifies the unguarded operation.".to_owned(),
+            lineage_id: None,
+            suggested_replacement: None,
+        };
+        let envelope = FindingsEnvelope {
+            schema_version: FindingsEnvelope::SCHEMA_VERSION.to_owned(),
+            work_unit_id: "wu2_fixture".to_owned(),
+            findings: vec![source.clone()],
+            summary: "One exact-anchor finding.".to_owned(),
+        };
+        let issued = BTreeMap::from([(
+            "wu2_fixture".to_owned(),
+            BTreeSet::from([anchor.id.clone()]),
+        )]);
+        let ranked = validate_rank_and_render([envelope], &issued, anchors, 25)
+            .expect("ranked finding")
+            .findings
+            .remove(0);
+        let overview_text = "Review completed with one verified finding.".to_owned();
+        let phases = [
+            ReviewReportPhase::Grouping,
+            ReviewReportPhase::Planning,
+            ReviewReportPhase::Review,
+            ReviewReportPhase::Verification,
+            ReviewReportPhase::Adjudication,
+        ]
+        .into_iter()
+        .map(|phase| ReviewReportPhaseUsage {
+            phase,
+            model_requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            tool_calls: 0,
+            cost_microusd: 0,
+        })
+        .collect();
+        let snapshot_identity = serde_json::to_vec(anchors.identity()).expect("snapshot identity");
+        ReviewReportV3::new(
+            ReviewReportState::Complete,
+            Sha256Digest::of_bytes(&snapshot_identity),
+            digest('f'),
+            vec![ReviewReportFinding {
+                work_unit_id: ranked.work_unit_id,
+                anchor_id: ranked.anchor_id,
+                coordinate: ReviewReportFindingCoordinate {
+                    path: anchor.path.new_path.clone(),
+                    side: ReviewReportFindingSide::New,
+                    line: 7,
+                },
+                finding_key: ranked.finding_key,
+                content_sha256: ranked.content_digest,
+                severity: source.severity,
+                confidence_percent: source.confidence_percent,
+                category: source.category,
+                title: source.title,
+                explanation: source.explanation,
+                evidence: source.evidence,
+                suggested_replacement: source.suggested_replacement,
+                rendered_body: ranked.rendered_body,
+                lineage_id: source.lineage_id,
+            }],
+            ReviewReportOverview {
+                content_sha256: Sha256Digest::of_bytes(overview_text.as_bytes()),
+                text: overview_text,
+            },
+            Vec::new(),
+            ReviewReportPublication {
+                planned_findings: 1,
+                published_findings: 1,
+                suppressed_findings: 0,
+                publication_complete: true,
+            },
+            ReviewReportSelection {
+                changed_files: 3,
+                selected_files: 3,
+                omitted_files: 0,
+                selected_diff_bytes: 128,
+                omission_reasons: BTreeMap::new(),
+            },
+            ReviewReportStrategy {
+                effort: ReviewEffort::Medium,
+                grouping_source: ReviewGroupingSource::Deterministic,
+                group_count: 1,
+                max_parallel_groups: 4,
+            },
+            coverage(),
+            ReviewReportUsage {
+                phases,
+                totals: ReviewReportUsageTotals::default(),
+            },
+        )
+        .expect("report")
+    }
+
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn golden_review_sarif_preserves_exact_sides_and_uri_safe_paths() {
         let anchors = anchors();
         let deletion = anchors
@@ -269,6 +438,34 @@ mod tests {
                 "failedGroups": 0,
                 "policyVersion": "revoot.risk-adaptive-coverage/v1"
             })
+        );
+    }
+
+    #[test]
+    fn report_v3_sarif_requires_the_matching_trusted_anchor_table() {
+        let anchors = anchors();
+        let report = report(&anchors);
+        let log = render_report_v3_sarif(&report, &anchors).expect("exact-anchor SARIF");
+        let value = serde_json::to_value(log).expect("SARIF JSON");
+        assert_eq!(
+            value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"],
+            "src/new%20%23name.rs"
+        );
+        assert_eq!(
+            value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startLine"],
+            7
+        );
+        assert!(!value.to_string().contains("unknown:1"));
+
+        let empty = AnchorTable::build(
+            anchors.identity().clone(),
+            std::iter::empty::<CommentableLine>(),
+        )
+        .expect("empty anchor table");
+        assert_eq!(
+            render_report_v3_sarif(&report, &empty),
+            Err(ReviewSarifError::Report(ReviewReportError::AnchorBinding))
         );
     }
 

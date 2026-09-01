@@ -19,7 +19,9 @@ use revoot_core::{
     PublicationTarget, PullRequestNumber, RankedFinding, RepositoryPath, RepositoryToolLimits,
     ReviewBudgetBroker, ReviewGroupingSource, ReviewOmissionReason, ReviewOutcome,
     ReviewPartitionPlan, ReviewPreview, ReviewPreviewGroupInput, ReviewPreviewRule,
-    ReviewPreviewRuleSource, ReviewPreviewStrategy, ReviewReportPublication, ReviewReportSelection,
+    ReviewPreviewRuleSource, ReviewPreviewStrategy, ReviewReportCoverage, ReviewReportOverview,
+    ReviewReportPhase, ReviewReportPhaseUsage, ReviewReportPublication, ReviewReportSelection,
+    ReviewReportState, ReviewReportStrategy, ReviewReportUsage, ReviewReportUsageTotals,
     ReviewReportV3, ReviewSelectionPolicy, ReviewSnapshotIdentity, ReviewValueTier, Severity,
     Sha256Digest, SnapshotReadiness, UnifiedDiffLimits, build_review_group_plan,
     build_review_preview, classify_gitlab_ci_environment, parse_project_response,
@@ -27,7 +29,6 @@ use revoot_core::{
 };
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::config::{
@@ -81,16 +82,17 @@ use crate::review_adjudicator::ReviewAdjudicatorClock;
 use crate::review_checkpoint::{
     ReviewAttention, ReviewCheckpoint, extract_checkpoint, plan_attention,
 };
-use crate::review_engine::{
-    MonotonicClock, PriorFindingDisposition, PriorFindingDispositionKind, REVIEWER_POLICY_VERSION,
-    ReviewCoverage, ReviewStrategy, reviewer_system_policy,
+use crate::review_contracts::{
+    PriorFindingDisposition, PriorFindingDispositionKind, ReviewCoverage, ReviewStrategy,
 };
 use crate::review_grouper::ReviewGrouperClock;
 use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
 };
+use crate::review_sarif::render_report_v3_sarif;
 use crate::review_strategy_config::{ReviewStrategyConfiguration, strategy_from_resolved};
 use crate::review_verifier::ReviewVerifierClock;
+use crate::reviewer_policy::{REVIEWER_POLICY_VERSION, tool_first_reviewer_system_policy};
 use crate::rule_diagnostics::{
     RepositoryRuleMetadata, RuleDiagnosticPolicy, RulePrecedenceSource, diagnose_rules,
 };
@@ -99,11 +101,10 @@ use crate::tool_first_engine::{
 };
 use crate::tool_first_report::{ToolFirstReportInput, build_tool_first_report};
 
-const REPORT_SCHEMA_VERSION: &str = "revoot.review-report/v3";
+const TERMINAL_REPORT_SCHEMA_VERSION: &str = "revoot.review-terminal/v1";
 const MAX_CODE_HOST_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const DEFERRED_PROVIDER: &str = "deferred";
 const DEFERRED_MODEL: &str = "deferred";
-const TOOL_FIRST_POLICY_ADAPTER: &str = "For this runtime, complete_group is the required final summary and coverage gate; the policy's submit_review_summary instruction refers to complete_group. Use the exact tool names exposed in the current request. A rejected complete_group call means required coverage remains and must not be bypassed.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum OutputFormat {
@@ -148,6 +149,8 @@ enum ReviewCommandResult {
 struct CanonicalReviewReport {
     #[serde(skip)]
     stable_report: Option<ReviewReportV3>,
+    #[serde(skip)]
+    sarif_anchors: Option<AnchorTable>,
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     overview: Option<ReviewOverview>,
@@ -631,12 +634,6 @@ impl ProcessClock {
     }
 }
 
-impl MonotonicClock for ProcessClock {
-    fn now_millis(&self) -> u64 {
-        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-}
-
 impl ReviewGrouperClock for ProcessClock {
     fn now_millis(&self) -> u64 {
         u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -943,6 +940,7 @@ async fn run_async(
         report.publication =
             publish_with_checkpoint(&prepared, &report, &provider, &model, job_url.as_deref(), 0)
                 .await;
+        attach_no_model_stable_report(&mut report, &prepared, &strategy)?;
         return Ok(ReviewCommandResult::Review {
             provider,
             model,
@@ -980,13 +978,6 @@ async fn run_local_review(
         None,
         environment.iter().cloned(),
     )?;
-    if capture.is_empty() && !preview {
-        return Ok(ReviewCommandResult::Review {
-            provider: "not_used".to_owned(),
-            model: "not_used".to_owned(),
-            report: Box::new(no_changes_report()),
-        });
-    }
     let resolution = &resolved.effective;
     let strategy = typed_review_strategy(&resolved)?;
     let context = build_local_review_context(
@@ -1008,10 +999,12 @@ async fn run_local_review(
             .map(ReviewCommandResult::Preview);
     }
     if prepared.partition().work_units.is_empty() {
+        let mut report = no_model_review_report(&prepared);
+        attach_no_model_stable_report(&mut report, &prepared, &strategy)?;
         return Ok(ReviewCommandResult::Review {
             provider: "not_used".to_owned(),
             model: "not_used".to_owned(),
-            report: Box::new(no_model_review_report(&prepared)),
+            report: Box::new(report),
         });
     }
     let credentials = crate::direct_provider::discover_credentials(environment.iter().cloned())?;
@@ -1200,11 +1193,13 @@ async fn execute_prepared_review(
     prepared: PreparedReview,
     job_url: Option<String>,
 ) -> Result<(String, String, CanonicalReviewReport), Diagnostic> {
-    if prepared.partition().work_units.is_empty() {
-        return Ok((provider, model, no_model_review_report(&prepared)));
-    }
     let resolution = &resolved.effective;
     let strategy = typed_review_strategy(&resolved)?;
+    if prepared.partition().work_units.is_empty() {
+        let mut report = no_model_review_report(&prepared);
+        attach_no_model_stable_report(&mut report, &prepared, &strategy)?;
+        return Ok((provider, model, report));
+    }
     let attention = prepared.review_attention();
     let adapter: Arc<dyn ProviderAdapter> = Arc::from(build_provider(&provider, &credentials)?);
     let minimum_confidence_percent =
@@ -1324,18 +1319,14 @@ async fn run_prepared_tool_first_engine(
         clock,
         limits: tool_first_limits(model, strategy, &resolved.effective)?,
         system_policy_id: format!("{REVIEWER_POLICY_VERSION}.tool-first"),
-        system_policy: format!(
-            "{}\n\n{TOOL_FIRST_POLICY_ADAPTER}",
-            reviewer_system_policy()
-        ),
+        system_policy: tool_first_reviewer_system_policy(),
         initial_omissions,
-        lineage_authorizations: Vec::new(),
     })
     .await
     .map_err(|error| diagnostic(ErrorCode::ReviewFailed, error.to_string()))
 }
 
-fn tool_first_limits(
+pub(crate) fn tool_first_limits(
     model: &str,
     strategy: &ReviewStrategyConfiguration,
     resolution: &revoot_core::ConfigurationResolution,
@@ -1473,32 +1464,10 @@ fn review_outcome_usage(outcome: &ReviewOutcome) -> AgentBudgetUsage {
     }
 }
 
-fn no_changes_report() -> CanonicalReviewReport {
-    CanonicalReviewReport {
-        stable_report: None,
-        state: "no_changes",
-        overview: None,
-        summary: Some("No local changes to review.".to_owned()),
-        findings: Vec::new(),
-        omissions: Vec::new(),
-        prior_finding_dispositions: Vec::new(),
-        duplicates_omitted: 0,
-        usage: AgentBudgetUsage::default(),
-        turns: 0,
-        tool_calls: 0,
-        admitted_candidates: 0,
-        suppressed_candidates: 0,
-        strategy: None,
-        coverage: None,
-        selection: CanonicalSelection::default(),
-        publication: CanonicalPublication::terminal("not_needed", Some("no_changes")),
-        finding_locations: BTreeMap::new(),
-    }
-}
-
 fn skipped_fork_review_report() -> CanonicalReviewReport {
     CanonicalReviewReport {
         stable_report: None,
+        sarif_anchors: None,
         state: "skipped",
         overview: None,
         summary: Some("Fork merge request skipped by policy.".to_owned()),
@@ -1520,18 +1489,37 @@ fn skipped_fork_review_report() -> CanonicalReviewReport {
 }
 
 fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
+    let no_changes = prepared.partition().coverage.input_files == 0;
+    let summary = if no_changes {
+        "No local changes to review."
+    } else {
+        "No changed files were selected for model review."
+    };
     CanonicalReviewReport {
         stable_report: None,
+        sarif_anchors: None,
         state: "no_findings",
         overview: Some(ReviewOverview {
-            summary: "No changed files were selected for model review.".to_owned(),
-            overall_risk: RiskLevel::Moderate,
-            overall_basis: "The overall risk could not be fully assessed because no changed files were selected for model review.".to_owned(),
+            summary: summary.to_owned(),
+            overall_risk: if no_changes {
+                RiskLevel::Low
+            } else {
+                RiskLevel::Moderate
+            },
+            overall_basis: if no_changes {
+                "The immutable snapshot contains no changed files.".to_owned()
+            } else {
+                "The overall risk could not be fully assessed because no changed files were selected for model review.".to_owned()
+            },
             risks: Vec::new(),
-            assumptions_and_gaps: vec!["The omitted files were not reviewed by the model.".to_owned()],
+            assumptions_and_gaps: if no_changes {
+                Vec::new()
+            } else {
+                vec!["The omitted files were not reviewed by the model.".to_owned()]
+            },
             manual_validations: Vec::new(),
         }),
-        summary: Some("No changed files were selected for model review.".to_owned()),
+        summary: Some(summary.to_owned()),
         findings: Vec::new(),
         omissions: prepared.initial_omissions(),
         prior_finding_dispositions: Vec::new(),
@@ -1547,6 +1535,92 @@ fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
         publication: CanonicalPublication::terminal("not_needed", Some("no_model_work")),
         finding_locations: BTreeMap::new(),
     }
+}
+
+fn attach_no_model_stable_report(
+    report: &mut CanonicalReviewReport,
+    prepared: &PreparedReview,
+    strategy: &ReviewStrategyConfiguration,
+) -> Result<(), Diagnostic> {
+    let partition = prepared.partition();
+    let selection = stable_selection(partition);
+    let partial = !report.omissions.is_empty() || selection.omitted_files > 0;
+    report.state = if partial { "partial" } else { "no_findings" };
+    let overview_text = report
+        .summary
+        .clone()
+        .unwrap_or_else(|| "No supported defects found.".to_owned());
+    let phases = [
+        ReviewReportPhase::Grouping,
+        ReviewReportPhase::Planning,
+        ReviewReportPhase::Review,
+        ReviewReportPhase::Verification,
+        ReviewReportPhase::Adjudication,
+    ]
+    .into_iter()
+    .map(|phase| ReviewReportPhaseUsage {
+        phase,
+        model_requests: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        tool_calls: 0,
+        cost_microusd: 0,
+    })
+    .collect();
+    let snapshot_sha256 =
+        Sha256Digest::of_bytes(&serde_json::to_vec(&partition.snapshot).map_err(|_| {
+            diagnostic(
+                ErrorCode::ContractInvalid,
+                "snapshot identity serialization failed",
+            )
+        })?);
+    let stable = ReviewReportV3::new(
+        if partial {
+            ReviewReportState::Partial
+        } else {
+            ReviewReportState::NoFindings
+        },
+        snapshot_sha256,
+        partition.plan_sha256.clone(),
+        Vec::new(),
+        ReviewReportOverview {
+            content_sha256: Sha256Digest::of_bytes(overview_text.as_bytes()),
+            text: overview_text,
+        },
+        Vec::new(),
+        stable_publication(report),
+        selection,
+        ReviewReportStrategy {
+            effort: strategy.effort,
+            grouping_source: ReviewGroupingSource::DeterministicFallback,
+            group_count: 0,
+            max_parallel_groups: strategy.max_parallel_groups,
+        },
+        ReviewReportCoverage {
+            policy_version: "revoot.risk-adaptive-coverage/v1".to_owned(),
+            high_risk_files: 0,
+            standard_risk_files: 0,
+            low_risk_files: 0,
+            fully_read_files: 0,
+            sampled_files: 0,
+            manifest_only_files: 0,
+            delivered_high_risk_hunks: 0,
+            required_high_risk_hunks: 0,
+            explicit_deferrals: partition.coverage.omitted_files,
+            failed_groups: 0,
+        },
+        ReviewReportUsage {
+            phases,
+            totals: ReviewReportUsageTotals::default(),
+        },
+    )
+    .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))?;
+    stable
+        .validate_against_anchors(prepared.anchors())
+        .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))?;
+    report.sarif_anchors = Some(prepared.anchors().clone());
+    report.stable_report = Some(stable);
+    Ok(())
 }
 
 fn minimum_review_risk(
@@ -1618,6 +1692,7 @@ fn canonicalize_report(
     let finding_locations = finding_locations(&ranked.findings, anchors);
     Ok(CanonicalReviewReport {
         stable_report: None,
+        sarif_anchors: Some(anchors.clone()),
         state,
         overview: matches!(state, "complete" | "partial" | "no_findings").then_some(overview),
         summary,
@@ -2820,7 +2895,7 @@ fn typed_review_strategy(
         .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))
 }
 
-fn partition_limits(
+pub(crate) fn partition_limits(
     resolution: &revoot_core::ConfigurationResolution,
 ) -> Result<PartitionLimits, Diagnostic> {
     let max_files = u32_value(resolution, "budget.max_files")?;
@@ -2835,7 +2910,7 @@ fn partition_limits(
     })
 }
 
-fn selection_policy(
+pub(crate) fn selection_policy(
     resolution: &revoot_core::ConfigurationResolution,
     repository_policy: &RepositoryReviewPolicy,
 ) -> Result<ReviewSelectionPolicy, Diagnostic> {
@@ -3223,7 +3298,7 @@ fn emit_report(
                 })?
             } else {
                 serde_json::to_string_pretty(&ReviewOutput {
-                    schema_version: REPORT_SCHEMA_VERSION,
+                    schema_version: TERMINAL_REPORT_SCHEMA_VERSION,
                     provider,
                     model,
                     review: report,
@@ -3289,56 +3364,28 @@ fn emit_preview(args: &ReviewArgs, preview: &ReviewPreview) -> Result<(), Diagno
 }
 
 fn render_sarif(report: &CanonicalReviewReport) -> Result<String, Diagnostic> {
-    let results = report
-        .findings
-        .iter()
-        .map(|finding| {
-            let (path, line) = report
-                .finding_locations
-                .get(&finding.anchor_id)
-                .and_then(|location| location.rsplit_once(':'))
-                .and_then(|(path, line)| line.parse::<u32>().ok().map(|line| (path, line)))
-                .unwrap_or(("unknown", 1));
-            let category = serde_json::to_value(finding.category)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "review".to_owned());
-            json!({
-                "ruleId": format!("revoot.{category}"),
-                "level": match finding.severity {
-                    Severity::Critical | Severity::High => "error",
-                    Severity::Medium => "warning",
-                    Severity::Low | Severity::Info => "note",
-                },
-                "message": {"text": finding.rendered_body},
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": {"uri": path},
-                        "region": {"startLine": line}
-                    }
-                }],
-                "partialFingerprints": {
-                    "revootFindingKey": finding.finding_key.as_str()
-                },
-                "properties": {
-                    "confidencePercent": finding.confidence_percent,
-                    "anchorId": finding.anchor_id.as_str()
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string_pretty(&json!({
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {"driver": {"name": "Revoot"}},
-            "results": results,
-            "properties": {
-                "reviewState": report.state,
-                "coverage": report.coverage
-            }
-        }]
-    }))
+    let stable = report.stable_report.as_ref().ok_or_else(|| {
+        diagnostic(
+            ErrorCode::ContractInvalid,
+            "SARIF requires a canonical exact-anchor review report",
+        )
+    })?;
+    let anchors = report.sarif_anchors.as_ref().ok_or_else(|| {
+        diagnostic(
+            ErrorCode::ContractInvalid,
+            "SARIF requires the trusted review anchor table",
+        )
+    })?;
+    let log = render_report_v3_sarif(stable, anchors).map_err(|_| {
+        diagnostic(
+            ErrorCode::ContractInvalid,
+            "SARIF exact-anchor validation failed",
+        )
+    })?;
+    String::from_utf8(
+        log.canonical_json()
+            .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "SARIF serialization failed"))?,
+    )
     .map(|value| format!("{value}\n"))
     .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "SARIF serialization failed"))
 }
@@ -3420,7 +3467,7 @@ mod tests {
 
     use super::{
         CanonicalPublication, CanonicalReviewReport, CanonicalSelection, OutputFormat,
-        REPORT_SCHEMA_VERSION, ReviewOutput, agent_limits, apply_repository_suppressions,
+        ReviewOutput, TERMINAL_REPORT_SCHEMA_VERSION, agent_limits, apply_repository_suppressions,
         diff_limits, fork_behavior, github_publication_failure, minimum_review_risk, parse_args,
         parse_private_cidr, partition_limits, run_prepared_tool_first_engine, select_model,
         selection_policy, typed_review_strategy, validate_bound_job_url, write_report_atomically,
@@ -3750,6 +3797,44 @@ mod tests {
     }
 
     #[test]
+    fn clean_local_review_emits_valid_v3_json_and_empty_exact_anchor_sarif() {
+        let repository = CleanLocalRepository::new();
+        let outputs = tempfile::tempdir().expect("output directory");
+        let json_output = outputs.path().join("review.json");
+        let sarif_output = outputs.path().join("review.sarif");
+        for (format, output) in [("json", &json_output), ("sarif", &sarif_output)] {
+            let exit = super::run(
+                [
+                    "--format".to_owned(),
+                    format.to_owned(),
+                    "--output".to_owned(),
+                    output.to_string_lossy().into_owned(),
+                ]
+                .into_iter(),
+                std::iter::empty::<(OsString, OsString)>(),
+                &repository.0,
+            )
+            .expect("clean local report");
+            assert_eq!(exit, 0);
+        }
+
+        let report: revoot_core::ReviewReportV3 =
+            serde_json::from_slice(&fs::read(json_output).expect("JSON report"))
+                .expect("version-3 report");
+        report.validate().expect("valid report");
+        assert_eq!(report.state, revoot_core::ReviewReportState::NoFindings);
+        assert!(report.findings.is_empty());
+        let sarif: serde_json::Value =
+            serde_json::from_slice(&fs::read(sarif_output).expect("SARIF report"))
+                .expect("SARIF JSON");
+        assert_eq!(sarif["version"], "2.1.0");
+        assert_eq!(
+            sarif["runs"][0]["results"].as_array().map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn binary_only_local_review_uses_no_provider_credential() {
         let repository = CleanLocalRepository::new();
         fs::write(repository.0.join("artifact.bin"), [0_u8, 1, 2, 3]).expect("binary fixture");
@@ -3835,10 +3920,13 @@ mod tests {
         )
         .expect("default fork policy skips before external acquisition");
         assert_eq!(exit, 0);
-        let report = fs::read_to_string(&output).expect("skipped report");
-        assert!(report.contains("\"provider\": \"not_used\""));
-        assert!(report.contains("\"state\": \"skipped\""));
-        assert!(report.contains("\"reason\": \"fork_policy\""));
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).expect("skipped report"))
+                .expect("terminal JSON");
+        assert_eq!(report["schema_version"], TERMINAL_REPORT_SCHEMA_VERSION);
+        assert_eq!(report["provider"], "not_used");
+        assert_eq!(report["review"]["state"], "skipped");
+        assert_eq!(report["review"]["publication"]["reason"], "fork_policy");
         fs::remove_file(output).expect("remove skipped report");
     }
 
@@ -3887,6 +3975,7 @@ mod tests {
     fn canonical_silent_report_omits_a_findings_payload() {
         let review = CanonicalReviewReport {
             stable_report: None,
+            sarif_anchors: None,
             state: "no_findings",
             overview: None,
             summary: Some("No supported defects found.".to_owned()),
@@ -3906,7 +3995,7 @@ mod tests {
             finding_locations: BTreeMap::new(),
         };
         let encoded = serde_json::to_string(&ReviewOutput {
-            schema_version: REPORT_SCHEMA_VERSION,
+            schema_version: TERMINAL_REPORT_SCHEMA_VERSION,
             provider: "anthropic",
             model: "model",
             review: &review,
@@ -3915,6 +4004,7 @@ mod tests {
         assert!(!encoded.contains("\"findings\":"));
         assert!(encoded.contains("no_findings"));
         assert!(encoded.contains("\"selection\":"));
+        assert!(super::render_sarif(&review).is_err());
     }
 
     #[test]

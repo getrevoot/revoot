@@ -11,15 +11,18 @@ use std::sync::Arc;
 
 use revoot_core::provider::ProviderAdapter;
 use revoot_core::{
-    AdjudicationFallbackCoverage, AgentBudgetUsage, AgentOmission, AgentOmissionReason,
-    AnchorTable, AuthorizedLineageDecision, CancellationToken, GroupCoverageLedger,
-    PriorReviewContext, PriorReviewSource, PriorReviewState, RepositoryToolbox, ReviewBudgetBroker,
-    ReviewBudgetUsage, ReviewEffort, ReviewGroupId, ReviewOutcome, ReviewPartitionPlan,
-    ReviewReportPhase, ReviewReportPhaseUsage, Sha256Digest, VerifiedCandidate,
+    AdjudicationFallbackCoverage, AgentBudgetUsage, AgentOmission, AgentOmissionReason, AnchorId,
+    AnchorPosition, AnchorTable, AuthorizedLineageAction, AuthorizedLineageDecision,
+    CancellationToken, DeliveredAnchorEvidence, GroupCoverageLedger, LineageCoverageEvidence,
+    LineageDecisionResponse, PriorLineageRecord, PriorLineageTarget, PriorReviewContext,
+    PriorReviewSource, PriorReviewState, ProposedLineageDecision, ProposedLineageDisposition,
+    RepositoryRelativePath, RepositoryToolbox, ReviewBudgetBroker, ReviewBudgetUsage, ReviewEffort,
+    ReviewGroupId, ReviewOutcome, ReviewPartitionPlan, ReviewReportPhase, ReviewReportPhaseUsage,
+    Sha256Digest, VerifiedCandidate, WorkUnitFile, authorize_lineage_decisions,
 };
 
 use crate::config::RepositoryReviewPolicy;
-use crate::diff_artifact::DEFAULT_DIFF_PAGE_BYTES;
+use crate::diff_artifact::{DEFAULT_DIFF_PAGE_BYTES, DiffArtifactStore, DiffHunkManifest};
 use crate::git_history::GitHistoryToolbox;
 use crate::group_runtime::GroupRuntimeStopReason;
 use crate::group_scheduler::{GroupScheduleSnapshot, GroupScheduleStatus};
@@ -98,10 +101,6 @@ pub struct ToolFirstEngineRequest<C> {
     pub system_policy_id: String,
     pub system_policy: String,
     pub initial_omissions: Vec<AgentOmission>,
-    /// Optional exact-evidence decisions produced by the trusted lineage
-    /// authorization layer. Absence can preserve or mark still-present
-    /// lineages, but can never mark one fixed.
-    pub lineage_authorizations: Vec<AuthorizedLineageDecision>,
 }
 
 impl<C> fmt::Debug for ToolFirstEngineRequest<C> {
@@ -116,10 +115,6 @@ impl<C> fmt::Debug for ToolFirstEngineRequest<C> {
             .field("system_policy_id", &self.system_policy_id)
             .field("system_policy", &"[redacted]")
             .field("initial_omission_count", &self.initial_omissions.len())
-            .field(
-                "lineage_authorization_count",
-                &self.lineage_authorizations.len(),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -128,6 +123,8 @@ impl<C> fmt::Debug for ToolFirstEngineRequest<C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolFirstEngineReport {
     pub result: ReducedReviewResult,
+    /// Final trusted coverage ledgers in stable review-group identity order.
+    pub group_coverage: Vec<GroupCoverageLedger>,
     pub grouping_mode: ReviewGrouperMode,
     pub group_plan_sha256: Sha256Digest,
     pub group_count: u32,
@@ -289,8 +286,7 @@ where
     .map_err(ToolFirstEngineError::Execution)?;
     let verified = verified_candidates(&execution.groups)?;
     let verification_suppressions = verification_suppression_count(&execution.groups)?;
-    let group_accounting =
-        group_accounting(&execution, initial_coverage, request.lineage_authorizations)?;
+    let mut group_accounting = group_accounting(&execution, initial_coverage)?;
     let adjudication_context = adjudication_context(
         &execution,
         &group_accounting,
@@ -309,6 +305,34 @@ where
     )
     .await
     .map_err(ToolFirstEngineError::Adjudication)?;
+    let lineage_authorizations = authorize_review_lineages(
+        &request.prior_review,
+        &request.anchor_table,
+        &request.partition,
+        artifacts.as_ref(),
+        &group_accounting,
+        !adjudication.partial
+            && !adjudication_context.coverage.partial
+            && request.initial_omissions.is_empty(),
+        adjudication.lineage_response.clone(),
+    )?;
+    attach_lineage_authorizations(&mut group_accounting, lineage_authorizations)?;
+    let mut ordered_group_coverage = execution
+        .groups
+        .iter()
+        .map(|group| (group.group_id.clone(), group.coverage.clone()))
+        .collect::<Vec<_>>();
+    ordered_group_coverage.sort_by(|left, right| left.0.cmp(&right.0));
+    if ordered_group_coverage
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0)
+    {
+        return Err(ToolFirstEngineError::ExecutionAccounting);
+    }
+    let group_coverage = ordered_group_coverage
+        .into_iter()
+        .map(|(_, coverage)| coverage)
+        .collect();
     let mut initial_omissions = request.initial_omissions;
     if let ReviewAdjudicationMode::DeterministicFallback(reason) = adjudication.mode {
         initial_omissions.push(adjudication_fallback_omission(reason));
@@ -338,6 +362,7 @@ where
     apply_aggregate_usage(&mut result.outcome, budget_usage, verified.len())?;
     Ok(ToolFirstEngineReport {
         result,
+        group_coverage,
         grouping_mode,
         group_plan_sha256: group_plan.plan_sha256,
         group_count: u32::try_from(group_plan.groups.len())
@@ -501,7 +526,6 @@ fn verification_suppression_count(
 fn group_accounting(
     execution: &crate::review_group_execution::ReviewGroupExecutionReport,
     mut initial_coverage: BTreeMap<ReviewGroupId, GroupCoverageLedger>,
-    lineage: Vec<AuthorizedLineageDecision>,
 ) -> Result<Vec<GroupResultAccounting>, ToolFirstEngineError> {
     let executed = execution
         .groups
@@ -524,7 +548,6 @@ fn group_accounting(
         return Err(ToolFirstEngineError::ExecutionAccounting);
     }
     let mut accounting = Vec::with_capacity(execution.schedule.records.len());
-    let mut lineage = Some(lineage);
     for record in &execution.schedule.records {
         let initial = initial_coverage
             .remove(&record.group_id)
@@ -537,16 +560,296 @@ fn group_accounting(
             group_id: record.group_id.clone(),
             usage,
             coverage,
-            // The authorization is review-wide. Its exact-evidence authority
-            // is carried by the closed decision type; deterministic placement
-            // in one per-group reducer record must not duplicate it.
-            lineage: lineage.take().unwrap_or_default(),
+            lineage: Vec::new(),
         });
     }
-    if !initial_coverage.is_empty() || lineage.is_some_and(|lineage| !lineage.is_empty()) {
+    if !initial_coverage.is_empty() {
         return Err(ToolFirstEngineError::ExecutionAccounting);
     }
     Ok(accounting)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "lineage authorization explicitly receives each trusted input boundary"
+)]
+fn authorize_review_lineages(
+    prior_review: &PriorReviewContext,
+    anchor_table: &AnchorTable,
+    partition: &ReviewPartitionPlan,
+    artifacts: &DiffArtifactStore,
+    accounting: &[GroupResultAccounting],
+    coverage_complete: bool,
+    response: LineageDecisionResponse,
+) -> Result<Vec<AuthorizedLineageDecision>, ToolFirstEngineError> {
+    let selected_inputs = partition
+        .work_units
+        .iter()
+        .flat_map(|unit| unit.files.iter())
+        .collect::<Vec<_>>();
+    let issued_anchors = selected_inputs
+        .iter()
+        .flat_map(|input| input.anchor_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let artifact_paths = selected_inputs
+        .iter()
+        .map(|input| {
+            RepositoryRelativePath::try_from(input.path.new_path.as_str().to_owned())
+                .map_err(|_| ToolFirstEngineError::ExecutionAccounting)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifests = artifacts
+        .manifest(&artifact_paths)
+        .map_err(|_| ToolFirstEngineError::ExecutionAccounting)?;
+    let manifests = manifests
+        .into_iter()
+        .map(|manifest| (manifest.path.as_str().to_owned(), manifest.hunks))
+        .collect::<BTreeMap<_, _>>();
+    let records = prior_review
+        .discussions()
+        .iter()
+        .filter_map(|discussion| {
+            discussion
+                .lineage
+                .as_ref()
+                .map(|lineage| PriorLineageRecord {
+                    lineage_id: lineage.lineage_sha256.clone(),
+                    discussion_source: discussion.source,
+                    state: discussion.state,
+                    resolution_source: discussion.resolution.as_ref().map(|value| value.source),
+                    target: derive_lineage_target(
+                        discussion,
+                        anchor_table,
+                        &selected_inputs,
+                        &manifests,
+                        &issued_anchors,
+                    ),
+                })
+        })
+        .collect::<Vec<_>>();
+    let (delivered_anchors, delivered_deletion_hunks) = delivered_lineage_evidence(
+        accounting,
+        anchor_table,
+        &manifests,
+        artifacts,
+        &issued_anchors,
+    )?;
+    let coverage = LineageCoverageEvidence::new(
+        coverage_complete,
+        delivered_anchors,
+        delivered_deletion_hunks,
+        &issued_anchors,
+        anchor_table,
+    )
+    .map_err(|_| ToolFirstEngineError::ExecutionAccounting)?;
+    authorize_lineage_decisions(
+        records.clone(),
+        response,
+        &coverage,
+        &issued_anchors,
+        anchor_table,
+    )
+    .or_else(|_| {
+        authorize_lineage_decisions(
+            records.clone(),
+            preserve_lineage_response(&records),
+            &coverage,
+            &issued_anchors,
+            anchor_table,
+        )
+    })
+    .map(|authorization| authorization.decisions)
+    .map_err(|_| ToolFirstEngineError::ExecutionAccounting)
+}
+
+fn derive_lineage_target(
+    discussion: &revoot_core::PriorReviewDiscussion,
+    anchor_table: &AnchorTable,
+    selected_inputs: &[&WorkUnitFile],
+    manifests: &BTreeMap<String, Vec<DiffHunkManifest>>,
+    issued_anchors: &BTreeSet<AnchorId>,
+) -> PriorLineageTarget {
+    let Some(path) = discussion.path.as_deref() else {
+        return PriorLineageTarget::Unavailable;
+    };
+    if let Some(line) = discussion.line {
+        let mut matches = anchor_table.iter().filter(|anchor| {
+            issued_anchors.contains(&anchor.id)
+                && anchor.path.new_path.as_str() == path
+                && current_line(anchor.position) == Some(line)
+        });
+        if let Some(anchor) = matches.next()
+            && matches.next().is_none()
+            && let Some(hunk) = manifests
+                .get(anchor.path.new_path.as_str())
+                .and_then(|hunks| {
+                    hunks
+                        .iter()
+                        .find(|hunk| anchor_in_hunk(anchor.position, hunk))
+                })
+        {
+            return PriorLineageTarget::CurrentLocation {
+                anchor_id: anchor.id.clone(),
+                evidence_id: hunk.hunk_id.clone(),
+            };
+        }
+    }
+    let Some(old_line) = discussion.original_line.or(discussion.line) else {
+        return PriorLineageTarget::Unavailable;
+    };
+    let mut matches = selected_inputs.iter().filter_map(|input| {
+        (input.path.old_path.as_str() == path || input.path.new_path.as_str() == path)
+            .then_some(input.path.new_path.as_str())
+    });
+    let Some(new_path) = matches.next() else {
+        return PriorLineageTarget::Unavailable;
+    };
+    if matches.next().is_some() {
+        return PriorLineageTarget::Unavailable;
+    }
+    let mut hunks = manifests
+        .get(new_path)
+        .into_iter()
+        .flatten()
+        .filter(|hunk| line_in_range(old_line, hunk.old_start, hunk.old_count));
+    let Some(hunk) = hunks.next() else {
+        return PriorLineageTarget::Unavailable;
+    };
+    if hunks.next().is_some() {
+        return PriorLineageTarget::Unavailable;
+    }
+    PriorLineageTarget::DeletionHunk {
+        hunk_evidence_id: hunk.hunk_id.clone(),
+    }
+}
+
+fn delivered_lineage_evidence(
+    accounting: &[GroupResultAccounting],
+    anchor_table: &AnchorTable,
+    manifests: &BTreeMap<String, Vec<DiffHunkManifest>>,
+    artifacts: &DiffArtifactStore,
+    issued_anchors: &BTreeSet<AnchorId>,
+) -> Result<(Vec<DeliveredAnchorEvidence>, Vec<String>), ToolFirstEngineError> {
+    let mut anchors = BTreeSet::new();
+    let mut deletion_hunks = BTreeSet::new();
+    for account in accounting {
+        for file in account.coverage.files.values() {
+            let hunks = manifests
+                .get(file.path.as_str())
+                .ok_or(ToolFirstEngineError::ExecutionAccounting)?;
+            for coverage in &file.hunks {
+                let manifest = hunks
+                    .iter()
+                    .find(|hunk| hunk.hunk_id == coverage.hunk_id)
+                    .ok_or(ToolFirstEngineError::ExecutionAccounting)?;
+                if coverage.total_pages != manifest.pages {
+                    return Err(ToolFirstEngineError::ExecutionAccounting);
+                }
+                if !coverage.delivered_pages.is_empty() {
+                    let path = RepositoryRelativePath::try_from(file.path.as_str().to_owned())
+                        .map_err(|_| ToolFirstEngineError::ExecutionAccounting)?;
+                    let positions = coverage
+                        .delivered_pages
+                        .iter()
+                        .map(|page| {
+                            artifacts
+                                .read_hunk_page(&path, &manifest.hunk_id, *page)
+                                .map(|page| page.positions)
+                                .map_err(|_| ToolFirstEngineError::ExecutionAccounting)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .flatten()
+                        .collect::<BTreeSet<_>>();
+                    for anchor in anchor_table.iter().filter(|anchor| {
+                        issued_anchors.contains(&anchor.id)
+                            && anchor.path.new_path == file.path
+                            && positions.contains(&anchor.position)
+                    }) {
+                        anchors.insert((anchor.id.clone(), manifest.hunk_id.clone()));
+                    }
+                }
+                if coverage.delivered_pages.len()
+                    == usize::try_from(coverage.total_pages).unwrap_or(usize::MAX)
+                    && (1..=coverage.total_pages)
+                        .all(|page| coverage.delivered_pages.contains(&page))
+                {
+                    deletion_hunks.insert(manifest.hunk_id.clone());
+                }
+            }
+        }
+    }
+    Ok((
+        anchors
+            .into_iter()
+            .map(|(anchor_id, evidence_id)| DeliveredAnchorEvidence {
+                anchor_id,
+                evidence_id,
+            })
+            .collect(),
+        deletion_hunks.into_iter().collect(),
+    ))
+}
+
+fn current_line(position: AnchorPosition) -> Option<u32> {
+    match position {
+        AnchorPosition::Addition { new_line } | AnchorPosition::Context { new_line, .. } => {
+            Some(new_line)
+        }
+        AnchorPosition::Deletion { .. } => None,
+    }
+}
+
+fn anchor_in_hunk(position: AnchorPosition, hunk: &DiffHunkManifest) -> bool {
+    match position {
+        AnchorPosition::Addition { new_line } => {
+            line_in_range(new_line, hunk.new_start, hunk.new_count)
+        }
+        AnchorPosition::Deletion { old_line } => {
+            line_in_range(old_line, hunk.old_start, hunk.old_count)
+        }
+        AnchorPosition::Context { old_line, new_line } => {
+            line_in_range(old_line, hunk.old_start, hunk.old_count)
+                && line_in_range(new_line, hunk.new_start, hunk.new_count)
+        }
+    }
+}
+
+fn line_in_range(line: u32, start: u32, count: u32) -> bool {
+    count > 0 && line >= start && line < start.saturating_add(count)
+}
+
+fn preserve_lineage_response(records: &[PriorLineageRecord]) -> LineageDecisionResponse {
+    LineageDecisionResponse {
+        schema_version: LineageDecisionResponse::SCHEMA_VERSION.to_owned(),
+        decisions: records
+            .iter()
+            .map(|record| ProposedLineageDecision {
+                lineage_id: record.lineage_id.clone(),
+                disposition: ProposedLineageDisposition::Preserve,
+            })
+            .collect(),
+    }
+}
+
+fn attach_lineage_authorizations(
+    accounting: &mut [GroupResultAccounting],
+    mut decisions: Vec<AuthorizedLineageDecision>,
+) -> Result<(), ToolFirstEngineError> {
+    decisions.retain(|decision| {
+        matches!(
+            decision.action,
+            AuthorizedLineageAction::ResolveFixed { .. }
+        )
+    });
+    if decisions.is_empty() {
+        return Ok(());
+    }
+    let Some(first) = accounting.first_mut() else {
+        return Err(ToolFirstEngineError::ExecutionAccounting);
+    };
+    first.lineage = decisions;
+    Ok(())
 }
 
 fn adjudication_context(
@@ -719,12 +1022,13 @@ mod tests {
 
     use revoot_core::provider::{ProviderError, ProviderErrorKind, ProviderFuture};
     use revoot_core::{
-        ChangedPath, FileChangeKind, GitSha, LocalSnapshotIdentity, ModelContent,
-        ModelFinishReason, ModelRequest, ModelResponse, ModelUsage, PartitionLimits,
-        RepositoryDiff, RepositoryPath, RepositoryRelativePath, RepositoryToolLimits,
-        ReviewBudgetLimits, ReviewFileClass, ReviewFileInput, ReviewObject, ReviewObjectRole,
-        ReviewSelectionPolicy, ReviewSnapshotIdentity, ReviewValue, ReviewValueReason,
-        ReviewValueTier, build_partition_plan,
+        AdjudicatorResponse, AnchorPosition, ChangedPath, CommentableLine, FileChangeKind,
+        FindingLineageMarker, GitSha, LocalSnapshotIdentity, ModelContent, ModelFinishReason,
+        ModelRequest, ModelResponse, ModelUsage, PartitionLimits, PriorReviewDiscussion,
+        PriorReviewResolution, RepositoryDiff, RepositoryPath, RepositoryRelativePath,
+        RepositoryToolLimits, ReviewBudgetLimits, ReviewFileClass, ReviewFileInput, ReviewObject,
+        ReviewObjectRole, ReviewSelectionPolicy, ReviewSnapshotIdentity, ReviewValue,
+        ReviewValueReason, ReviewValueTier, build_partition_plan,
     };
     use serde_json::json;
     use tempfile::TempDir;
@@ -815,6 +1119,59 @@ mod tests {
                     ))
                 }
             })
+        }
+    }
+
+    struct LineageProvider {
+        worker_stage: AtomicUsize,
+        lineage_id: Sha256Digest,
+        malformed_lineage_response: bool,
+    }
+
+    impl ProviderAdapter for LineageProvider {
+        fn adapter_id(&self) -> &'static str {
+            "lineage-fake"
+        }
+
+        fn complete<'a>(
+            &'a self,
+            request: &'a ModelRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> ProviderFuture<'a> {
+            let response = if request.tools.is_empty() {
+                lineage_adjudication_response(&self.lineage_id, self.malformed_lineage_response)
+            } else if self.worker_stage.fetch_add(1, Ordering::Relaxed) == 0 {
+                let packet = request
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .find_map(|content| match content {
+                        ModelContent::Text { text } => {
+                            serde_json::from_str::<serde_json::Value>(text).ok()
+                        }
+                        ModelContent::ToolUse { .. } | ModelContent::ToolResult { .. } => None,
+                    })
+                    .expect("worker packet");
+                let file = &packet["files"][0];
+                ModelResponse {
+                    provider_response_id: None,
+                    model: "model-v1".to_owned(),
+                    content: vec![ModelContent::ToolUse {
+                        id: "lineage-read".to_owned(),
+                        name: "read_diff".to_owned(),
+                        input: json!({"reads":[{
+                            "path": file["path"],
+                            "hunk_id": file["hunk_ids"][0],
+                            "page": 1
+                        }]}),
+                    }],
+                    finish_reason: ModelFinishReason::ToolUse,
+                    usage: ModelUsage::default(),
+                }
+            } else {
+                complete_group_response()
+            };
+            Box::pin(async move { Ok(response) })
         }
     }
 
@@ -921,6 +1278,133 @@ mod tests {
         }
     }
 
+    fn lineage_setup(
+        discussion_source: PriorReviewSource,
+        discussion_state: PriorReviewState,
+        current_anchor: bool,
+    ) -> (EngineSetup, PriorReviewContext, Sha256Digest) {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        fs::create_dir(directory.path().join("src")).expect("source directory");
+        fs::write(directory.path().join("src/lineage.rs"), "new\n").expect("source");
+        let path = repository_path("src/lineage.rs");
+        let changed_path = ChangedPath {
+            old_path: path.clone(),
+            new_path: path.clone(),
+            kind: FileChangeKind::Modified,
+        };
+        let mut diff = "diff --git a/src/lineage.rs b/src/lineage.rs\n--- a/src/lineage.rs\n+++ b/src/lineage.rs\n@@ -1 +1 @@\n-old\n+new\n ".to_owned();
+        diff.push_str(&"x".repeat(17_000));
+        diff.push('\n');
+        let snapshot = snapshot();
+        let anchors = AnchorTable::build(
+            snapshot.clone(),
+            current_anchor.then(|| CommentableLine {
+                path: changed_path.clone(),
+                position: AnchorPosition::addition(1).expect("anchor"),
+                exact_line_digest: Sha256Digest::of_bytes(b"new"),
+                context_digest: Sha256Digest::of_bytes(b"context"),
+            }),
+        )
+        .expect("anchor table");
+        let anchor_ids = anchors.iter().map(|anchor| anchor.id.clone()).collect();
+        let partition = build_partition_plan(
+            snapshot,
+            &ReviewSelectionPolicy {
+                version: "selection-v1".to_owned(),
+                included_paths: BTreeSet::new(),
+                included_prefixes: Vec::new(),
+                included_suffixes: Vec::new(),
+                excluded_paths: BTreeSet::new(),
+                excluded_prefixes: Vec::new(),
+                excluded_suffixes: Vec::new(),
+                excluded_basename_prefixes: Vec::new(),
+                include_generated: false,
+                max_file_bytes: 100_000,
+            },
+            PartitionLimits {
+                max_files: 1,
+                max_total_bytes: 100_000,
+                max_work_units: 1,
+                max_files_per_work_unit: 1,
+                max_bytes_per_work_unit: 100_000,
+                max_anchors_per_work_unit: 10,
+            },
+            [ReviewFileInput {
+                path: changed_path,
+                class: ReviewFileClass::Text,
+                review_value: ReviewValue {
+                    tier: ReviewValueTier::High,
+                    score: 220,
+                    reasons: BTreeSet::from([ReviewValueReason::SourceCode]),
+                },
+                objects: vec![ReviewObject {
+                    role: ReviewObjectRole::ExactDiff,
+                    content_sha256: Sha256Digest::of_bytes(diff.as_bytes()),
+                    size_bytes: u64::try_from(diff.len()).expect("diff bytes"),
+                }],
+                anchor_ids,
+            }],
+        )
+        .expect("partition");
+        let cancellation = CancellationToken::default();
+        let toolbox = Arc::new(
+            RepositoryToolbox::open_selected(
+                directory.path(),
+                RepositoryToolLimits::default(),
+                [RepositoryDiff {
+                    path: relative_path("src/lineage.rs"),
+                    text: diff,
+                }],
+                [relative_path("src/lineage.rs")],
+                &cancellation,
+            )
+            .expect("toolbox"),
+        );
+        let (prior_review, lineage_id) =
+            lineage_prior_review(discussion_source, discussion_state, current_anchor);
+        (
+            EngineSetup {
+                _directory: directory,
+                toolbox,
+                partition,
+                anchors,
+            },
+            prior_review,
+            lineage_id,
+        )
+    }
+
+    fn lineage_prior_review(
+        source: PriorReviewSource,
+        state: PriorReviewState,
+        current_anchor: bool,
+    ) -> (PriorReviewContext, Sha256Digest) {
+        let lineage_id = Sha256Digest::of_bytes(b"prior-lineage");
+        let resolution = (state == PriorReviewState::Resolved).then_some(PriorReviewResolution {
+            source: PriorReviewSource::Other,
+            resolved_at: None,
+        });
+        let prior_review = PriorReviewContext::try_new(vec![PriorReviewDiscussion {
+            thread_id: "thread-lineage".to_owned(),
+            comment_id: "comment-lineage".to_owned(),
+            source,
+            state,
+            path: Some("src/lineage.rs".to_owned()),
+            line: current_anchor.then_some(1),
+            original_line: Some(1),
+            body: "Prior finding".to_owned(),
+            replies: Vec::new(),
+            resolution,
+            lineage: Some(FindingLineageMarker::new(
+                lineage_id.clone(),
+                GitSha::try_from("9".repeat(40)).expect("prior head"),
+                Sha256Digest::of_bytes(b"prior evidence"),
+            )),
+        }])
+        .expect("prior review");
+        (prior_review, lineage_id)
+    }
+
     fn request<P>(setup: EngineSetup, provider: Arc<P>) -> ToolFirstEngineRequest<FixedClock>
     where
         P: ProviderAdapter + 'static,
@@ -944,7 +1428,6 @@ mod tests {
             system_policy: "Use only bounded tools and complete the assigned review group."
                 .to_owned(),
             initial_omissions: Vec::new(),
-            lineage_authorizations: Vec::new(),
         }
     }
 
@@ -1011,6 +1494,150 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn full_engine_cancellation_and_provider_failure_clean_artifacts() {
+        let completing = Arc::new(CompletingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let cancelled_request = request(setup(), completing);
+        let cancelled_prepared = prepare_for_execution(&cancelled_request).await;
+        let cancelled_directory = cancelled_prepared.artifacts.directory_path().to_path_buf();
+        cancelled_request
+            .cancellation
+            .cancel(revoot_core::ProviderCancellationReason::UserRequested);
+        let _cancelled_result = execute_and_reduce(cancelled_request, cancelled_prepared).await;
+        assert!(!cancelled_directory.exists());
+
+        let failing = Arc::new(FailingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let failed_request = request(setup(), failing);
+        let failed_prepared = prepare_for_execution(&failed_request).await;
+        let failed_directory = failed_prepared.artifacts.directory_path().to_path_buf();
+        let failed_result = execute_and_reduce(failed_request, failed_prepared)
+            .await
+            .expect("provider failure produces a partial review");
+        assert!(matches!(
+            failed_result.result.outcome,
+            ReviewOutcome::Partial { .. }
+        ));
+        assert!(!failed_directory.exists());
+    }
+
+    #[tokio::test]
+    async fn delivered_current_anchor_and_complete_deletion_hunk_authorize_fixed() {
+        for current_anchor in [true, false] {
+            let (setup, prior_review, lineage_id) = lineage_setup(
+                PriorReviewSource::Revoot,
+                PriorReviewState::Open,
+                current_anchor,
+            );
+            let provider = Arc::new(LineageProvider {
+                worker_stage: AtomicUsize::new(0),
+                lineage_id: lineage_id.clone(),
+                malformed_lineage_response: false,
+            });
+            let mut review = request(setup, Arc::clone(&provider));
+            review.prior_review = prior_review;
+            let result = run_tool_first_engine(review).await.expect("lineage review");
+            assert_eq!(provider.worker_stage.load(Ordering::Relaxed), 2);
+            assert_eq!(result.result.prior_finding_dispositions.len(), 1);
+            assert_eq!(
+                result.result.prior_finding_dispositions[0].lineage_id,
+                lineage_id
+            );
+            assert_eq!(
+                result.result.prior_finding_dispositions[0].disposition,
+                crate::review_contracts::PriorFindingDispositionKind::Fixed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_coverage_and_missing_lineage_decision_preserve_prior_finding() {
+        for (malformed, add_partial_omission) in [(false, true), (true, false)] {
+            let (setup, prior_review, lineage_id) =
+                lineage_setup(PriorReviewSource::Revoot, PriorReviewState::Open, true);
+            let provider = Arc::new(LineageProvider {
+                worker_stage: AtomicUsize::new(0),
+                lineage_id,
+                malformed_lineage_response: malformed,
+            });
+            let mut review = request(setup, provider);
+            review.prior_review = prior_review;
+            if add_partial_omission {
+                review.initial_omissions.push(AgentOmission {
+                    subject_id: "trusted-selection-omission".to_owned(),
+                    reason: AgentOmissionReason::CoverageIncomplete,
+                });
+            }
+            let result = run_tool_first_engine(review).await.expect("partial review");
+            assert!(matches!(
+                result.result.outcome,
+                ReviewOutcome::Partial { .. }
+            ));
+            assert_eq!(
+                result.result.prior_finding_dispositions[0].disposition,
+                crate::review_contracts::PriorFindingDispositionKind::Uncertain
+            );
+            if malformed {
+                assert!(matches!(
+                    result.adjudication_mode,
+                    ReviewAdjudicationMode::DeterministicFallback(
+                        ReviewAdjudicatorFallbackReason::InvalidResponse
+                    )
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_and_already_resolved_lineages_remain_outside_resolution_actions() {
+        for (source, state) in [
+            (PriorReviewSource::Other, PriorReviewState::Open),
+            (PriorReviewSource::Revoot, PriorReviewState::Resolved),
+        ] {
+            let (setup, prior_review, lineage_id) = lineage_setup(source, state, true);
+            let provider = Arc::new(LineageProvider {
+                worker_stage: AtomicUsize::new(0),
+                lineage_id,
+                malformed_lineage_response: false,
+            });
+            let mut review = request(setup, provider);
+            review.prior_review = prior_review;
+            let result = run_tool_first_engine(review)
+                .await
+                .expect("preserved review");
+            assert!(result.result.prior_finding_dispositions.is_empty());
+        }
+    }
+
+    async fn prepare_for_execution(
+        request: &ToolFirstEngineRequest<FixedClock>,
+    ) -> ToolFirstPreparedReview {
+        let bindings = preparation_bindings(request).expect("preparation bindings");
+        let diagnostic_policy = diagnostic_rule_policy(&request.rule_policy);
+        prepare_tool_first_review(
+            ToolFirstPreparationInput {
+                repository: request.toolbox.as_ref(),
+                partition: &request.partition,
+                anchor_table: request.anchor_table.clone(),
+                rule_policy: &diagnostic_policy,
+                bindings,
+                grouper: request.limits.grouper.clone(),
+                effort: request.limits.effort,
+                diff_page_bytes: request.limits.diff_page_bytes,
+                max_inline_diff_bytes: request.limits.max_inline_diff_bytes,
+            },
+            request.provider.as_ref(),
+            &request.budget,
+            &request.cancellation,
+            request.clock.as_ref(),
+        )
+        .await
+        .expect("tool-first preparation")
+    }
+
     fn complete_group_response() -> ModelResponse {
         ModelResponse {
             provider_response_id: None,
@@ -1028,6 +1655,33 @@ mod tests {
                 }),
             }],
             finish_reason: ModelFinishReason::ToolUse,
+            usage: ModelUsage::default(),
+        }
+    }
+
+    fn lineage_adjudication_response(lineage_id: &Sha256Digest, malformed: bool) -> ModelResponse {
+        let mut response = json!({
+            "schema_version": AdjudicatorResponse::SCHEMA_VERSION,
+            "publish": [],
+            "suppress": [],
+            "overview": {
+                "summary": "No current findings remain.",
+                "assumptions": []
+            }
+        });
+        if !malformed {
+            response["lineage_decisions"] = json!([{
+                "lineage_id": lineage_id,
+                "disposition": "fixed"
+            }]);
+        }
+        ModelResponse {
+            provider_response_id: None,
+            model: "model-v1".to_owned(),
+            content: vec![ModelContent::Text {
+                text: response.to_string(),
+            }],
+            finish_reason: ModelFinishReason::Stop,
             usage: ModelUsage::default(),
         }
     }

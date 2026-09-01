@@ -56,6 +56,7 @@ pub enum CoverageGateError {
     InvalidDisposition,
     InvalidMetadataOnlyRename,
     MetadataRenameNotFound,
+    PageAlreadyDelivered,
     Ledger(CoverageError),
 }
 
@@ -113,9 +114,35 @@ impl CoverageCompletionGate {
         hunk_id: &str,
         page: u32,
     ) -> Result<(), CoverageGateError> {
+        validate_undelivered_hunk_page(&self.ledger, path, hunk_id, page)?;
         self.ledger
             .record_hunk_page(path, hunk_id, page)
             .map_err(CoverageGateError::Ledger)
+    }
+
+    /// Atomically record a batch of successfully delivered hunk pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload-free ledger error without changing coverage when any
+    /// page in the batch has an unknown or invalid target.
+    pub fn record_hunk_pages(
+        &mut self,
+        pages: &[(RepositoryPath, String, u32)],
+    ) -> Result<(), CoverageGateError> {
+        let mut unique = BTreeSet::new();
+        for (path, hunk_id, page) in pages {
+            if !unique.insert((path, hunk_id, page)) {
+                return Err(CoverageGateError::PageAlreadyDelivered);
+            }
+            validate_undelivered_hunk_page(&self.ledger, path, hunk_id, *page)?;
+        }
+        for (path, hunk_id, page) in pages {
+            self.ledger
+                .record_hunk_page(path, hunk_id, *page)
+                .map_err(CoverageGateError::Ledger)?;
+        }
+        Ok(())
     }
 
     /// Record one explicit unread disposition.
@@ -194,6 +221,43 @@ impl CoverageCompletionGate {
             })
         }
     }
+}
+
+fn validate_undelivered_hunk_page(
+    ledger: &GroupCoverageLedger,
+    path: &RepositoryPath,
+    hunk_id: &str,
+    page: u32,
+) -> Result<(), CoverageGateError> {
+    validate_hunk_page(ledger, path, hunk_id, page).map_err(CoverageGateError::Ledger)?;
+    let delivered = ledger
+        .files
+        .get(path)
+        .and_then(|file| file.hunks.iter().find(|hunk| hunk.hunk_id == hunk_id))
+        .is_some_and(|hunk| hunk.delivered_pages.contains(&page));
+    if delivered {
+        Err(CoverageGateError::PageAlreadyDelivered)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_hunk_page(
+    ledger: &GroupCoverageLedger,
+    path: &RepositoryPath,
+    hunk_id: &str,
+    page: u32,
+) -> Result<(), CoverageError> {
+    let file = ledger.files.get(path).ok_or(CoverageError::UnknownFile)?;
+    let hunk = file
+        .hunks
+        .iter()
+        .find(|hunk| hunk.hunk_id == hunk_id)
+        .ok_or(CoverageError::UnknownHunk)?;
+    if page == 0 || page > hunk.total_pages {
+        return Err(CoverageError::InvalidPage);
+    }
+    Ok(())
 }
 
 fn validate_ledger(
@@ -373,6 +437,55 @@ mod tests {
             complete.complete_group(),
             Ok(GroupCompletion::Complete { .. })
         ));
+    }
+
+    #[test]
+    fn batched_page_recording_is_atomic() {
+        let target = path("src/high.rs");
+        let mut gate = build_gate(file(
+            target.as_str(),
+            ReviewValueTier::High,
+            vec![hunk("h1", 1, false)],
+        ));
+        let error = gate
+            .record_hunk_pages(&[
+                (target.clone(), "h1".to_owned(), 1),
+                (target.clone(), "h1".to_owned(), 2),
+            ])
+            .expect_err("later invalid page rejects batch");
+        assert_eq!(error, CoverageGateError::Ledger(CoverageError::InvalidPage));
+        assert!(
+            gate.ledger().files[&target].hunks[0]
+                .delivered_pages
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn repeated_pages_are_rejected_without_mutating_the_batch() {
+        let target = path("src/high.rs");
+        let mut gate = build_gate(file(
+            target.as_str(),
+            ReviewValueTier::High,
+            vec![hunk("h1", 2, false)],
+        ));
+        gate.record_hunk_page(&target, "h1", 1)
+            .expect("first delivery");
+        assert_eq!(
+            gate.record_hunk_page(&target, "h1", 1),
+            Err(CoverageGateError::PageAlreadyDelivered)
+        );
+        assert_eq!(
+            gate.record_hunk_pages(&[
+                (target.clone(), "h1".to_owned(), 2),
+                (target.clone(), "h1".to_owned(), 1),
+            ]),
+            Err(CoverageGateError::PageAlreadyDelivered)
+        );
+        assert_eq!(
+            gate.ledger().files[&target].hunks[0].delivered_pages,
+            BTreeSet::from([1])
+        );
     }
 
     #[test]

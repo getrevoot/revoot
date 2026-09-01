@@ -19,7 +19,7 @@ use revoot_core::{
 };
 
 use crate::group_scheduler::GroupScheduleStatus;
-use crate::review_engine::PriorFindingDispositionKind;
+use crate::review_contracts::{PriorFindingDispositionKind, ReviewCoverage};
 use crate::review_grouper::ReviewGrouperMode;
 use crate::review_overview::{ReviewOverview, RiskLevel};
 use crate::tool_first_engine::ToolFirstEngineReport;
@@ -457,7 +457,7 @@ fn grouping_source(mode: ReviewGrouperMode) -> ReviewGroupingSource {
     }
 }
 
-fn coverage(value: &crate::review_engine::ReviewCoverage) -> ReviewReportCoverage {
+fn coverage(value: &ReviewCoverage) -> ReviewReportCoverage {
     ReviewReportCoverage {
         policy_version: value.policy_version.to_owned(),
         high_risk_files: value.high_risk_files,
@@ -580,7 +580,7 @@ mod tests {
     use super::*;
     use crate::group_scheduler::{GroupScheduleRecord, GroupScheduleStatus};
     use crate::review_adjudicator::ReviewAdjudicationMode;
-    use crate::review_engine::{PriorFindingDisposition, ReviewCoverage};
+    use crate::review_contracts::PriorFindingDisposition;
     use crate::review_result_reducer::ReducedReviewResult;
 
     struct Fixture {
@@ -609,7 +609,30 @@ mod tests {
         )
         .expect("anchors");
         let anchor_id = anchors.iter().next().expect("anchor").id.clone();
-        let partition = build_partition_plan(
+        let partition = fixture_partition(&snapshot, changed, &anchor_id);
+        let aggregate = aggregate_usage();
+        let result = fixture_result(
+            partition.work_units[0].id.as_str().to_owned(),
+            &anchor_id,
+            aggregate,
+        );
+        let engine = fixture_engine(result, aggregate);
+        let snapshot_sha256 =
+            Sha256Digest::of_bytes(&serde_json::to_vec(&snapshot).expect("snapshot encoding"));
+        Fixture {
+            partition,
+            anchors,
+            engine,
+            snapshot_sha256,
+        }
+    }
+
+    fn fixture_partition(
+        snapshot: &ReviewSnapshotIdentity,
+        changed: ChangedPath,
+        anchor_id: &AnchorId,
+    ) -> ReviewPartitionPlan {
+        build_partition_plan(
             snapshot.clone(),
             &ReviewSelectionPolicy {
                 version: "selection-v1".to_owned(),
@@ -647,8 +670,14 @@ mod tests {
                 anchor_ids: vec![anchor_id.clone()],
             }],
         )
-        .expect("partition");
-        let work_unit_id = partition.work_units[0].id.as_str().to_owned();
+        .expect("partition")
+    }
+
+    fn fixture_result(
+        work_unit_id: String,
+        anchor_id: &AnchorId,
+        aggregate: revoot_core::ReviewBudgetUsage,
+    ) -> ReducedReviewResult {
         let overview = ReviewOverview {
             summary: "One verified issue requires attention.".to_owned(),
             overall_risk: RiskLevel::High,
@@ -657,7 +686,6 @@ mod tests {
             assumptions_and_gaps: Vec::new(),
             manual_validations: Vec::new(),
         };
-        let aggregate = aggregate_usage();
         let agent_usage = AgentBudgetUsage {
             turns: aggregate.model_requests,
             model_requests: aggregate.model_requests,
@@ -669,7 +697,7 @@ mod tests {
             elapsed_millis: aggregate.elapsed_millis,
             ..AgentBudgetUsage::default()
         };
-        let result = ReducedReviewResult {
+        ReducedReviewResult {
             outcome: ReviewOutcome::Complete {
                 findings: vec![FindingsEnvelope {
                     schema_version: FindingsEnvelope::SCHEMA_VERSION.to_owned(),
@@ -706,12 +734,19 @@ mod tests {
                 failed_groups: 0,
             },
             prior_finding_dispositions: Vec::<PriorFindingDisposition>::new(),
-        };
+        }
+    }
+
+    fn fixture_engine(
+        result: ReducedReviewResult,
+        aggregate: revoot_core::ReviewBudgetUsage,
+    ) -> ToolFirstEngineReport {
         let group_plan_sha256 = Sha256Digest::of_bytes(b"group-plan");
         let group_id =
             serde_json::from_value(json!(format!("rg-{}", "1".repeat(64)))).expect("group id");
-        let engine = ToolFirstEngineReport {
+        ToolFirstEngineReport {
             result,
+            group_coverage: vec![revoot_core::GroupCoverageLedger::new([]).expect("coverage")],
             grouping_mode: ReviewGrouperMode::Semantic,
             group_plan_sha256: group_plan_sha256.clone(),
             group_count: 1,
@@ -737,14 +772,6 @@ mod tests {
             verification_suppressions: 0,
             budget_usage: aggregate,
             phase_usage: phases(),
-        };
-        let snapshot_sha256 =
-            Sha256Digest::of_bytes(&serde_json::to_vec(&snapshot).expect("snapshot encoding"));
-        Fixture {
-            partition,
-            anchors,
-            engine,
-            snapshot_sha256,
         }
     }
 

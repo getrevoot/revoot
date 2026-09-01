@@ -15,14 +15,14 @@ use revoot_core::review_packet::{
 };
 use revoot_core::{
     AgentBudget, AgentBudgetLimits, AgentBudgetUsage, AnchorId, AnchorTable, CancellationToken,
-    CandidateForVerification, CodeSearchRequest, CompleteGroupRejection, CoverageCompletionGate,
-    GroupCompletion, GroupCoverageLedger, GroupPartialCause, LineRange, ModelContent,
-    ModelFinishReason, ModelMessage, ModelRequest, ModelRole, ModelTool, PreparedVerificationBatch,
-    PriorReviewContext, ProviderAdapter, RepositoryPath, RepositoryRelativePath, RepositoryToolbox,
-    ReviewBudgetBroker, ReviewBudgetUsage, ReviewCallUsage, ReviewModelReservation,
-    ReviewModelSettlement, ReviewModelUsage, ReviewWorkerCheckpoint, ReviewWorkerError,
-    ReviewWorkerPhase, ReviewWorkerPlan, ReviewWorkerState, Sha256Digest, UnreadHunkDisposition,
-    WorkUnitId, prepare_verification_batch,
+    CandidateForVerification, ChangedPath, CodeSearchRequest, CompleteGroupRejection,
+    CoverageCompletionGate, GroupCompletion, GroupCoverageLedger, GroupPartialCause, LineRange,
+    ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRole, ModelTool,
+    PreparedVerificationBatch, PriorReviewContext, ProviderAdapter, RepositoryPath,
+    RepositoryRelativePath, RepositoryToolbox, ReviewBudgetBroker, ReviewBudgetUsage,
+    ReviewCallUsage, ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
+    ReviewWorkerCheckpoint, ReviewWorkerError, ReviewWorkerPhase, ReviewWorkerPlan,
+    ReviewWorkerState, Sha256Digest, UnreadHunkDisposition, WorkUnitId, prepare_verification_batch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -85,6 +85,8 @@ pub struct GroupWorkerRequest {
     /// are represented when the group spans multiple work units.
     pub work_unit_ids_by_path: BTreeMap<RepositoryPath, WorkUnitId>,
     pub assigned_paths: BTreeSet<RepositoryRelativePath>,
+    /// Exact trusted old/new provider path pairs for assigned files.
+    pub assigned_file_paths: BTreeSet<ChangedPath>,
     pub issued_anchors: BTreeSet<AnchorId>,
     pub anchor_table: AnchorTable,
     pub coverage_gate: CoverageCompletionGate,
@@ -102,6 +104,7 @@ impl fmt::Debug for GroupWorkerRequest {
             .field("system_policy", &"[redacted]")
             .field("group_id", &self.plan.group_id)
             .field("assigned_path_count", &self.assigned_paths.len())
+            .field("assigned_file_path_count", &self.assigned_file_paths.len())
             .field("work_unit_binding_count", &self.work_unit_ids_by_path.len())
             .field("issued_anchor_count", &self.issued_anchors.len())
             .field("rule_count", &self.rule_bundle.rule_count())
@@ -251,6 +254,7 @@ struct WorkerRuntime<'a> {
     started_at_millis: u64,
     candidates: Vec<CandidateForVerification>,
     delivered_evidence_ids: BTreeSet<String>,
+    delivered_anchor_ids: BTreeSet<AnchorId>,
     evidence: Vec<GroupWorkerEvidence>,
     summary: Option<GroupWorkerSummary>,
     completion: Option<GroupCompletion>,
@@ -324,6 +328,7 @@ pub async fn run_group_worker(
         started_at_millis: started_at,
         candidates: Vec::new(),
         delivered_evidence_ids: BTreeSet::new(),
+        delivered_anchor_ids: BTreeSet::new(),
         evidence: Vec::new(),
         summary: None,
         completion: None,
@@ -376,9 +381,7 @@ pub async fn run_group_worker(
                 return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Context);
             }
         };
-        if initial {
-            mark_inline_coverage(&mut runtime, &packet)?;
-        }
+        let delivers_initial_inline_diff = initial;
         initial = false;
 
         let model_request = compose_model_request(
@@ -420,8 +423,16 @@ pub async fn run_group_worker(
                 state.phase(),
                 ReviewCallUsage::conservative(reservation),
             );
-            return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Provider);
+            let reason = if cancellation.is_cancelled() {
+                GroupWorkerPartialReason::Cancelled
+            } else {
+                GroupWorkerPartialReason::Provider
+            };
+            return partial_output(&mut state, &runtime, reason);
         };
+        if delivers_initial_inline_diff {
+            register_inline_delivery(&mut runtime, &packet)?;
+        }
         let reported = (response.usage.input_tokens != 0 || response.usage.output_tokens != 0)
             .then_some(ReviewModelUsage {
                 input_tokens: response.usage.input_tokens,
@@ -542,6 +553,7 @@ fn validate_request(
         || request.initial_packet.purpose != ReviewPacketPurpose::GroupInitial
         || request.assigned_paths.is_empty()
         || request.assigned_paths.len() != request.initial_packet.group_brief.files.len()
+        || request.assigned_file_paths.len() != request.assigned_paths.len()
     {
         return Err(GroupWorkerError::GroupBinding);
     }
@@ -587,19 +599,41 @@ fn validate_request(
     {
         return Err(GroupWorkerError::CoverageBinding);
     }
+    validate_path_authority(request)
+}
+
+fn validate_path_authority(request: &GroupWorkerRequest) -> Result<(), GroupWorkerError> {
     let assigned_provider_paths = request
         .assigned_paths
         .iter()
         .map(|path| RepositoryPath::try_from(path.as_str().to_owned()))
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|_| GroupWorkerError::PathBinding)?;
+    let trusted_new_paths = request
+        .assigned_file_paths
+        .iter()
+        .map(|path| path.new_path.clone())
+        .collect::<BTreeSet<_>>();
+    if request
+        .assigned_file_paths
+        .iter()
+        .any(|path| path.semantic_issue().is_some())
+        || trusted_new_paths != assigned_provider_paths
+    {
+        return Err(GroupWorkerError::PathBinding);
+    }
+    let allowed_binding_paths = request
+        .assigned_file_paths
+        .iter()
+        .flat_map(|path| [path.old_path.clone(), path.new_path.clone()])
+        .collect::<BTreeSet<_>>();
     let mut candidate_targets = BTreeSet::new();
     for anchor_id in &request.issued_anchors {
         let anchor = request
             .anchor_table
             .resolve(anchor_id.as_str())
             .ok_or(GroupWorkerError::PathBinding)?;
-        if !assigned_provider_paths.contains(&anchor.path.new_path) {
+        if !request.assigned_file_paths.contains(&anchor.path) {
             return Err(GroupWorkerError::PathBinding);
         }
         candidate_targets.insert(match anchor.position {
@@ -608,19 +642,16 @@ fn validate_request(
             | revoot_core::AnchorPosition::Context { .. } => anchor.path.new_path.clone(),
         });
     }
-    let allowed_binding_paths = assigned_provider_paths
-        .union(&candidate_targets)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if allowed_binding_paths.iter().any(|path| {
-        request
-            .work_unit_ids_by_path
-            .get(path)
-            .is_none_or(|id| !valid_work_unit_id(id.as_str()))
-    }) || request
-        .work_unit_ids_by_path
-        .iter()
-        .any(|(path, id)| !allowed_binding_paths.contains(path) || !valid_work_unit_id(id.as_str()))
+    if !candidate_targets.is_subset(&allowed_binding_paths)
+        || allowed_binding_paths.iter().any(|path| {
+            request
+                .work_unit_ids_by_path
+                .get(path)
+                .is_none_or(|id| !valid_work_unit_id(id.as_str()))
+        })
+        || request.work_unit_ids_by_path.iter().any(|(path, id)| {
+            !allowed_binding_paths.contains(path) || !valid_work_unit_id(id.as_str())
+        })
     {
         return Err(GroupWorkerError::GroupBinding);
     }
@@ -677,16 +708,13 @@ fn mark_initial_manifest(runtime: &mut WorkerRuntime<'_>) -> Result<(), GroupWor
     Ok(())
 }
 
-fn mark_inline_coverage(
+fn register_inline_delivery(
     runtime: &mut WorkerRuntime<'_>,
     packet: &ReviewPacket,
 ) -> Result<(), GroupWorkerError> {
-    if !matches!(
-        packet.diff_context,
-        ReviewPacketDiffContext::InlineComplete { .. }
-    ) {
+    let ReviewPacketDiffContext::InlineComplete { body, sha256 } = &packet.diff_context else {
         return Ok(());
-    }
+    };
     let assigned = runtime.assigned_paths.iter().cloned().collect::<Vec<_>>();
     let manifest = runtime
         .diff_store
@@ -706,7 +734,33 @@ fn mark_inline_coverage(
             }
         }
     }
+    let evidence_id = inline_evidence_id(sha256);
+    let content = serde_json::to_string(&json!({
+        "evidence_id": evidence_id,
+        "result": {
+            "mode": "inline_complete",
+            "sha256": sha256,
+            "body": body,
+        }
+    }))
+    .map_err(|_| GroupWorkerError::ArtifactBinding)?;
+    if content.len() > MAX_TOOL_RESULT_BYTES
+        || !runtime.delivered_evidence_ids.insert(evidence_id.clone())
+    {
+        return Err(GroupWorkerError::ArtifactBinding);
+    }
+    runtime.evidence.push(GroupWorkerEvidence {
+        evidence_id,
+        content,
+    });
+    runtime
+        .delivered_anchor_ids
+        .extend(runtime.issued_anchors.iter().cloned());
     Ok(())
+}
+
+fn inline_evidence_id(sha256: &Sha256Digest) -> String {
+    format!("evidence:inline:{}", sha256.as_str())
 }
 
 fn packet_purpose(phase: ReviewWorkerPhase) -> Option<ReviewPacketPurpose> {
@@ -838,6 +892,7 @@ struct FileBriefWire<'a> {
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum DiffContextWire<'a> {
     InlineComplete {
+        evidence_id: String,
         body: &'a str,
         sha256: &'a Sha256Digest,
     },
@@ -871,20 +926,8 @@ struct ToolResultWire<'a> {
 }
 
 fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<String, ()> {
-    let purpose = match packet.purpose {
-        ReviewPacketPurpose::GroupInitial => "group_initial",
-        ReviewPacketPurpose::Planning => "planning",
-        ReviewPacketPurpose::ReviewRound { .. } => "review_round",
-        ReviewPacketPurpose::Verification => "verification",
-        ReviewPacketPurpose::Adjudication => "adjudication",
-    };
-    let worker_phase = match phase {
-        ReviewWorkerPhase::Planning => "planning",
-        ReviewWorkerPhase::Reviewing { .. } => "reviewing",
-        ReviewWorkerPhase::Verifying => "verifying",
-        ReviewWorkerPhase::Complete => "complete",
-        ReviewWorkerPhase::Partial => "partial",
-    };
+    let purpose = packet_purpose_name(packet.purpose);
+    let worker_phase = worker_phase_name(phase);
     let plan_summary = packet.plan_summary.as_ref().map(|plan| PlanSummaryWire {
         focus_area_ids: &plan.focus_area_ids,
         hunk_ids: &plan.hunk_ids,
@@ -916,7 +959,11 @@ fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<Stri
         .collect();
     let diff = match &packet.diff_context {
         ReviewPacketDiffContext::InlineComplete { body, sha256 } => {
-            DiffContextWire::InlineComplete { body, sha256 }
+            DiffContextWire::InlineComplete {
+                evidence_id: inline_evidence_id(sha256),
+                body,
+                sha256,
+            }
         }
         ReviewPacketDiffContext::ManifestOnly(manifest) => DiffContextWire::ManifestOnly {
             sha256: &manifest.complete_diff_sha256,
@@ -970,7 +1017,33 @@ fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<Stri
     .map_err(|_| ())
 }
 
+const fn packet_purpose_name(purpose: ReviewPacketPurpose) -> &'static str {
+    match purpose {
+        ReviewPacketPurpose::GroupInitial => "group_initial",
+        ReviewPacketPurpose::Planning => "planning",
+        ReviewPacketPurpose::ReviewRound { .. } => "review_round",
+        ReviewPacketPurpose::Verification => "verification",
+        ReviewPacketPurpose::Adjudication => "adjudication",
+    }
+}
+
+const fn worker_phase_name(phase: ReviewWorkerPhase) -> &'static str {
+    match phase {
+        ReviewWorkerPhase::Planning => "planning",
+        ReviewWorkerPhase::Reviewing { .. } => "reviewing",
+        ReviewWorkerPhase::Verifying => "verifying",
+        ReviewWorkerPhase::Complete => "complete",
+        ReviewWorkerPhase::Partial => "partial",
+    }
+}
+
 fn model_tools() -> Vec<ModelTool> {
+    let checkpoint = json!({"type":"object","required":["hypotheses","evidence_references","unresolved_coverage"],"properties":{"hypotheses":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}},"evidence_references":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":128}},"unresolved_coverage":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}}},"additionalProperties":false});
+    let plan_summary = json!({"type":"object","required":["focus_area_ids","hunk_ids","dependency_question_ids","risk_hypothesis_ids"],"properties":{"focus_area_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128}},"hunk_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128}},"dependency_question_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128}},"risk_hypothesis_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128}}},"additionalProperties":false});
+    let finding = json!({"type":"object","required":["anchor_id","severity","confidence_percent","category","title","explanation","evidence"],"properties":{"anchor_id":{"type":"string","maxLength":128},"severity":{"type":"string","enum":["critical","high","medium","low","info"]},"confidence_percent":{"type":"integer","minimum":0,"maximum":100},"category":{"type":"string","enum":["correctness","security","reliability","performance","maintainability"]},"title":{"type":"string","maxLength":160},"explanation":{"type":"string","maxLength":4000},"evidence":{"type":"string","maxLength":2000},"lineage_id":{"type":["string","null"],"maxLength":64},"suggested_replacement":{"type":["string","null"],"maxLength":8000}},"additionalProperties":false});
+    let candidate = json!({"type":"object","required":["candidate_id","work_unit_id","finding","evidence_references"],"properties":{"candidate_id":{"type":"string","maxLength":128},"work_unit_id":{"type":"string","maxLength":128},"finding":finding,"evidence_references":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","maxLength":128}}},"additionalProperties":false});
+    let summary = json!({"type":"object","required":["text","assumptions"],"properties":{"text":{"type":"string","maxLength":4096},"assumptions":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}}},"additionalProperties":false});
+    let disposition = json!({"type":"object","required":["path","hunk_id","disposition"],"properties":{"path":{"type":"string","maxLength":4096},"hunk_id":{"type":"string","maxLength":128},"disposition":{"type":"object","required":["kind","note"],"properties":{"kind":{"type":"string","enum":["manifest_low_risk","redundant_pattern","budget_exhausted","tool_error"]},"note":{"type":"string","maxLength":512}},"additionalProperties":false}},"additionalProperties":false});
     [
         ("diff_manifest", json!({"type":"object","properties":{},"additionalProperties":false})),
         ("read_diff", json!({"type":"object","required":["reads"],"properties":{"reads":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","required":["path","hunk_id","page"],"properties":{"path":{"type":"string"},"hunk_id":{"type":"string"},"page":{"type":"integer","minimum":1}},"additionalProperties":false}}},"additionalProperties":false})),
@@ -982,9 +1055,9 @@ fn model_tools() -> Vec<ModelTool> {
         ("show_commit_context", json!({"type":"object","required":["commit"],"properties":{"commit":{"type":"string"}},"additionalProperties":false})),
         ("get_existing_revoot_findings", json!({"type":"object","required":["cursor","max_results"],"properties":{"cursor":{"type":"integer","minimum":0},"max_results":{"type":"integer","minimum":1,"maximum":10}},"additionalProperties":false})),
         ("get_rules", json!({"type":"object","required":["rule_ids"],"properties":{"rule_ids":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string"}},"after_id":{"type":["string","null"]}},"additionalProperties":false})),
-        ("checkpoint_review", json!({"type":"object","required":["checkpoint"],"properties":{"checkpoint":{"type":"object"},"plan_summary":{"type":["object","null"]}},"additionalProperties":false})),
-        ("submit_candidate_finding", json!({"type":"object","required":["candidate"],"properties":{"candidate":{"type":"object"}},"additionalProperties":false})),
-        ("complete_group", json!({"type":"object","required":["checkpoint","summary"],"properties":{"checkpoint":{"type":"object"},"summary":{"type":"object"},"dispositions":{"type":"array","maxItems":10000}},"additionalProperties":false})),
+        ("checkpoint_review", json!({"type":"object","required":["checkpoint"],"properties":{"checkpoint":checkpoint.clone(),"plan_summary":{"anyOf":[plan_summary,{"type":"null"}]}},"additionalProperties":false})),
+        ("submit_candidate_finding", json!({"type":"object","required":["candidate"],"properties":{"candidate":candidate},"additionalProperties":false})),
+        ("complete_group", json!({"type":"object","required":["checkpoint","summary"],"properties":{"checkpoint":checkpoint,"summary":summary,"dispositions":{"type":"array","maxItems":10000,"items":disposition}},"additionalProperties":false})),
     ]
     .into_iter()
     .map(|(name, input_schema)| ModelTool {
@@ -1184,9 +1257,11 @@ fn execute_tool(
     plan: &ReviewWorkerPlan,
     runtime: &mut WorkerRuntime<'_>,
 ) -> Result<String, ToolExecutionError> {
+    if name == "read_diff" {
+        return execute_read_diff(input, runtime);
+    }
     let result = match name {
         "diff_manifest" => execute_manifest(input, runtime),
-        "read_diff" => execute_read_diff(input, runtime),
         "search_diff" => execute_search_diff(input, runtime),
         "read_file" => execute_read_file(input, runtime),
         "find_files" => execute_find_files(input, runtime),
@@ -1219,20 +1294,14 @@ fn execute_manifest(
 fn execute_read_diff(
     input: Value,
     runtime: &mut WorkerRuntime<'_>,
-) -> Result<Value, ToolExecutionError> {
+) -> Result<String, ToolExecutionError> {
     let args = strict_input::<ReadDiffArgs>(input)?;
     if args.reads.is_empty() || args.reads.len() > 32 {
         return Err(recoverable("bounds"));
     }
-    let manifests = runtime
-        .diff_store
-        .manifest(&runtime.assigned_paths.iter().cloned().collect::<Vec<_>>())
-        .map_err(|_| recoverable("artifact"))?;
-    let manifest_by_path = manifests
-        .iter()
-        .map(|file| (file.path.as_str(), file))
-        .collect::<BTreeMap<_, _>>();
     let mut pages = Vec::with_capacity(args.reads.len());
+    let mut deliveries = Vec::with_capacity(args.reads.len());
+    let mut delivered_anchor_ids = BTreeSet::new();
     for read in args.reads {
         let path = assigned_path(&read.path, runtime)?;
         let page = runtime
@@ -1241,16 +1310,7 @@ fn execute_read_diff(
             .map_err(|_| recoverable("diff_read"))?;
         let provider_path =
             RepositoryPath::try_from(path.as_str().to_owned()).map_err(|_| recoverable("path"))?;
-        runtime
-            .coverage_gate
-            .as_mut()
-            .ok_or_else(|| recoverable("coverage"))?
-            .record_hunk_page(&provider_path, &page.hunk_id, page.page)
-            .map_err(|_| recoverable("coverage"))?;
-        let hunk = manifest_by_path
-            .get(path.as_str())
-            .and_then(|file| file.hunks.iter().find(|hunk| hunk.hunk_id == page.hunk_id))
-            .ok_or_else(|| recoverable("artifact"))?;
+        deliveries.push((provider_path, page.hunk_id.clone(), page.page));
         let anchors = runtime
             .anchor_table
             .iter()
@@ -1259,8 +1319,11 @@ fn execute_read_diff(
                 anchor.path.old_path.as_str() == path.as_str()
                     || anchor.path.new_path.as_str() == path.as_str()
             })
-            .filter(|anchor| anchor_in_hunk(anchor.position, hunk))
-            .map(|anchor| json!({"anchor_id": anchor.id, "position": anchor.position}))
+            .filter(|anchor| page.positions.contains(&anchor.position))
+            .map(|anchor| {
+                delivered_anchor_ids.insert(anchor.id.clone());
+                json!({"anchor_id": anchor.id, "position": anchor.position})
+            })
             .collect::<Vec<_>>();
         pages.push(json!({
             "path": page.path,
@@ -1272,28 +1335,15 @@ fn execute_read_diff(
         }));
     }
     let value = json!({"pages": pages});
-    record_evidence(&value, runtime)?;
-    Ok(value)
-}
-
-fn anchor_in_hunk(
-    position: revoot_core::AnchorPosition,
-    hunk: &crate::diff_artifact::DiffHunkManifest,
-) -> bool {
-    match position {
-        revoot_core::AnchorPosition::Addition { new_line } => {
-            new_line >= hunk.new_start && new_line < hunk.new_start.saturating_add(hunk.new_count)
-        }
-        revoot_core::AnchorPosition::Deletion { old_line } => {
-            old_line >= hunk.old_start && old_line < hunk.old_start.saturating_add(hunk.old_count)
-        }
-        revoot_core::AnchorPosition::Context { old_line, new_line } => {
-            old_line >= hunk.old_start
-                && old_line < hunk.old_start.saturating_add(hunk.old_count)
-                && new_line >= hunk.new_start
-                && new_line < hunk.new_start.saturating_add(hunk.new_count)
-        }
-    }
+    let prepared_evidence = prepare_evidence(&value, runtime)?;
+    runtime
+        .coverage_gate
+        .as_mut()
+        .ok_or_else(|| recoverable("coverage"))?
+        .record_hunk_pages(&deliveries)
+        .map_err(|_| recoverable("coverage"))?;
+    runtime.delivered_anchor_ids.extend(delivered_anchor_ids);
+    Ok(commit_evidence(prepared_evidence, runtime))
 }
 
 fn execute_search_diff(
@@ -1321,8 +1371,7 @@ fn execute_search_diff(
         })
         .map_err(|_| recoverable("diff_search"))?;
     let value = serde_json::to_value(result).map_err(|_| recoverable("serialization"))?;
-    record_evidence(&value, runtime)?;
-    Ok(value)
+    record_evidence(&value, runtime)
 }
 
 fn execute_read_file(
@@ -1358,8 +1407,7 @@ fn execute_read_file(
         reads.push(result);
     }
     let value = serde_json::to_value(reads).map_err(|_| recoverable("serialization"))?;
-    record_evidence(&value, runtime)?;
-    Ok(value)
+    record_evidence(&value, runtime)
 }
 
 fn execute_find_files(
@@ -1431,8 +1479,7 @@ fn execute_search_code(
         )
         .map_err(|_| repository_partial(runtime))?;
     let value = serde_json::to_value(result).map_err(|_| recoverable("serialization"))?;
-    record_evidence(&value, runtime)?;
-    Ok(value)
+    record_evidence(&value, runtime)
 }
 
 fn execute_list_commits(
@@ -1452,8 +1499,7 @@ fn execute_list_commits(
         )
         .map_err(|_| repository_partial(runtime))?;
     let value = serde_json::to_value(result).map_err(|_| recoverable("serialization"))?;
-    record_evidence(&value, runtime)?;
-    Ok(value)
+    record_evidence(&value, runtime)
 }
 
 fn execute_commit_context(
@@ -1474,8 +1520,7 @@ fn execute_commit_context(
         )
         .map_err(|_| repository_partial(runtime))?;
     let value = serde_json::to_value(result).map_err(|_| recoverable("serialization"))?;
-    record_evidence(&value, runtime)?;
-    Ok(value)
+    record_evidence(&value, runtime)
 }
 
 fn execute_prior_review(
@@ -1512,8 +1557,7 @@ fn execute_prior_review(
         )
         .map_err(|_| ToolExecutionError::Partial(GroupWorkerPartialReason::Budget))?;
     runtime.prior_review_cursor = end;
-    record_evidence(&value, runtime)?;
-    Ok(value)
+    record_evidence(&value, runtime)
 }
 
 fn execute_get_rules(
@@ -1586,6 +1630,9 @@ fn execute_candidate(
         .anchor_table
         .resolve(&args.candidate.finding.anchor_id)
         .ok_or_else(|| recoverable("candidate"))?;
+    if !runtime.delivered_anchor_ids.contains(&anchor.id) {
+        return Err(recoverable("candidate_anchor_not_delivered"));
+    }
     let target_path = match anchor.position {
         revoot_core::AnchorPosition::Deletion { .. } => anchor.path.old_path.clone(),
         revoot_core::AnchorPosition::Addition { .. }
@@ -1750,21 +1797,53 @@ fn repository_search_paths(
     Ok(paths)
 }
 
-fn record_evidence(
+struct PreparedEvidence {
+    evidence_id: String,
+    delivered: Value,
+    content: String,
+}
+
+fn prepare_evidence(
     value: &Value,
-    runtime: &mut WorkerRuntime<'_>,
-) -> Result<(), ToolExecutionError> {
-    let content = serde_json::to_string(value).map_err(|_| recoverable("serialization"))?;
+    runtime: &WorkerRuntime<'_>,
+) -> Result<PreparedEvidence, ToolExecutionError> {
+    let evidence_id = format!("evidence:{:04}", runtime.tool_calls);
+    let delivered = json!({"evidence_id": evidence_id, "result": value});
+    let content = serde_json::to_string(&delivered).map_err(|_| recoverable("serialization"))?;
     if content.len() > MAX_TOOL_RESULT_BYTES {
         return Err(recoverable("result_too_large"));
     }
-    let evidence_id = format!("evidence:{:04}", runtime.tool_calls);
-    runtime.delivered_evidence_ids.insert(evidence_id.clone());
-    runtime.evidence.push(GroupWorkerEvidence {
+    Ok(PreparedEvidence {
         evidence_id,
+        delivered,
         content,
+    })
+}
+
+fn record_evidence(
+    value: &Value,
+    runtime: &mut WorkerRuntime<'_>,
+) -> Result<Value, ToolExecutionError> {
+    let prepared = prepare_evidence(value, runtime)?;
+    let delivered = prepared.delivered.clone();
+    commit_prepared_evidence(prepared, runtime);
+    Ok(delivered)
+}
+
+fn commit_prepared_evidence(prepared: PreparedEvidence, runtime: &mut WorkerRuntime<'_>) {
+    runtime
+        .delivered_evidence_ids
+        .insert(prepared.evidence_id.clone());
+    runtime.evidence.push(GroupWorkerEvidence {
+        evidence_id: prepared.evidence_id,
+        content: prepared.content,
     });
-    Ok(())
+}
+
+fn commit_evidence(prepared: PreparedEvidence, runtime: &mut WorkerRuntime<'_>) -> String {
+    let content = prepared.content.clone();
+    commit_prepared_evidence(prepared, runtime);
+    content
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1995,14 +2074,16 @@ mod tests {
         ReviewPacketPolicy, ReviewPacketTokenEstimates,
     };
     use revoot_core::{
-        FileChangeKind, FileCoverageLedger, GitSha, GroupCoverageLedger, GroupFileManifest,
-        GroupHunkManifest, HunkCoverage, LocalSnapshotIdentity, ModelResponse, ModelUsage,
-        ProviderError, ProviderFuture, RepositoryDiff, RepositoryToolLimits, ReviewEffort,
-        ReviewGroup, ReviewGroupMetrics, ReviewSnapshotIdentity, ReviewValueTier,
+        AnchorPosition, CommentableLine, FileChangeKind, FileCoverageLedger, GitSha,
+        GroupCoverageLedger, GroupFileManifest, GroupHunkManifest, HunkCoverage,
+        LocalSnapshotIdentity, ModelResponse, ModelUsage, ProviderError, ProviderFuture,
+        RepositoryDiff, RepositoryToolLimits, ReviewEffort, ReviewGroup, ReviewGroupMetrics,
+        ReviewSnapshotIdentity, ReviewValueTier,
     };
     use tempfile::TempDir;
 
     use crate::config::RepositoryReviewPolicy;
+    use crate::diff_artifact::DEFAULT_DIFF_PAGE_BYTES;
     use crate::review_group_inputs::{TrustedGroupFileInput, TrustedReviewGroupInput};
     use crate::review_rule_bundle::build_review_rule_bundle;
 
@@ -2012,6 +2093,58 @@ mod tests {
         responses: Mutex<VecDeque<ModelResponse>>,
         requests: Mutex<Vec<ModelRequest>>,
         calls: AtomicUsize,
+    }
+
+    struct FailingProvider {
+        error: ProviderError,
+        requests: Mutex<Vec<ModelRequest>>,
+    }
+
+    struct CancellationAwareProvider {
+        calls: AtomicUsize,
+    }
+
+    impl ProviderAdapter for CancellationAwareProvider {
+        fn adapter_id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _request: &'a ModelRequest,
+            cancellation: &'a CancellationToken,
+        ) -> ProviderFuture<'a> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                while !cancellation.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
+                Err(ProviderError::new(
+                    ProviderErrorKind::Cancelled,
+                    None,
+                    false,
+                ))
+            })
+        }
+    }
+
+    impl ProviderAdapter for FailingProvider {
+        fn adapter_id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn complete<'a>(
+            &'a self,
+            request: &'a ModelRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> ProviderFuture<'a> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+            let error = self.error;
+            Box::pin(async move { Err(error) })
+        }
     }
 
     impl FakeProvider {
@@ -2058,6 +2191,14 @@ mod tests {
         }
     }
 
+    struct ExpiredClock;
+
+    impl GroupWorkerClock for ExpiredClock {
+        fn now_millis(&self) -> u64 {
+            60_001
+        }
+    }
+
     struct Fixture {
         _directory: TempDir,
         toolbox: RepositoryToolbox,
@@ -2093,7 +2234,7 @@ mod tests {
         format!("wu-{}", "b".repeat(64))
     }
 
-    fn group(tier: ReviewValueTier) -> ReviewGroup {
+    fn group(tier: ReviewValueTier, diff_bytes: usize) -> ReviewGroup {
         serde_json::from_value(json!({
             "id": format!("rg-{}", "a".repeat(64)),
             "files": [{
@@ -2103,23 +2244,34 @@ mod tests {
                     "kind": "modified"
                 },
                 "tier": tier,
-                "input_bytes": DIFF.len(),
+                "input_bytes": diff_bytes,
                 "anchor_ids": [],
                 "work_unit_id": work_unit_id()
             }],
-            "input_bytes": DIFF.len(),
+            "input_bytes": diff_bytes,
             "anchor_count": 0
         }))
         .expect("group")
     }
 
-    #[allow(clippy::too_many_lines)]
     fn fixture(
         effort: ReviewEffort,
         changed_lines: u32,
         tier: ReviewValueTier,
         inline: bool,
         budget_limits: revoot_core::ReviewBudgetLimits,
+    ) -> Fixture {
+        fixture_with_diff(effort, changed_lines, tier, inline, budget_limits, DIFF)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fixture_with_diff(
+        effort: ReviewEffort,
+        changed_lines: u32,
+        tier: ReviewValueTier,
+        inline: bool,
+        budget_limits: revoot_core::ReviewBudgetLimits,
+        diff: &str,
     ) -> Fixture {
         let directory = tempfile::tempdir().expect("temporary directory");
         fs::create_dir(directory.path().join("src")).expect("src directory");
@@ -2136,7 +2288,7 @@ mod tests {
             RepositoryToolLimits::default(),
             [RepositoryDiff {
                 path: path.clone(),
-                text: DIFF.to_owned(),
+                text: diff.to_owned(),
             }],
             [
                 path.clone(),
@@ -2145,13 +2297,14 @@ mod tests {
             &cancellation,
         )
         .expect("toolbox");
-        let store = DiffArtifactStore::create([(&path, DIFF)], 32 * 1024).expect("artifact store");
+        let store = DiffArtifactStore::create([(&path, diff)], DEFAULT_DIFF_PAGE_BYTES)
+            .expect("artifact store");
         let file_manifest = store
             .manifest(std::slice::from_ref(&path))
             .expect("manifest")
             .pop()
             .expect("file manifest");
-        let group = group(tier);
+        let group = group(tier, diff.len());
         let trusted_work_unit_id = group.files[0].work_unit_id.clone();
         let trusted_group_input = TrustedReviewGroupInput {
             partition_sha256: Sha256Digest::of_bytes(b"partition"),
@@ -2214,7 +2367,7 @@ mod tests {
             unread_dispositions: BTreeMap::new(),
         }])
         .expect("coverage ledger");
-        let diff_sha = Sha256Digest::of_bytes(DIFF.as_bytes());
+        let diff_sha = Sha256Digest::of_bytes(diff.as_bytes());
         let plan_sha = Sha256Digest::of_bytes(b"group-plan");
         let initial_packet = ReviewPacketInput {
             purpose: ReviewPacketPurpose::GroupInitial,
@@ -2246,12 +2399,12 @@ mod tests {
             recent_exchange: None,
             diff_manifest: ReviewPacketDiffManifest {
                 complete_diff_sha256: diff_sha.clone(),
-                complete_diff_bytes: u64::try_from(DIFF.len()).expect("diff bytes"),
+                complete_diff_bytes: u64::try_from(diff.len()).expect("diff bytes"),
                 file_count: 1,
                 hunk_count: u32::try_from(file_manifest.hunks.len()).expect("hunk count"),
             },
             complete_diff: Some(ReviewPacketCompleteDiff::SmallComplete {
-                body: DIFF.to_owned(),
+                body: diff.to_owned(),
                 sha256: diff_sha,
             }),
             token_estimates: ReviewPacketTokenEstimates {
@@ -2266,6 +2419,7 @@ mod tests {
             initial_packet,
             work_unit_ids_by_path: BTreeMap::from([(provider_path(), trusted_work_unit_id)]),
             assigned_paths: BTreeSet::from([path]),
+            assigned_file_paths: BTreeSet::from([group.files[0].path.clone()]),
             issued_anchors: BTreeSet::new(),
             anchor_table: anchors,
             coverage_gate: CoverageCompletionGate::new(coverage, &BTreeSet::new())
@@ -2383,7 +2537,8 @@ mod tests {
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(output.provider_turns, 1);
         assert_eq!(output.tool_calls, 2);
-        assert_eq!(output.evidence.len(), 1);
+        assert_eq!(output.evidence.len(), 2);
+        assert!(provider_request_contains(&provider, 0, "evidence:inline:"));
         assert_eq!(output.coverage.files.len(), 1);
         assert_eq!(output.usage.model_requests, 1);
         assert_eq!(output.usage.tool_calls, 2);
@@ -2410,6 +2565,295 @@ mod tests {
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(output.provider_turns, 2);
         assert_eq!(provider.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn inline_diff_evidence_can_authorize_a_candidate_without_a_repeat_read() {
+        let mut fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let changed_path = fixture
+            .request
+            .assigned_file_paths
+            .iter()
+            .next()
+            .expect("assigned path")
+            .clone();
+        let anchors = AnchorTable::build(
+            snapshot(),
+            [CommentableLine {
+                path: changed_path,
+                position: AnchorPosition::addition(1).expect("position"),
+                exact_line_digest: Sha256Digest::of_bytes(b"new"),
+                context_digest: Sha256Digest::of_bytes(b"context"),
+            }],
+        )
+        .expect("anchors");
+        let anchor_id = anchors.iter().next().expect("anchor").id.clone();
+        fixture.request.anchor_table = anchors;
+        fixture.request.issued_anchors = BTreeSet::from([anchor_id.clone()]);
+        let evidence_id = inline_evidence_id(&Sha256Digest::of_bytes(DIFF.as_bytes()));
+        let provider = FakeProvider::new(vec![batched_response(vec![
+            (
+                1,
+                "submit_candidate_finding",
+                json!({"candidate": {
+                    "candidate_id": "candidate-1",
+                    "work_unit_id": work_unit_id(),
+                    "finding": {
+                        "anchor_id": anchor_id,
+                        "severity": "medium",
+                        "confidence_percent": 90,
+                        "category": "correctness",
+                        "title": "Changed behavior is incorrect",
+                        "explanation": "The new value violates the expected behavior.",
+                        "evidence": "The complete inline diff shows the changed value.",
+                        "suggested_replacement": null,
+                        "lineage_id": null
+                    },
+                    "evidence_references": [evidence_id]
+                }}),
+            ),
+            (2, "complete_group", complete_call()),
+        ])]);
+        let output = run(fixture, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        assert_eq!(output.candidates.candidates.len(), 1);
+        assert_eq!(output.evidence.len(), 1);
+        assert_eq!(output.tool_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn rebased_turns_bind_batched_ids_and_retain_only_the_latest_exchange() {
+        let fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let provider = FakeProvider::new(vec![
+            batched_response(vec![
+                (
+                    1,
+                    "read_file",
+                    json!({"reads":[{"path":"src/helper.rs","start_line":1,"end_line":1}]}),
+                ),
+                (
+                    2,
+                    "read_file",
+                    json!({"reads":[{"path":"src/lib.rs","start_line":1,"end_line":1}]}),
+                ),
+            ]),
+            tool_response(
+                3,
+                "read_file",
+                json!({"reads":[{"path":"src/helper.rs","start_line":1,"end_line":1}]}),
+            ),
+            tool_response(4, "complete_group", complete_call()),
+        ]);
+        let output = run(fixture, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+
+        let requests = provider.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request.messages.len() == 1));
+        let rendered = requests
+            .iter()
+            .map(|request| serde_json::to_string(request).expect("request JSON"))
+            .collect::<Vec<_>>();
+        assert!(!rendered[0].contains("call-1"));
+        assert!(!rendered[0].contains("call-2"));
+        assert!(rendered[1].contains("call-1"));
+        assert!(rendered[1].contains("call-2"));
+        assert!(!rendered[1].contains("call-3"));
+        assert!(!rendered[2].contains("call-1"));
+        assert!(!rendered[2].contains("call-2"));
+        assert!(rendered[2].contains("call-3"));
+        assert!(
+            rendered
+                .iter()
+                .all(|request| !request.contains("previous_response_id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_provider_tool_call_id_fails_closed_across_fresh_turns() {
+        let fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let provider = FakeProvider::new(vec![
+            tool_response(
+                1,
+                "read_file",
+                json!({"reads":[{"path":"src/helper.rs","start_line":1,"end_line":1}]}),
+            ),
+            tool_response(1, "complete_group", complete_call()),
+        ]);
+        let output = run(fixture, &provider).await;
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::ProviderContract)
+        );
+        assert_eq!(provider.calls(), 2);
+        assert_eq!(output.tool_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_and_ambiguous_usage_charge_only_the_conservative_reservation() {
+        let missing = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let missing_budget = missing.budget.clone();
+        let provider = FakeProvider::new(vec![tool_response(1, "complete_group", complete_call())]);
+        let output = run(missing, &provider).await;
+        let snapshot = missing_budget.snapshot();
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        assert_eq!(snapshot.outstanding.model_requests, 0);
+        assert_eq!(snapshot.usage.model_requests, 1);
+        assert_eq!(snapshot.usage.output_tokens, 4_096);
+        assert_eq!(output.usage.output_tokens, 4_096);
+
+        let ambiguous = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let ambiguous_budget = ambiguous.budget.clone();
+        let mut response = tool_response(1, "complete_group", complete_call());
+        response.usage = ModelUsage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cached_input_tokens: 0,
+        };
+        let provider = FakeProvider::new(vec![response]);
+        let output = run(ambiguous, &provider).await;
+        let snapshot = ambiguous_budget.snapshot();
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        assert_eq!(snapshot.outstanding.model_requests, 0);
+        assert_eq!(snapshot.usage.model_requests, 1);
+        assert_ne!(snapshot.usage.input_tokens, u64::MAX);
+        assert_eq!(snapshot.usage.output_tokens, 4_096);
+        assert_eq!(output.usage.input_tokens, snapshot.usage.input_tokens);
+        assert_eq!(output.usage.output_tokens, snapshot.usage.output_tokens);
+    }
+
+    #[tokio::test]
+    async fn response_loss_after_dispatch_is_partial_and_conservatively_settled() {
+        let fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let budget = fixture.budget.clone();
+        let provider = FailingProvider {
+            error: ProviderError::new(ProviderErrorKind::Unavailable, None, true),
+            requests: Mutex::new(Vec::new()),
+        };
+        let output = run_group_worker(
+            &provider,
+            fixture.request,
+            &fixture.toolbox,
+            &fixture.store,
+            &fixture.budget,
+            &fixture.cancellation,
+            &FixedClock,
+        )
+        .await
+        .expect("worker output");
+        let snapshot = budget.snapshot();
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Provider)
+        );
+        assert_eq!(provider.requests.lock().expect("requests").len(), 1);
+        assert_eq!(snapshot.outstanding.model_requests, 0);
+        assert_eq!(snapshot.usage.model_requests, 1);
+        assert_eq!(snapshot.usage.output_tokens, 4_096);
+        assert_eq!(output.usage.output_tokens, 4_096);
+    }
+
+    #[tokio::test]
+    async fn expired_aggregate_deadline_prevents_provider_dispatch() {
+        let limits = revoot_core::ReviewBudgetLimits {
+            max_elapsed_millis: 60_000,
+            ..generous_budget()
+        };
+        let fixture = fixture(ReviewEffort::Low, 10, ReviewValueTier::High, true, limits);
+        let provider = FakeProvider::new(Vec::new());
+        let output = run_group_worker(
+            &provider,
+            fixture.request,
+            &fixture.toolbox,
+            &fixture.store,
+            &fixture.budget,
+            &fixture.cancellation,
+            &ExpiredClock,
+        )
+        .await
+        .expect("worker output");
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Budget)
+        );
+        assert_eq!(provider.calls(), 0);
+        assert_eq!(fixture.budget.snapshot().usage.model_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_provider_dispatch_stops_cooperatively_and_settles() {
+        let fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let cancellation = fixture.cancellation.clone();
+        let budget = fixture.budget.clone();
+        let provider = CancellationAwareProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let cancel_task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancellation.cancel(revoot_core::ProviderCancellationReason::UserRequested);
+        });
+        let output = run_group_worker(
+            &provider,
+            fixture.request,
+            &fixture.toolbox,
+            &fixture.store,
+            &fixture.budget,
+            &fixture.cancellation,
+            &FixedClock,
+        )
+        .await
+        .expect("worker output");
+        cancel_task.await.expect("cancellation task");
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Cancelled)
+        );
+        assert_eq!(provider.calls.load(Ordering::Acquire), 1);
+        assert_eq!(budget.snapshot().outstanding.model_requests, 0);
+        assert_eq!(budget.snapshot().usage.model_requests, 1);
+        assert_eq!(output.usage.output_tokens, 4_096);
     }
 
     #[tokio::test]
@@ -2507,6 +2951,259 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_diff_read_exposes_evidence_id_before_completion() {
+        let fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            false,
+            generous_budget(),
+        );
+        let manifest = fixture
+            .store
+            .manifest(&[relative_path()])
+            .expect("manifest");
+        let hunk_id = manifest[0].hunks[0].hunk_id.clone();
+        let provider = FakeProvider::new(vec![
+            tool_response(
+                1,
+                "read_diff",
+                json!({"reads":[{"path":"src/lib.rs","hunk_id":hunk_id,"page":1}]}),
+            ),
+            tool_response(2, "complete_group", complete_call()),
+        ]);
+        let output = run(fixture, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        assert_eq!(output.evidence.len(), 1);
+        assert!(provider_request_contains(&provider, 1, "evidence:0001"));
+    }
+
+    #[tokio::test]
+    async fn repeated_diff_page_is_rejected_without_duplicate_evidence_or_credit() {
+        let fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            false,
+            generous_budget(),
+        );
+        let manifest = fixture
+            .store
+            .manifest(&[relative_path()])
+            .expect("manifest");
+        let hunk_id = manifest[0].hunks[0].hunk_id.clone();
+        let read = json!({"reads":[{"path":"src/lib.rs","hunk_id":hunk_id,"page":1}]});
+        let provider = FakeProvider::new(vec![
+            tool_response(1, "read_diff", read.clone()),
+            tool_response(2, "read_diff", read),
+            tool_response(3, "complete_group", complete_call()),
+        ]);
+        let output = run(fixture, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        assert_eq!(output.evidence.len(), 1);
+        assert_eq!(delivered_page_count(&output), 1);
+        assert!(provider_request_contains(&provider, 2, "coverage"));
+    }
+
+    #[tokio::test]
+    async fn oversized_hunk_wrong_page_does_not_authorize_its_other_page_anchor() {
+        let diff = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n {}\n",
+            "x".repeat(40_000)
+        );
+        let mut fixture = fixture_with_diff(
+            ReviewEffort::Low,
+            3,
+            ReviewValueTier::High,
+            false,
+            generous_budget(),
+            &diff,
+        );
+        fixture.request.initial_packet.complete_diff =
+            Some(ReviewPacketCompleteDiff::LargeManifestOnly {
+                sha256: Sha256Digest::of_bytes(diff.as_bytes()),
+                bytes: u64::try_from(diff.len()).expect("diff bytes"),
+            });
+        fixture
+            .request
+            .initial_packet
+            .token_estimates
+            .inline_request_tokens = None;
+        let changed_path = fixture
+            .request
+            .assigned_file_paths
+            .iter()
+            .next()
+            .expect("assigned path")
+            .clone();
+        let anchors = AnchorTable::build(
+            snapshot(),
+            [CommentableLine {
+                path: changed_path,
+                position: AnchorPosition::addition(1).expect("position"),
+                exact_line_digest: Sha256Digest::of_bytes(b"new"),
+                context_digest: Sha256Digest::of_bytes(b"context"),
+            }],
+        )
+        .expect("anchors");
+        let anchor_id = anchors.iter().next().expect("anchor").id.clone();
+        fixture.request.anchor_table = anchors;
+        fixture.request.issued_anchors = BTreeSet::from([anchor_id.clone()]);
+        let manifest = fixture
+            .store
+            .manifest(&[relative_path()])
+            .expect("manifest");
+        let hunk = &manifest[0].hunks[0];
+        assert!(hunk.pages > 1);
+        let wrong_page = hunk.pages;
+        let hunk_id = hunk.hunk_id.clone();
+        assert!(
+            !fixture
+                .store
+                .read_hunk_page(&relative_path(), &hunk_id, wrong_page)
+                .expect("wrong page")
+                .positions
+                .contains(&AnchorPosition::addition(1).expect("position"))
+        );
+        let candidate = json!({"candidate": {
+            "candidate_id": "candidate-wrong-page",
+            "work_unit_id": work_unit_id(),
+            "finding": {
+                "anchor_id": anchor_id,
+                "severity": "medium",
+                "confidence_percent": 90,
+                "category": "correctness",
+                "title": "Changed behavior is incorrect",
+                "explanation": "The new value violates the expected behavior.",
+                "evidence": "The cited page does not contain this line.",
+                "suggested_replacement": null,
+                "lineage_id": null
+            },
+            "evidence_references": ["evidence:0001"]
+        }});
+        let provider = FakeProvider::new(vec![
+            tool_response(
+                1,
+                "read_diff",
+                json!({"reads":[{"path":"src/lib.rs","hunk_id":hunk_id,"page":wrong_page}]}),
+            ),
+            tool_response(2, "submit_candidate_finding", candidate),
+        ]);
+        let output = run(fixture, &provider).await;
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Provider)
+        );
+        assert!(output.candidates.candidates.is_empty());
+        assert_eq!(delivered_page_count(&output), 1);
+        assert!(provider_request_contains(
+            &provider,
+            2,
+            "candidate_anchor_not_delivered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_batched_diff_read_credits_no_earlier_pages() {
+        let fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            false,
+            generous_budget(),
+        );
+        let manifest = fixture
+            .store
+            .manifest(&[relative_path()])
+            .expect("manifest");
+        let hunk_id = manifest[0].hunks[0].hunk_id.clone();
+        let provider = FakeProvider::new(vec![
+            tool_response(
+                1,
+                "read_diff",
+                json!({"reads":[
+                    {"path":"src/lib.rs","hunk_id":hunk_id,"page":1},
+                    {"path":"src/lib.rs","hunk_id":hunk_id,"page":2}
+                ]}),
+            ),
+            tool_response(2, "complete_group", complete_call()),
+        ]);
+        let output = run(fixture, &provider).await;
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Provider)
+        );
+        assert_eq!(delivered_page_count(&output), 0);
+        assert!(output.evidence.is_empty());
+        assert!(provider_request_contains(&provider, 1, "diff_read"));
+    }
+
+    #[tokio::test]
+    async fn oversized_batched_diff_result_credits_no_pages() {
+        let large_line = "x".repeat(2_048);
+        let diff = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+{large_line}\n"
+        );
+        let fixture = fixture_with_diff(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            false,
+            generous_budget(),
+            &diff,
+        );
+        let manifest = fixture
+            .store
+            .manifest(&[relative_path()])
+            .expect("manifest");
+        let hunk_id = manifest[0].hunks[0].hunk_id.clone();
+        let reads = (0..32)
+            .map(|_| json!({"path":"src/lib.rs","hunk_id":hunk_id,"page":1}))
+            .collect::<Vec<_>>();
+        let provider = FakeProvider::new(vec![
+            tool_response(1, "read_diff", json!({"reads":reads})),
+            tool_response(2, "complete_group", complete_call()),
+        ]);
+        let output = run(fixture, &provider).await;
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Provider)
+        );
+        assert_eq!(delivered_page_count(&output), 0);
+        assert!(output.evidence.is_empty());
+        assert!(provider_request_contains(&provider, 1, "result_too_large"));
+    }
+
+    #[tokio::test]
+    async fn pre_exhausted_budget_does_not_credit_inline_pages() {
+        let limits = revoot_core::ReviewBudgetLimits {
+            max_model_requests: 1,
+            ..generous_budget()
+        };
+        let fixture = fixture(ReviewEffort::Low, 10, ReviewValueTier::High, true, limits);
+        let exhausted = fixture
+            .budget
+            .reserve_model_request(
+                ReviewModelReservation {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_microusd: 1,
+                },
+                0,
+            )
+            .expect("exhausting reservation");
+        drop(exhausted);
+        let provider = FakeProvider::new(Vec::new());
+        let output = run(fixture, &provider).await;
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Budget)
+        );
+        assert_eq!(provider.calls(), 0);
+        assert_eq!(delivered_page_count(&output), 0);
+    }
+
+    #[tokio::test]
     async fn aggregate_budget_and_cancellation_return_payload_free_partial_results() {
         let limits = revoot_core::ReviewBudgetLimits {
             max_model_requests: 1,
@@ -2555,6 +3252,45 @@ mod tests {
         assert_eq!(estimate_wire_tokens(1_024), 1_024);
         assert!(estimate_wire_tokens(1_024) < MAX_REQUEST_INPUT_TOKENS);
         assert_eq!(estimate_wire_tokens(32_001), 32_001);
+    }
+
+    #[test]
+    fn anchorless_rename_accepts_only_its_exact_old_and_new_path_bindings() {
+        let mut fixture = fixture(
+            ReviewEffort::Low,
+            1,
+            ReviewValueTier::Low,
+            true,
+            generous_budget(),
+        );
+        let old_path = RepositoryPath::try_from("src/legacy.rs".to_owned()).expect("old path");
+        let new_path = provider_path();
+        let work_unit_id = fixture
+            .request
+            .work_unit_ids_by_path
+            .get(&new_path)
+            .expect("new-path binding")
+            .clone();
+        fixture.request.assigned_file_paths = BTreeSet::from([ChangedPath {
+            old_path: old_path.clone(),
+            new_path,
+            kind: FileChangeKind::Renamed,
+        }]);
+        fixture
+            .request
+            .work_unit_ids_by_path
+            .insert(old_path, work_unit_id.clone());
+        let provider = FakeProvider::new(Vec::new());
+        assert!(validate_request(&provider, &fixture.request, &fixture.store).is_ok());
+
+        fixture.request.work_unit_ids_by_path.insert(
+            RepositoryPath::try_from("src/forged.rs".to_owned()).expect("forged path"),
+            work_unit_id,
+        );
+        assert_eq!(
+            validate_request(&provider, &fixture.request, &fixture.store),
+            Err(GroupWorkerError::GroupBinding)
+        );
     }
 
     #[test]
@@ -2633,5 +3369,25 @@ mod tests {
             complete,
             ReviewPacketCompleteDiff::LargeManifestOnly { .. }
         ));
+    }
+
+    fn delivered_page_count(output: &GroupWorkerOutput) -> usize {
+        output
+            .coverage
+            .files
+            .values()
+            .flat_map(|file| &file.hunks)
+            .map(|hunk| hunk.delivered_pages.len())
+            .sum()
+    }
+
+    fn provider_request_contains(provider: &FakeProvider, index: usize, needle: &str) -> bool {
+        provider
+            .requests
+            .lock()
+            .expect("requests")
+            .get(index)
+            .and_then(|request| serde_json::to_string(request).ok())
+            .is_some_and(|request| request.contains(needle))
     }
 }
