@@ -20,6 +20,7 @@ pub mod publication;
 pub mod repository;
 pub mod review_group;
 pub mod review_history;
+pub mod review_worker;
 pub mod snapshot;
 
 pub use config::{
@@ -117,6 +118,10 @@ pub use review_group::{
 pub use review_history::{
     PriorReviewContext, PriorReviewContextError, PriorReviewDiscussion, PriorReviewReply,
     PriorReviewResolution, PriorReviewSource, PriorReviewState,
+};
+pub use review_worker::{
+    ReviewGroupMetrics, ReviewRound, ReviewWorkerCheckpoint, ReviewWorkerError, ReviewWorkerPhase,
+    ReviewWorkerPlan, ReviewWorkerState,
 };
 pub use snapshot::{
     AnchorId, AnchorPosition, AnchorTable, AnchorTableError, BlobAcquisition, BlobIdentity,
