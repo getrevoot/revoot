@@ -15,6 +15,10 @@ trap cleanup EXIT
 
 install -m 0755 "$binary" "$staging/revoot"
 install -m 0644 LICENSE "$staging/LICENSE"
+install -m 0644 THIRD_PARTY_NOTICES.md "$staging/THIRD_PARTY_NOTICES.md"
+mkdir -p "$staging/licenses"
+install -m 0644 crates/revoot/assets/review_rules/LICENSE.md \
+  "$staging/licenses/embedded-review-rules-LICENSE.md"
 mkdir -p "$staging/completions"
 install -m 0644 packaging/completions/revoot.bash "$staging/completions/revoot.bash"
 install -m 0644 packaging/completions/_revoot "$staging/completions/_revoot"
@@ -26,6 +30,7 @@ find "$staging" -mindepth 1 -exec touch -t "$timestamp" {} +
 
 tar --format=ustar --uid 0 --gid 0 --uname root --gname root --no-xattrs \
   -cf "$staging/revoot.tar" -C "$staging" \
-  revoot LICENSE \
+  revoot LICENSE THIRD_PARTY_NOTICES.md \
+  licenses/embedded-review-rules-LICENSE.md \
   completions/revoot.bash completions/_revoot completions/revoot.fish
 gzip -n -9 < "$staging/revoot.tar" > "$output"

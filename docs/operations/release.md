@@ -43,12 +43,15 @@ Before merging the release pull request, run:
 mise run verify
 mise run package:linux
 mise run package:macos
+mise run package:oci
 mise run release:checksums
 mise run sbom
 mise run install:cargo:smoke
 ```
 
-`package:macos` requires an Apple Silicon macOS host.
+`package:macos` requires an Apple Silicon macOS host. `package:oci` consumes
+the Linux release binaries and must run after `package:linux`; it builds and
+smoke-tests both non-root image architectures.
 
 For a tool-first engine release, also verify the user-facing contracts before
 promotion:

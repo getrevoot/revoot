@@ -106,8 +106,8 @@ impl PreparedScan {
             .map_err(|_| contract_error("prepared scan plan failed replay validation"))
     }
 
-    /// Hand the immutable plan and retained bodies to the future model-backed
-    /// scan engine. This module does not execute them.
+    /// Split the immutable plan and retained bodies for the shared tool-first
+    /// scan engine.
     #[must_use]
     pub fn into_execution_parts(
         self,
