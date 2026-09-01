@@ -343,6 +343,42 @@ pub fn build_review_rule_bundle(
     })
 }
 
+/// Resolve bounded guidance for one path without constructing a review group.
+///
+/// This is the shared local rule-resolution path for read-only diagnostics.
+/// Repository-authored bodies retain their explicit untrusted marker.
+pub(crate) fn resolve_path_rule_guidance(
+    path: &str,
+    policy: &RepositoryReviewPolicy,
+) -> Result<Vec<ReviewRuleGuidance>, ReviewRuleBundleError> {
+    validate_policy(policy)?;
+    let diagnostics = diagnose_rules([path.to_owned()], &diagnostic_policy(policy))
+        .map_err(|_| ReviewRuleBundleError::RuleDiagnostics)?;
+    let diagnostic = diagnostics
+        .paths
+        .into_iter()
+        .next()
+        .ok_or(ReviewRuleBundleError::RuleDiagnostics)?;
+    let repository_bodies = repository_bodies(policy);
+    diagnostic
+        .trace
+        .into_iter()
+        .filter(|trace| trace.active)
+        .flat_map(|trace| {
+            trace
+                .rule_ids
+                .into_iter()
+                .map(move |id| (trace.precedence, trace.source, id))
+        })
+        .map(|(precedence, source, id)| {
+            Ok(ReviewRuleGuidance {
+                descriptor: descriptor(&id, precedence, source),
+                guidance: guidance_for(&id, source, path, policy, &repository_bodies)?,
+            })
+        })
+        .collect()
+}
+
 fn validate_group_shape(group: &TrustedReviewGroupInput) -> Result<(), ReviewRuleBundleError> {
     if group.files.is_empty() {
         return Err(ReviewRuleBundleError::EmptyGroup);

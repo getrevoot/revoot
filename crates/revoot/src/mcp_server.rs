@@ -13,19 +13,20 @@ use revoot_core::{
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Value, json};
 
+use crate::config::{RepositoryReviewPolicy, resolve_review_configuration};
 use crate::diff_artifact::{
     DEFAULT_DIFF_PAGE_BYTES, DiffArtifactStore, DiffSearchKind, DiffSearchRequest,
 };
 use crate::local_review::{
     LocalReviewContextOptions, build_local_review_context, capture_local_git,
 };
-use crate::review_rules::resolve_embedded_rule;
+use crate::review_rule_bundle::{ReviewRuleGuidance, resolve_path_rule_guidance};
 
 static HANDLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MCP_RESULT_BYTES: usize = 32 * 1024;
@@ -41,6 +42,7 @@ struct OpenReview {
     changed_paths: Vec<RepositoryRelativePath>,
     anchor_ids: BTreeSet<String>,
     snapshot_digest: String,
+    repository_policy: RepositoryReviewPolicy,
 }
 
 pub struct RevootMcpServer {
@@ -103,6 +105,7 @@ impl RevootMcpServer {
             },
         )
         .map_err(|_| "review snapshot unavailable")?;
+        let repository_policy = repository_policy(&context.root, &context.identity.base_sha)?;
         let cancellation = CancellationToken::default();
         let toolbox = RepositoryToolbox::open_selected(
             &context.root,
@@ -158,6 +161,7 @@ impl RevootMcpServer {
                     changed_paths,
                     anchor_ids,
                     snapshot_digest: snapshot_digest.clone(),
+                    repository_policy,
                 }),
             );
         Ok(json!({"handle": handle, "snapshot": snapshot_digest}))
@@ -356,8 +360,9 @@ impl RevootMcpServer {
             }
             "revoot_get_rules" => {
                 let path = path_argument(arguments)?;
-                let rule = resolve_embedded_rule(path.as_str()).map_err(|_| "rule unavailable")?;
-                Ok(json!({"id": rule.id, "pattern": rule.pattern, "guidance": rule.guidance}))
+                let rules = resolve_path_rule_guidance(path.as_str(), &review.repository_policy)
+                    .map_err(|_| "rule unavailable")?;
+                rule_result(arguments, &path, &rules)
             }
             "revoot_validate_findings" => {
                 let value = arguments
@@ -419,9 +424,24 @@ impl RevootMcpServer {
     }
 }
 
+fn repository_policy(
+    root: &Path,
+    base: &revoot_core::GitSha,
+) -> Result<RepositoryReviewPolicy, &'static str> {
+    resolve_review_configuration(
+        root,
+        Some(base),
+        None,
+        std::iter::empty::<(std::ffi::OsString, std::ffi::OsString)>(),
+    )
+    .map(|resolved| resolved.repository)
+    .map_err(|_| "review policy unavailable")
+}
+
 impl ServerHandler for RevootMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
     }
 
     async fn list_tools(
@@ -464,7 +484,7 @@ fn tool_definitions() -> Vec<Tool> {
         ("revoot_find_files", "Find tracked allowlisted files", json!({"handle":{"type":"string"},"query":{"type":"string"},"glob":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
         ("revoot_search_code", "Search allowlisted snapshot code", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
         ("revoot_search_diff", "Search exact diff artifacts", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"kind":{"enum":["any","added","deleted","context"]},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
-        ("revoot_get_rules", "Get embedded guidance for a path", json!({"handle":{"type":"string"},"path":{"type":"string"}})),
+        ("revoot_get_rules", "Resolve effective bounded guidance for a path", json!({"handle":{"type":"string"},"path":{"type":"string"},"rule_ids":{"type":["array","null"],"minItems":1,"maxItems":32,"items":{"type":"string"}},"after_id":{"type":["string","null"]}})),
         ("revoot_validate_findings", "Validate findings against issued anchors", json!({"handle":{"type":"string"},"findings":{"type":"object"}})),
     ].into_iter().map(|(name, description, properties)| {
         let required: &[&str] = match name {
@@ -612,6 +632,104 @@ fn encoded_value_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
+fn rule_result(
+    arguments: &JsonObject,
+    path: &RepositoryRelativePath,
+    rules: &[ReviewRuleGuidance],
+) -> Result<Value, &'static str> {
+    let descriptors = rules
+        .iter()
+        .map(|rule| rule.descriptor.clone())
+        .collect::<Vec<_>>();
+    let Some(requested) = arguments.get("rule_ids") else {
+        if arguments.contains_key("after_id") {
+            return Err("invalid rule cursor");
+        }
+        let value = json!({
+            "path": path,
+            "rules": descriptors,
+            "guidance": [],
+            "next_after_id": null,
+            "truncated": false,
+        });
+        return (encoded_value_len(&value) <= MCP_RESULT_BYTES)
+            .then_some(value)
+            .ok_or("rule result exceeds limit");
+    };
+    let requested = requested.as_array().ok_or("invalid rule identifiers")?;
+    if requested.is_empty() || requested.len() > 32 {
+        return Err("invalid rule identifier count");
+    }
+    let mut requested = requested
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .ok_or("invalid rule identifier")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    requested.sort();
+    if requested.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate rule identifier");
+    }
+    let by_id = rules
+        .iter()
+        .map(|rule| (rule.descriptor.id.as_str(), rule))
+        .collect::<BTreeMap<_, _>>();
+    if requested.iter().any(|id| !by_id.contains_key(id.as_str())) {
+        return Err("unknown rule identifier");
+    }
+    let start = match arguments.get("after_id") {
+        Some(Value::String(after)) => requested
+            .iter()
+            .position(|id| id == after)
+            .map(|index| index + 1)
+            .ok_or("invalid rule cursor")?,
+        Some(Value::Null) | None => 0,
+        Some(_) => return Err("invalid rule cursor"),
+    };
+    let mut guidance = Vec::new();
+    for id in &requested[start..] {
+        let rule = by_id
+            .get(id.as_str())
+            .copied()
+            .ok_or("unknown rule identifier")?;
+        let mut candidate = guidance.clone();
+        candidate.push(rule.clone());
+        let value = json!({
+            "path": path,
+            "rules": descriptors,
+            "guidance": candidate,
+            "next_after_id": id,
+            "truncated": true,
+        });
+        if encoded_value_len(&value) > usize::try_from(MCP_PAGE_BYTES).unwrap_or(MCP_RESULT_BYTES) {
+            if guidance.is_empty() {
+                return Err("rule result exceeds limit");
+            }
+            let next_after_id = guidance
+                .last()
+                .map(|rule: &ReviewRuleGuidance| rule.descriptor.id.clone());
+            return Ok(json!({
+                "path": path,
+                "rules": descriptors,
+                "guidance": guidance,
+                "next_after_id": next_after_id,
+                "truncated": true,
+            }));
+        }
+        guidance = candidate;
+    }
+    Ok(json!({
+        "path": path,
+        "rules": descriptors,
+        "guidance": guidance,
+        "next_after_id": null,
+        "truncated": false,
+    }))
+}
+
 fn local_budget() -> Result<AgentBudget, &'static str> {
     AgentBudget::new(AgentBudgetLimits::default(), 0).map_err(|_| "tool budget unavailable")
 }
@@ -638,7 +756,203 @@ pub fn serve_stdio(_root: &Path) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::{Command, Stdio};
+
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf};
+
     use super::*;
+
+    struct ProtocolHarness {
+        reader: Lines<BufReader<ReadHalf<tokio::io::DuplexStream>>>,
+        writer: WriteHalf<tokio::io::DuplexStream>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ProtocolHarness {
+        async fn start() -> Self {
+            let (server_transport, client_transport) = tokio::io::duplex(256 * 1024);
+            let server = tokio::spawn(async move {
+                let service = RevootMcpServer::new()
+                    .expect("server")
+                    .serve(server_transport)
+                    .await
+                    .expect("serve");
+                let _ = service.waiting().await;
+            });
+            let (reader, writer) = tokio::io::split(client_transport);
+            let mut harness = Self {
+                reader: BufReader::new(reader).lines(),
+                writer,
+                server,
+            };
+            harness
+                .send(json!({
+                    "jsonrpc":"2.0",
+                    "id":1,
+                    "method":"initialize",
+                    "params":{
+                        "protocolVersion":"2026-07-28",
+                        "capabilities":{},
+                        "clientInfo":{"name":"revoot-test","version":"1"}
+                    }
+                }))
+                .await;
+            let initialized = harness.receive().await;
+            assert_eq!(initialized["id"], 1);
+            assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+            assert_eq!(initialized["result"]["capabilities"]["tools"], json!({}));
+            harness
+                .send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+                .await;
+            harness
+        }
+
+        async fn start_discover() -> Self {
+            let (server_transport, client_transport) = tokio::io::duplex(256 * 1024);
+            let server = tokio::spawn(async move {
+                let service = RevootMcpServer::new()
+                    .expect("server")
+                    .serve(server_transport)
+                    .await
+                    .expect("serve");
+                let _ = service.waiting().await;
+            });
+            let (reader, writer) = tokio::io::split(client_transport);
+            let mut harness = Self {
+                reader: BufReader::new(reader).lines(),
+                writer,
+                server,
+            };
+            harness
+                .send(json!({
+                    "jsonrpc":"2.0",
+                    "id":1,
+                    "method":"server/discover",
+                    "params":{
+                        "_meta":{
+                            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                            "io.modelcontextprotocol/clientInfo":{
+                                "name":"revoot-test",
+                                "version":"1"
+                            },
+                            "io.modelcontextprotocol/clientCapabilities":{}
+                        }
+                    }
+                }))
+                .await;
+            let discovered = harness.receive().await;
+            assert_eq!(discovered["id"], 1);
+            assert!(
+                discovered["result"]["supportedVersions"]
+                    .as_array()
+                    .expect("supported versions")
+                    .iter()
+                    .any(|version| version == "2026-07-28")
+            );
+            harness
+        }
+
+        async fn request(&mut self, id: u64, method: &str, mut params: Value) -> Value {
+            params.as_object_mut().expect("request params").insert(
+                "_meta".to_owned(),
+                json!({
+                    "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{}
+                }),
+            );
+            self.send(json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "method":method,
+                "params":params,
+            }))
+            .await;
+            let response = self.receive().await;
+            assert_eq!(response["id"], id);
+            response
+        }
+
+        async fn send(&mut self, value: Value) {
+            let mut encoded = serde_json::to_vec(&value).expect("protocol JSON");
+            encoded.push(b'\n');
+            self.writer
+                .write_all(&encoded)
+                .await
+                .expect("protocol write");
+            self.writer.flush().await.expect("protocol flush");
+        }
+
+        async fn receive(&mut self) -> Value {
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.reader.next_line())
+                    .await
+                    .expect("protocol response timeout")
+                    .expect("protocol read")
+                    .expect("protocol closed");
+            serde_json::from_str(&line).expect("stdout contains protocol JSON only")
+        }
+    }
+
+    impl Drop for ProtocolHarness {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    struct RepositoryFixture(TempDir);
+
+    impl RepositoryFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("repository");
+            fs::create_dir(directory.path().join("src")).expect("source directory");
+            git(directory.path(), &["init", "-b", "main"]);
+            git(
+                directory.path(),
+                &["config", "user.email", "revoot@example.invalid"],
+            );
+            git(directory.path(), &["config", "user.name", "Revoot Test"]);
+            git(directory.path(), &["config", "commit.gpgsign", "false"]);
+            fs::write(
+                directory.path().join("src/lib.rs"),
+                "pub fn value() -> u32 { 1 }\n",
+            )
+            .expect("base source");
+            fs::write(
+                directory.path().join(".revoot.toml"),
+                "version = 1\n[repository]\nguidance = \"BASE_GUIDANCE_SENTINEL\"\n[[rules]]\npaths = [\"**/*.rs\"]\nfocus = [\"correctness\"]\nguidance = \"REPOSITORY_RULE_SENTINEL\"\n",
+            )
+            .expect("base policy");
+            git(directory.path(), &["add", "."]);
+            git(directory.path(), &["commit", "-m", "base"]);
+            git(directory.path(), &["checkout", "-b", "feature"]);
+            fs::write(
+                directory.path().join("src/lib.rs"),
+                "pub fn value() -> u32 { 2 }\n",
+            )
+            .expect("feature source");
+            Self(directory)
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    fn git(root: &Path, arguments: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(arguments)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("Git fixture")
+                .success()
+        );
+    }
 
     #[test]
     fn exposes_only_the_closed_read_only_surface() {
@@ -750,6 +1064,180 @@ mod tests {
         assert_eq!(
             file_read_arguments(ambiguous_file.as_object().expect("file arguments")),
             Err("ambiguous file read arguments")
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_negotiates_lists_tools_and_rejects_unknown_handles_cleanly() {
+        let mut harness = ProtocolHarness::start().await;
+        let listed = harness.request(2, "tools/list", json!({})).await;
+        let tools = listed["result"]["tools"].as_array().expect("listed tools");
+        assert_eq!(tools.len(), 9);
+        assert!(tools.iter().any(|tool| tool["name"] == "revoot_get_rules"));
+
+        let unknown = harness
+            .request(
+                3,
+                "tools/call",
+                json!({
+                    "name":"revoot_list_changed_files",
+                    "arguments":{"handle":"unknown-handle"}
+                }),
+            )
+            .await;
+        assert_eq!(unknown["result"]["isError"], true);
+        assert!(
+            unknown["result"]["content"][0]["text"]
+                .as_str()
+                .expect("error text")
+                .contains("stale or unknown review handle")
+        );
+        assert!(encoded_value_len(&unknown["result"]) <= MCP_RESULT_BYTES);
+
+        harness
+            .send(json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/cancelled",
+                "params":{"requestId":999,"reason":"test cancellation"}
+            }))
+            .await;
+        let after_cancellation = harness.request(4, "tools/list", json!({})).await;
+        assert_eq!(after_cancellation["id"], 4);
+    }
+
+    #[tokio::test]
+    async fn protocol_supports_stateless_discovery_for_2026_clients() {
+        let mut harness = ProtocolHarness::start_discover().await;
+        let listed = harness.request(2, "tools/list", json!({})).await;
+        assert_eq!(
+            listed["result"]["tools"]
+                .as_array()
+                .expect("listed tools")
+                .len(),
+            9
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one protocol session demonstrates handle freshness and effective rule reads"
+    )]
+    async fn protocol_calls_are_bounded_snapshot_bound_and_rules_are_effective() {
+        let fixture = RepositoryFixture::new();
+        let mut harness = ProtocolHarness::start().await;
+        let opened = harness
+            .request(
+                10,
+                "tools/call",
+                json!({
+                    "name":"revoot_open_review",
+                    "arguments":{
+                        "repository_root":fixture.path(),
+                        "base":"main"
+                    }
+                }),
+            )
+            .await;
+        assert_ne!(opened["result"]["isError"], true, "{opened}");
+        let handle = opened["result"]["structuredContent"]["handle"]
+            .as_str()
+            .expect("review handle")
+            .to_owned();
+
+        let changed = harness
+            .request(
+                11,
+                "tools/call",
+                json!({
+                    "name":"revoot_list_changed_files",
+                    "arguments":{
+                        "handle":handle,
+                        "max_result_bytes":1024,
+                        "max_matches":10
+                    }
+                }),
+            )
+            .await;
+        assert_ne!(changed["result"]["isError"], true);
+        assert!(encoded_value_len(&changed["result"]["structuredContent"]) <= 1024);
+
+        let metadata = harness
+            .request(
+                12,
+                "tools/call",
+                json!({
+                    "name":"revoot_get_rules",
+                    "arguments":{"handle":handle,"path":"src/lib.rs"}
+                }),
+            )
+            .await;
+        let rule_metadata = &metadata["result"]["structuredContent"];
+        let rule_ids = rule_metadata["rules"]
+            .as_array()
+            .expect("rule metadata")
+            .iter()
+            .map(|rule| rule["id"].as_str().expect("rule ID").to_owned())
+            .collect::<Vec<_>>();
+        for expected in [
+            "compiled:safety-invariants",
+            "base:repository-guidance",
+            "repository:rule-000",
+            "rust.md",
+            "generic:review",
+        ] {
+            assert!(rule_ids.iter().any(|id| id == expected));
+        }
+        assert_eq!(rule_metadata["guidance"], json!([]));
+
+        let guidance = harness
+            .request(
+                13,
+                "tools/call",
+                json!({
+                    "name":"revoot_get_rules",
+                    "arguments":{
+                        "handle":handle,
+                        "path":"src/lib.rs",
+                        "rule_ids":["base:repository-guidance","repository:rule-000"]
+                    }
+                }),
+            )
+            .await;
+        let guidance = &guidance["result"]["structuredContent"];
+        assert!(encoded_value_len(guidance) <= MCP_RESULT_BYTES);
+        assert!(
+            guidance["guidance"]
+                .as_array()
+                .expect("guidance")
+                .iter()
+                .all(|rule| rule["descriptor"]["untrusted_repository_data"] == true)
+        );
+        let guidance_text = serde_json::to_string(guidance).expect("guidance JSON");
+        assert!(guidance_text.contains("BASE_GUIDANCE_SENTINEL"));
+        assert!(guidance_text.contains("REPOSITORY_RULE_SENTINEL"));
+
+        fs::write(
+            fixture.path().join("src/lib.rs"),
+            "pub fn value() -> u32 { 3 }\n",
+        )
+        .expect("stale mutation");
+        let stale = harness
+            .request(
+                14,
+                "tools/call",
+                json!({
+                    "name":"revoot_list_changed_files",
+                    "arguments":{"handle":handle}
+                }),
+            )
+            .await;
+        assert_eq!(stale["result"]["isError"], true);
+        assert!(
+            stale["result"]["content"][0]["text"]
+                .as_str()
+                .expect("stale error")
+                .contains("stale or unknown review handle")
         );
     }
 }
