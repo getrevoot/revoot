@@ -119,6 +119,11 @@ impl ReviewRuleBundle {
         self.rules.len()
     }
 
+    /// Iterate the exact lexical rule identifiers bound to this group.
+    pub fn rule_ids(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.rules.keys().map(String::as_str)
+    }
+
     /// Return body-free, precedence-ordered rule metadata for an assigned path.
     #[must_use]
     pub fn rules_for_path(&self, path: &RepositoryPath) -> Option<&[ReviewRuleDescriptor]> {

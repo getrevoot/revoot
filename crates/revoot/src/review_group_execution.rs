@@ -23,6 +23,7 @@ use crate::group_worker_engine::{
     GroupWorkerRequest, GroupWorkerStatus, GroupWorkerSummary, run_group_worker,
 };
 use crate::review_group_packet::PreparedReviewGroupPacket;
+use crate::review_rule_bundle::ReviewRuleBundle;
 use crate::review_verifier::{
     PartialVerifierSuppression, ReviewVerifierClock, ReviewVerifierConfig,
     ReviewVerifierFailureReason, ReviewVerifierOutcome, VerifierEvidence, run_review_verifier,
@@ -32,6 +33,7 @@ use crate::review_verifier::{
 pub struct PreparedReviewGroupExecution {
     pub group_id: ReviewGroupId,
     pub packet: PreparedReviewGroupPacket,
+    pub rule_bundle: ReviewRuleBundle,
     pub prior_review: revoot_core::PriorReviewContext,
 }
 
@@ -40,6 +42,7 @@ impl fmt::Debug for PreparedReviewGroupExecution {
         formatter
             .debug_struct("PreparedReviewGroupExecution")
             .field("group_id", &self.group_id)
+            .field("rule_count", &self.rule_bundle.rule_count())
             .field("prior_review_count", &self.prior_review.discussions().len())
             .finish_non_exhaustive()
     }
@@ -124,6 +127,7 @@ impl From<GroupRuntimeError> for ReviewGroupExecutionError {
 
 struct GroupTaskInput {
     packet: PreparedReviewGroupPacket,
+    rule_bundle: ReviewRuleBundle,
     prior_review: revoot_core::PriorReviewContext,
 }
 
@@ -264,6 +268,7 @@ fn validate_prepared(
                 item.group_id,
                 GroupTaskInput {
                     packet: item.packet,
+                    rule_bundle: item.rule_bundle,
                     prior_review: item.prior_review,
                 },
             )
@@ -298,6 +303,7 @@ fn worker_request(
         issued_anchors: packet.issued_anchors,
         anchor_table: packet.anchor_table,
         coverage_gate: packet.coverage_gate,
+        rule_bundle: input.rule_bundle,
         history,
         prior_review: input.prior_review,
         limits: config.worker_limits.clone(),
@@ -516,8 +522,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Barrier;
 
+    use crate::config::RepositoryReviewPolicy;
     use crate::review_group_inputs::{derive_review_group_inputs, derive_selected_review_inputs};
     use crate::review_group_packet::{ReviewGroupPacketBindings, prepare_review_group_packet};
+    use crate::review_rule_bundle::build_review_rule_bundle;
     use crate::rule_diagnostics::RuleDiagnosticPolicy;
 
     use super::*;
@@ -702,6 +710,9 @@ mod tests {
         let prepared = group_inputs
             .into_iter()
             .map(|input| {
+                let rule_bundle =
+                    build_review_rule_bundle(&input, &RepositoryReviewPolicy::default())
+                        .expect("rule bundle");
                 let bindings = ReviewGroupPacketBindings {
                     snapshot: snapshot.clone(),
                     snapshot_sha256: snapshot_sha256.clone(),
@@ -722,6 +733,7 @@ mod tests {
                 PreparedReviewGroupExecution {
                     group_id: input.group.id,
                     packet,
+                    rule_bundle,
                     prior_review: revoot_core::PriorReviewContext::default(),
                 }
             })

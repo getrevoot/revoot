@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use crate::diff_artifact::{DiffArtifactStore, DiffSearchKind, DiffSearchRequest};
 use crate::git_history::GitHistoryToolbox;
+use crate::review_rule_bundle::ReviewRuleBundle;
 
 #[cfg(test)]
 use crate::diff_artifact::MAX_INLINE_GROUP_DIFF_BYTES;
@@ -86,6 +87,7 @@ pub struct GroupWorkerRequest {
     pub issued_anchors: BTreeSet<AnchorId>,
     pub anchor_table: AnchorTable,
     pub coverage_gate: CoverageCompletionGate,
+    pub rule_bundle: ReviewRuleBundle,
     pub history: Option<Arc<GitHistoryToolbox>>,
     pub prior_review: PriorReviewContext,
     pub limits: GroupWorkerLimits,
@@ -101,6 +103,7 @@ impl fmt::Debug for GroupWorkerRequest {
             .field("assigned_path_count", &self.assigned_paths.len())
             .field("work_unit_binding_count", &self.work_unit_ids_by_path.len())
             .field("issued_anchor_count", &self.issued_anchors.len())
+            .field("rule_count", &self.rule_bundle.rule_count())
             .field("history_available", &self.history.is_some())
             .field("prior_review_count", &self.prior_review.discussions().len())
             .field("limits", &self.limits)
@@ -229,6 +232,7 @@ struct WorkerRuntime<'a> {
     clock: &'a dyn GroupWorkerClock,
     history: Option<&'a GitHistoryToolbox>,
     prior_review: &'a PriorReviewContext,
+    rule_bundle: &'a ReviewRuleBundle,
     prior_review_cursor: usize,
     local_budget: AgentBudget,
     coverage_gate: Option<CoverageCompletionGate>,
@@ -300,6 +304,7 @@ pub async fn run_group_worker(
         clock,
         history: request.history.as_deref(),
         prior_review: &request.prior_review,
+        rule_bundle: &request.rule_bundle,
         prior_review_cursor: 0,
         local_budget,
         coverage_gate: Some(request.coverage_gate),
@@ -516,12 +521,14 @@ fn validate_request(
         return Err(GroupWorkerError::Configuration);
     }
     if request.plan.group_id != request.initial_packet.group_brief.group_id
+        || request.rule_bundle.group_id().as_str() != request.plan.group_id
         || request.initial_packet.purpose != ReviewPacketPurpose::GroupInitial
         || request.assigned_paths.is_empty()
         || request.assigned_paths.len() != request.initial_packet.group_brief.files.len()
     {
         return Err(GroupWorkerError::GroupBinding);
     }
+    validate_rule_bundle_binding(request)?;
     let brief_paths = request
         .initial_packet
         .group_brief
@@ -597,6 +604,23 @@ fn validate_request(
         .work_unit_ids_by_path
         .iter()
         .any(|(path, id)| !allowed_binding_paths.contains(path) || !valid_work_unit_id(id.as_str()))
+    {
+        return Err(GroupWorkerError::GroupBinding);
+    }
+    Ok(())
+}
+
+fn validate_rule_bundle_binding(request: &GroupWorkerRequest) -> Result<(), GroupWorkerError> {
+    let packet_rule_ids = request
+        .initial_packet
+        .policy
+        .rule_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let bundle_rule_ids = request.rule_bundle.rule_ids().collect::<BTreeSet<_>>();
+    if packet_rule_ids.len() != request.initial_packet.policy.rule_ids.len()
+        || packet_rule_ids != bundle_rule_ids
     {
         return Err(GroupWorkerError::GroupBinding);
     }
@@ -927,6 +951,7 @@ fn model_tools() -> Vec<ModelTool> {
         ("list_change_commits", json!({"type":"object","required":["max_results"],"properties":{"max_results":{"type":"integer","minimum":1,"maximum":256}},"additionalProperties":false})),
         ("show_commit_context", json!({"type":"object","required":["commit"],"properties":{"commit":{"type":"string"}},"additionalProperties":false})),
         ("get_existing_revoot_findings", json!({"type":"object","required":["cursor","max_results"],"properties":{"cursor":{"type":"integer","minimum":0},"max_results":{"type":"integer","minimum":1,"maximum":10}},"additionalProperties":false})),
+        ("get_rules", json!({"type":"object","required":["rule_ids"],"properties":{"rule_ids":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string"}},"after_id":{"type":["string","null"]}},"additionalProperties":false})),
         ("checkpoint_review", json!({"type":"object","required":["checkpoint"],"properties":{"checkpoint":{"type":"object"},"plan_summary":{"type":["object","null"]}},"additionalProperties":false})),
         ("submit_candidate_finding", json!({"type":"object","required":["candidate"],"properties":{"candidate":{"type":"object"}},"additionalProperties":false})),
         ("complete_group", json!({"type":"object","required":["checkpoint","summary"],"properties":{"checkpoint":{"type":"object"},"summary":{"type":"object"},"dispositions":{"type":"array","maxItems":10000}},"additionalProperties":false})),
@@ -1056,6 +1081,14 @@ struct PriorReviewArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GetRulesArgs {
+    rule_ids: Vec<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CheckpointArgs {
     checkpoint: ReviewWorkerCheckpoint,
     #[serde(default)]
@@ -1131,6 +1164,7 @@ fn execute_tool(
         "list_change_commits" => execute_list_commits(input, runtime),
         "show_commit_context" => execute_commit_context(input, runtime),
         "get_existing_revoot_findings" => execute_prior_review(input, runtime),
+        "get_rules" => execute_get_rules(input, runtime),
         "checkpoint_review" => execute_checkpoint(input, state, plan, runtime),
         "submit_candidate_finding" => execute_candidate(input, runtime),
         "complete_group" => execute_complete(input, state, plan, runtime),
@@ -1450,6 +1484,22 @@ fn execute_prior_review(
     runtime.prior_review_cursor = end;
     record_evidence(&value, runtime)?;
     Ok(value)
+}
+
+fn execute_get_rules(
+    input: Value,
+    runtime: &mut WorkerRuntime<'_>,
+) -> Result<Value, ToolExecutionError> {
+    let args = strict_input::<GetRulesArgs>(input)?;
+    let page = runtime
+        .rule_bundle
+        .read_rules(&args.rule_ids, args.after_id.as_deref())
+        .map_err(|_| recoverable("rules"))?;
+    runtime
+        .local_budget
+        .charge_tool(1, 0, 0, runtime.clock.now_millis())
+        .map_err(|_| ToolExecutionError::Partial(GroupWorkerPartialReason::Budget))?;
+    serde_json::to_value(page).map_err(|_| recoverable("serialization"))
 }
 
 fn execute_checkpoint(
@@ -1885,17 +1935,22 @@ mod tests {
         ReviewPacketPolicy, ReviewPacketTokenEstimates,
     };
     use revoot_core::{
-        FileCoverageLedger, GitSha, GroupCoverageLedger, HunkCoverage, LocalSnapshotIdentity,
-        ModelResponse, ModelUsage, ProviderError, ProviderFuture, RepositoryDiff,
-        RepositoryToolLimits, ReviewEffort, ReviewGroup, ReviewGroupMetrics,
-        ReviewSnapshotIdentity, ReviewValueTier,
+        FileChangeKind, FileCoverageLedger, GitSha, GroupCoverageLedger, GroupFileManifest,
+        GroupHunkManifest, HunkCoverage, LocalSnapshotIdentity, ModelResponse, ModelUsage,
+        ProviderError, ProviderFuture, RepositoryDiff, RepositoryToolLimits, ReviewEffort,
+        ReviewGroup, ReviewGroupMetrics, ReviewSnapshotIdentity, ReviewValueTier,
     };
     use tempfile::TempDir;
+
+    use crate::config::RepositoryReviewPolicy;
+    use crate::review_group_inputs::{TrustedGroupFileInput, TrustedReviewGroupInput};
+    use crate::review_rule_bundle::build_review_rule_bundle;
 
     const DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
 
     struct FakeProvider {
         responses: Mutex<VecDeque<ModelResponse>>,
+        requests: Mutex<Vec<ModelRequest>>,
         calls: AtomicUsize,
     }
 
@@ -1903,6 +1958,7 @@ mod tests {
         fn new(responses: Vec<ModelResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
             }
         }
@@ -1919,10 +1975,14 @@ mod tests {
 
         fn complete<'a>(
             &'a self,
-            _request: &'a ModelRequest,
+            request: &'a ModelRequest,
             _cancellation: &'a CancellationToken,
         ) -> ProviderFuture<'a> {
             self.calls.fetch_add(1, Ordering::AcqRel);
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
             let response = self.responses.lock().expect("responses").pop_front();
             Box::pin(async move {
                 response.ok_or_else(|| ProviderError::new(ProviderErrorKind::Protocol, None, false))
@@ -2033,6 +2093,43 @@ mod tests {
             .expect("file manifest");
         let group = group(tier);
         let trusted_work_unit_id = group.files[0].work_unit_id.clone();
+        let trusted_group_input = TrustedReviewGroupInput {
+            partition_sha256: Sha256Digest::of_bytes(b"partition"),
+            group_plan_sha256: Sha256Digest::of_bytes(b"group-plan"),
+            selected_input_sha256: Sha256Digest::of_bytes(b"selected-input"),
+            group: group.clone(),
+            file_count: 1,
+            exact_diff_bytes: file_manifest.size_bytes,
+            changed_line_count: changed_lines,
+            hunk_count: u32::try_from(file_manifest.hunks.len()).expect("hunk count"),
+            files: vec![TrustedGroupFileInput {
+                artifact_sha256: file_manifest.sha256.clone(),
+                work_unit_id: trusted_work_unit_id.clone(),
+                rule_ids: vec![
+                    "compiled:safety-invariants".to_owned(),
+                    "generic:review".to_owned(),
+                    "rust.md".to_owned(),
+                ],
+                manifest: GroupFileManifest {
+                    path: provider_path(),
+                    status: FileChangeKind::Modified,
+                    exact_diff_bytes: file_manifest.size_bytes,
+                    metadata_only: false,
+                    hunks: file_manifest
+                        .hunks
+                        .iter()
+                        .map(|hunk| GroupHunkManifest {
+                            hunk_id: hunk.hunk_id.clone(),
+                            changed_lines: hunk.changed_lines,
+                            pages: hunk.pages,
+                        })
+                        .collect(),
+                },
+            }],
+        };
+        let rule_bundle =
+            build_review_rule_bundle(&trusted_group_input, &RepositoryReviewPolicy::default())
+                .expect("rule bundle");
         let metrics = ReviewGroupMetrics {
             changed_lines_by_path: BTreeMap::from([(provider_path(), changed_lines)]),
         };
@@ -2080,7 +2177,7 @@ mod tests {
             policy: ReviewPacketPolicy {
                 system_policy_id: "policy-v1".to_owned(),
                 system_policy_sha256: Sha256Digest::of_bytes(b"policy"),
-                rule_ids: vec!["generic:review".to_owned()],
+                rule_ids: rule_bundle.rule_ids().map(str::to_owned).collect(),
             },
             checkpoint: ReviewWorkerCheckpoint::default(),
             plan_summary: None,
@@ -2113,6 +2210,7 @@ mod tests {
             anchor_table: anchors,
             coverage_gate: CoverageCompletionGate::new(coverage, &BTreeSet::new())
                 .expect("coverage gate"),
+            rule_bundle,
             history: None,
             prior_review: PriorReviewContext::default(),
             limits: GroupWorkerLimits::default(),
@@ -2255,6 +2353,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rule_guidance_is_ids_only_initially_and_delivered_once_by_tool() {
+        let budgeted = fixture(
+            ReviewEffort::Medium,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let provider = FakeProvider::new(vec![
+            tool_response(1, "get_rules", json!({"rule_ids":["generic:review"]})),
+            tool_response(2, "checkpoint_review", checkpoint_call(false)),
+            tool_response(3, "complete_group", complete_call()),
+        ]);
+        let output = run(budgeted, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        assert_eq!(output.tool_calls, 3);
+        assert_eq!(output.usage.tool_calls, 3);
+
+        let requests = provider.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 3);
+        let rendered = requests
+            .iter()
+            .map(|request| serde_json::to_string(request).expect("request JSON"))
+            .collect::<Vec<_>>();
+        let guidance_marker = "Test files are normal reviewable code";
+        assert!(rendered[0].contains("generic:review"));
+        assert!(!rendered[0].contains(guidance_marker));
+        assert_eq!(rendered[1].matches(guidance_marker).count(), 1);
+        assert!(!rendered[2].contains(guidance_marker));
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|request| request.matches(guidance_marker).count())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn complex_high_effort_plans_then_runs_three_rounds_under_shared_budget() {
         let limits = revoot_core::ReviewBudgetLimits {
             max_model_requests: 4,
@@ -2377,6 +2514,7 @@ mod tests {
                 "list_change_commits",
                 "show_commit_context",
                 "get_existing_revoot_findings",
+                "get_rules",
                 "checkpoint_review",
                 "submit_candidate_finding",
                 "complete_group",
