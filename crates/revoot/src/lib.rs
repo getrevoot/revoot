@@ -24,6 +24,7 @@ pub mod gitlab_snapshot;
 pub mod gitlab_transport;
 pub mod group_runtime;
 pub mod group_scheduler;
+pub mod group_worker_engine;
 pub mod grouping;
 pub mod local_review;
 pub mod mcp_server;
