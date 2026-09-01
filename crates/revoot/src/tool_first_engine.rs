@@ -144,6 +144,11 @@ pub enum ToolFirstEngineError {
     Preparation(ReviewPreparationError),
     Execution(ReviewGroupExecutionError),
     ExecutionAccounting,
+    CandidateAccounting,
+    GroupAccounting,
+    LineageAccounting,
+    CoverageAccounting,
+    BudgetAccounting,
     Adjudication(ReviewAdjudicatorError),
     Reduction(ReviewResultReducerError),
 }
@@ -156,6 +161,11 @@ impl fmt::Display for ToolFirstEngineError {
             Self::Preparation(_) => "tool-first review preparation failed",
             Self::Execution(_) => "tool-first review group execution failed",
             Self::ExecutionAccounting => "tool-first review execution accounting is invalid",
+            Self::CandidateAccounting => "tool-first candidate accounting is invalid",
+            Self::GroupAccounting => "tool-first group accounting is invalid",
+            Self::LineageAccounting => "tool-first lineage accounting is invalid",
+            Self::CoverageAccounting => "tool-first coverage accounting is invalid",
+            Self::BudgetAccounting => "tool-first phase budget accounting is invalid",
             Self::Adjudication(_) => "tool-first review adjudication failed",
             Self::Reduction(_) => "tool-first review reduction failed",
         })
@@ -284,16 +294,20 @@ where
     )
     .await
     .map_err(ToolFirstEngineError::Execution)?;
-    let verified = verified_candidates(&execution.groups)?;
-    let verification_suppressions = verification_suppression_count(&execution.groups)?;
-    let mut group_accounting = group_accounting(&execution, initial_coverage)?;
+    let verified = verified_candidates(&execution.groups)
+        .map_err(|_| ToolFirstEngineError::CandidateAccounting)?;
+    let verification_suppressions = verification_suppression_count(&execution.groups)
+        .map_err(|_| ToolFirstEngineError::CandidateAccounting)?;
+    let mut group_accounting = group_accounting(&execution, initial_coverage)
+        .map_err(|_| ToolFirstEngineError::GroupAccounting)?;
     let adjudication_context = adjudication_context(
         &execution,
         &group_accounting,
         &request.partition,
         &request.prior_review,
         request.budget.snapshot().usage,
-    )?;
+    )
+    .map_err(|_| ToolFirstEngineError::GroupAccounting)?;
     let adjudication = run_review_adjudicator(
         request.provider.as_ref(),
         &request.limits.adjudicator,
@@ -315,8 +329,10 @@ where
             && !adjudication_context.coverage.partial
             && request.initial_omissions.is_empty(),
         adjudication.lineage_response.clone(),
-    )?;
-    attach_lineage_authorizations(&mut group_accounting, lineage_authorizations)?;
+    )
+    .map_err(|_| ToolFirstEngineError::LineageAccounting)?;
+    attach_lineage_authorizations(&mut group_accounting, lineage_authorizations)
+        .map_err(|_| ToolFirstEngineError::LineageAccounting)?;
     let mut ordered_group_coverage = execution
         .groups
         .iter()
@@ -327,7 +343,7 @@ where
         .windows(2)
         .any(|pair| pair[0].0 == pair[1].0)
     {
-        return Err(ToolFirstEngineError::ExecutionAccounting);
+        return Err(ToolFirstEngineError::CoverageAccounting);
     }
     let group_coverage = ordered_group_coverage
         .into_iter()
@@ -348,7 +364,7 @@ where
     .map_err(ToolFirstEngineError::Reduction)?;
     let budget_snapshot = request.budget.snapshot();
     if budget_snapshot.outstanding != revoot_core::OutstandingReviewReservations::default() {
-        return Err(ToolFirstEngineError::ExecutionAccounting);
+        return Err(ToolFirstEngineError::BudgetAccounting);
     }
     let budget_usage = budget_snapshot.usage;
     let phase_usage = ordered_phase_usage(
@@ -358,8 +374,10 @@ where
         execution.phase_usage.verification,
         adjudication.usage,
     );
-    reconcile_phase_usage(&phase_usage, budget_usage)?;
-    apply_aggregate_usage(&mut result.outcome, budget_usage, verified.len())?;
+    reconcile_phase_usage(&phase_usage, budget_usage)
+        .map_err(|_| ToolFirstEngineError::BudgetAccounting)?;
+    apply_aggregate_usage(&mut result.outcome, budget_usage, verified.len())
+        .map_err(|_| ToolFirstEngineError::BudgetAccounting)?;
     Ok(ToolFirstEngineReport {
         result,
         group_coverage,
