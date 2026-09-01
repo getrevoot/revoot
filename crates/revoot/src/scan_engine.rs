@@ -41,6 +41,7 @@ pub struct ScanEngineLimits {
     pub max_output_tokens: u32,
     pub reserved_cost_microusd: u64,
     pub minimum_confidence_percent: u8,
+    pub max_findings: usize,
 }
 
 impl Default for ScanEngineLimits {
@@ -51,6 +52,7 @@ impl Default for ScanEngineLimits {
             max_output_tokens: MAX_OUTPUT_TOKENS,
             reserved_cost_microusd: 500_000,
             minimum_confidence_percent: 85,
+            max_findings: MAX_FINDINGS,
         }
     }
 }
@@ -88,6 +90,7 @@ pub struct ScanEngineCoverage {
     pub total_chunks: u32,
     pub delivered_chunks: u32,
     pub fully_read_files: u32,
+    pub sampled_files: u32,
     pub complete: bool,
 }
 
@@ -458,6 +461,8 @@ fn validate_request(
         || request.limits.max_output_tokens == 0
         || request.limits.max_output_tokens > MAX_OUTPUT_TOKENS
         || !(1..=100).contains(&request.limits.minimum_confidence_percent)
+        || request.limits.max_findings == 0
+        || request.limits.max_findings > MAX_FINDINGS
     {
         return Err(ScanEngineError::Configuration);
     }
@@ -766,7 +771,9 @@ fn submit_findings(
     runtime: &mut Runtime,
     eligible_delivered: &BTreeSet<String>,
 ) -> Result<String, &'static str> {
-    if findings.is_empty() || findings.len().saturating_add(runtime.pending.len()) > MAX_FINDINGS {
+    if findings.is_empty()
+        || findings.len().saturating_add(runtime.pending.len()) > request.limits.max_findings
+    {
         return Err("scan finding limit exceeded");
     }
     let mut accepted = Vec::new();
@@ -848,6 +855,18 @@ fn coverage(plan: &ScanPlan, runtime: &Runtime) -> ScanEngineCoverage {
                 .all(|chunk| runtime.delivered.contains(&chunk.id))
         })
         .count();
+    let sampled_files = plan
+        .files
+        .iter()
+        .filter(|file| {
+            let delivered = file
+                .chunks
+                .iter()
+                .filter(|chunk| runtime.delivered.contains(&chunk.id))
+                .count();
+            delivered != 0 && delivered != file.chunks.len()
+        })
+        .count();
     let complete = runtime.delivered.len() == runtime.chunks.len() && plan.omissions.is_empty();
     ScanEngineCoverage {
         selected_files: u32::try_from(plan.files.len()).unwrap_or(u32::MAX),
@@ -855,6 +874,7 @@ fn coverage(plan: &ScanPlan, runtime: &Runtime) -> ScanEngineCoverage {
         total_chunks: u32::try_from(runtime.chunks.len()).unwrap_or(u32::MAX),
         delivered_chunks: u32::try_from(runtime.delivered.len()).unwrap_or(u32::MAX),
         fully_read_files: u32::try_from(fully_read_files).unwrap_or(u32::MAX),
+        sampled_files: u32::try_from(sampled_files).unwrap_or(u32::MAX),
         complete,
     }
 }
@@ -923,7 +943,7 @@ fn project_findings(
             .map(|anchor| anchor.id.clone())
             .collect::<BTreeSet<AnchorId>>(),
     )]);
-    validate_rank_and_render([envelope], &issued, &anchors, MAX_FINDINGS)
+    validate_rank_and_render([envelope], &issued, &anchors, request.limits.max_findings)
         .map(|ranked| (ranked.findings, anchors))
         .map_err(|_| ScanEngineError::FindingProjection)
 }

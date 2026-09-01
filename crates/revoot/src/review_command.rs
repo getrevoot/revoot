@@ -33,8 +33,8 @@ use sha2::{Digest, Sha256};
 use crate::config::{
     RepositoryReviewPolicy, ResolvedReviewConfiguration, resolve_review_configuration,
 };
-use crate::credentials::{CredentialKind, DiscoveredCredentials};
-use crate::egress_setup::{authorize_configured_provider, authorize_standard_provider};
+use crate::credentials::DiscoveredCredentials;
+use crate::egress_setup::authorize_configured_provider;
 use crate::git_history::GitHistoryToolbox;
 use crate::github_checkout::{
     DiscoveredGitHubRepository, GitHubCiContext, GitHubRepositorySlug, GitHubServer,
@@ -77,9 +77,6 @@ use crate::local_review::{
     local_snapshot_is_fresh,
 };
 use crate::prior_review::{acquire_github_prior_review, acquire_gitlab_prior_review};
-use crate::providers::ApiKey;
-use crate::providers::anthropic::{AnthropicAdapter, AnthropicConfig};
-use crate::providers::openai::{OpenAiAdapter, OpenAiConfig};
 use crate::review_adjudicator::ReviewAdjudicatorClock;
 use crate::review_checkpoint::{
     ReviewAttention, ReviewCheckpoint, extract_checkpoint, plan_attention,
@@ -103,8 +100,6 @@ use crate::tool_first_engine::{
 use crate::tool_first_report::{ToolFirstReportInput, build_tool_first_report};
 
 const REPORT_SCHEMA_VERSION: &str = "revoot.review-report/v3";
-const MODEL_CATALOG_SCHEMA_VERSION: &str = "revoot.model-catalog/v1";
-const MODEL_CATALOG: &str = include_str!("../assets/model-catalog-v1.json");
 const MAX_CODE_HOST_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const DEFERRED_PROVIDER: &str = "deferred";
 const DEFERRED_MODEL: &str = "deferred";
@@ -130,20 +125,6 @@ struct ReviewArgs {
     merge_request_iid: Option<MergeRequestIid>,
     pull_request_number: Option<PullRequestNumber>,
     github_repository: Option<GitHubRepositorySlug>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelCatalog {
-    schema_version: String,
-    providers: Vec<ModelCatalogProvider>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelCatalogProvider {
-    adapter: String,
-    default_model: String,
 }
 
 #[derive(Serialize)]
@@ -968,13 +949,7 @@ async fn run_async(
             report: Box::new(report),
         });
     }
-    let credentials =
-        DiscoveredCredentials::discover(environment.iter().cloned()).map_err(|_| {
-            diagnostic(
-                ErrorCode::ProviderUnavailable,
-                "provider credential discovery failed",
-            )
-        })?;
+    let credentials = crate::direct_provider::discover_credentials(environment.iter().cloned())?;
     let provider = select_provider(config_string(resolution, "review.provider")?, &credentials)?;
     let model = select_model(&provider, config_string(resolution, "review.model")?)?;
     prepared.bind_provider_model(&provider, &model)?;
@@ -1039,13 +1014,7 @@ async fn run_local_review(
             report: Box::new(no_model_review_report(&prepared)),
         });
     }
-    let credentials =
-        DiscoveredCredentials::discover(environment.iter().cloned()).map_err(|_| {
-            diagnostic(
-                ErrorCode::ProviderUnavailable,
-                "provider credential discovery failed",
-            )
-        })?;
+    let credentials = crate::direct_provider::discover_credentials(environment.iter().cloned())?;
     let provider = select_provider(config_string(resolution, "review.provider")?, &credentials)?;
     let model = select_model(&provider, config_string(resolution, "review.model")?)?;
     prepared.bind_provider_model(&provider, &model)?;
@@ -2811,121 +2780,18 @@ fn select_provider(
     configured: &str,
     credentials: &DiscoveredCredentials,
 ) -> Result<String, Diagnostic> {
-    match configured {
-        "anthropic" => require_credential(credentials, CredentialKind::Anthropic, "anthropic"),
-        "openai" => require_credential(credentials, CredentialKind::OpenAiCompatible, "openai"),
-        "auto" => match (
-            credentials.get(CredentialKind::Anthropic).is_some(),
-            credentials.get(CredentialKind::OpenAiCompatible).is_some(),
-        ) {
-            (true, _) => Ok("anthropic".to_owned()),
-            (false, true) => Ok("openai".to_owned()),
-            (false, false) => Err(missing_provider_credential()),
-        },
-        _ => Err(diagnostic(
-            ErrorCode::ProviderUnavailable,
-            "configured provider adapter is unsupported",
-        )),
-    }
-}
-
-fn require_credential(
-    credentials: &DiscoveredCredentials,
-    kind: CredentialKind,
-    provider: &str,
-) -> Result<String, Diagnostic> {
-    credentials
-        .get(kind)
-        .map(|_| provider.to_owned())
-        .ok_or_else(missing_provider_credential)
-}
-
-fn missing_provider_credential() -> Diagnostic {
-    diagnostic(
-        ErrorCode::ProviderUnavailable,
-        "no credential is available for the selected provider",
-    )
-    .with_remediation("provide ANTHROPIC_API_KEY or OPENAI_API_KEY")
+    crate::direct_provider::select_provider(configured, credentials)
 }
 
 fn select_model(provider: &str, configured: &str) -> Result<String, Diagnostic> {
-    if configured != "auto" {
-        return Ok(configured.to_owned());
-    }
-    let catalog: ModelCatalog = serde_json::from_str(MODEL_CATALOG)
-        .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "model catalog is invalid"))?;
-    if catalog.schema_version != MODEL_CATALOG_SCHEMA_VERSION
-        || catalog.providers.is_empty()
-        || catalog.providers.len() > 64
-    {
-        return Err(diagnostic(
-            ErrorCode::ContractInvalid,
-            "model catalog is invalid",
-        ));
-    }
-    catalog
-        .providers
-        .into_iter()
-        .find(|entry| entry.adapter == provider)
-        .filter(|entry| {
-            !entry.default_model.is_empty()
-                && entry.default_model.len() <= revoot_core::MAX_MODEL_ID_BYTES
-                && !entry
-                    .default_model
-                    .bytes()
-                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-        })
-        .map(|entry| entry.default_model)
-        .ok_or_else(|| {
-            diagnostic(
-                ErrorCode::ProviderUnavailable,
-                "the selected provider has no valid default model",
-            )
-        })
+    crate::direct_provider::select_model(provider, configured)
 }
 
 fn build_provider(
     provider: &str,
     credentials: &DiscoveredCredentials,
 ) -> Result<Box<dyn ProviderAdapter>, Diagnostic> {
-    match provider {
-        "anthropic" => {
-            let authorization =
-                authorize_standard_provider("anthropic", "https://api.anthropic.com/v1/messages")
-                    .map_err(|_| provider_setup_error())?;
-            let key = provider_key(credentials, CredentialKind::Anthropic)?;
-            let adapter = AnthropicAdapter::new(&AnthropicConfig::default(), key, &authorization)
-                .map_err(|_| provider_setup_error())?;
-            Ok(Box::new(adapter))
-        }
-        "openai" => {
-            let authorization =
-                authorize_standard_provider("openai", "https://api.openai.com/v1/responses")
-                    .map_err(|_| provider_setup_error())?;
-            let key = provider_key(credentials, CredentialKind::OpenAiCompatible)?;
-            let adapter = OpenAiAdapter::new(&OpenAiConfig::default(), key, &authorization)
-                .map_err(|_| provider_setup_error())?;
-            Ok(Box::new(adapter))
-        }
-        _ => Err(provider_setup_error()),
-    }
-}
-
-fn provider_key(
-    credentials: &DiscoveredCredentials,
-    kind: CredentialKind,
-) -> Result<ApiKey, Diagnostic> {
-    let value = credentials
-        .get(kind)
-        .ok_or_else(missing_provider_credential)?;
-    ApiKey::new(value.expose()).map_err(|_| provider_setup_error())
-}
-
-fn provider_setup_error() -> Diagnostic {
-    diagnostic(
-        ErrorCode::ProviderUnavailable,
-        "direct provider adapter setup failed",
-    )
+    crate::direct_provider::build_provider(provider, credentials)
 }
 
 fn agent_limits(

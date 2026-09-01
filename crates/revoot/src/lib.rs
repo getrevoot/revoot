@@ -7,6 +7,7 @@ pub mod config;
 pub mod credentials;
 pub mod delegate_command;
 pub mod diff_artifact;
+pub mod direct_provider;
 pub mod egress_setup;
 mod embedded_git;
 pub mod git_history;
