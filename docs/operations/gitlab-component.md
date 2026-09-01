@@ -23,7 +23,9 @@ Revoot needs a write-capable token to create inline discussions, resolve its
 old discussions, and update the merge-request summary. Create a project access
 token with the `api` scope and at least the Developer role, then save it as a
 masked CI/CD variable named `REVOOT_GITLAB_TOKEN`. GitLab attributes comments
-to the project token's bot user.
+to the project token's bot user. Transient GitLab reads use bounded retries,
+while publication writes require endpoint-specific reconciliation before
+replay.
 
 `CI_JOB_TOKEN` can read merge-request data but cannot publish discussions. If
 `REVOOT_GITLAB_TOKEN` is absent, the publishing job fails its readiness check.

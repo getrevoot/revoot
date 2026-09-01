@@ -28,6 +28,7 @@ use crate::gitlab_transport::{
     GitLabEndpointError, GitLabFailureKind, GitLabPagination, GitLabReadClient, GitLabReadEndpoint,
     GitLabRetryMetadata, GitLabTransportError,
 };
+use crate::retry::{RetryJitter, RetryPolicy};
 
 const MAX_PER_PAGE: u32 = 100;
 const HARD_MAX_BLOB_REQUESTS: u32 = 1_000_000;
@@ -1096,10 +1097,7 @@ impl AcquisitionBudget {
                     let retry_after = retry
                         .after_seconds
                         .map(Duration::from_secs)
-                        .filter(|delay| *delay <= retry_policy.max_retry_after);
-                    if retry.after_seconds.is_some() && retry_after.is_none() {
-                        return Err(transport(stage, &error));
-                    }
+                        .map(|delay| delay.min(retry_policy.max_retry_after));
                     self.wait_backoff(stage, retry_policy, attempt - 1, retry_after)
                         .await?;
                 }
@@ -1119,16 +1117,17 @@ impl AcquisitionBudget {
         retry_after: Option<Duration>,
     ) -> Result<(), GitLabSnapshotAcquisitionFailure> {
         self.ensure_deadline(stage)?;
-        let delay = retry_after.unwrap_or_else(|| {
-            let multiplier = 1_u32
-                .checked_shl(u32::from(exponent).min(31))
-                .unwrap_or(u32::MAX);
-            let base = policy
-                .initial_backoff
-                .saturating_mul(multiplier)
-                .min(policy.max_backoff);
-            deterministic_jitter(base, self.requests_started).min(policy.max_backoff)
-        });
+        let mut jitter = RetryJitter::new(u64::from(self.requests_started));
+        let delay = RetryPolicy {
+            max_attempts: policy.max_read_attempts,
+            initial_delay: policy.initial_backoff,
+            max_delay: policy.max_backoff,
+            max_retry_after: policy.max_retry_after,
+            total_budget: self
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now()),
+        }
+        .delay(exponent.saturating_add(1), retry_after, &mut jitter);
         let Some(wake) = tokio::time::Instant::now().checked_add(delay) else {
             return Err(self.failure(stage, GitLabSnapshotBudgetFailureKind::Deadline));
         };
@@ -1174,19 +1173,6 @@ impl AcquisitionBudget {
             evidence: self.evidence(),
         })
     }
-}
-
-fn deterministic_jitter(base: Duration, request_ordinal: u32) -> Duration {
-    let slot = u128::from(
-        request_ordinal
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223)
-            % 5,
-    );
-    let jitter_nanos = base.as_nanos().saturating_mul(slot) / 20;
-    base.saturating_add(Duration::from_nanos(
-        u64::try_from(jitter_nanos).unwrap_or(u64::MAX),
-    ))
 }
 
 fn preparation_only_binding_failure(reasons: &[IdentityBlocker]) -> bool {

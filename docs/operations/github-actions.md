@@ -19,6 +19,8 @@ organization secret. Optional Actions variables `REVOOT_PROVIDER` and
 `REVOOT_MODEL` override the `auto` defaults.
 
 No extra GitHub token is required to publish comments and the evolving summary.
+Transient GitHub reads use bounded retries; review comments, thread mutations,
+and pull-request description writes are never blindly replayed.
 The generated workflow grants its short-lived `GITHUB_TOKEN` repository read
 and pull-request write access; comments appear as `github-actions[bot]`. Revoot
 embeds lineage metadata in those comments and the overview, so fixed findings,

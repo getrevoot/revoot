@@ -46,7 +46,7 @@ pub async fn acquire_gitlab_prior_review(
         let pagination = GitLabPagination::new(requested, PAGE_SIZE)
             .map_err(|_| PriorReviewAcquisitionError::Pagination)?;
         let response = client
-            .get(&GitLabReadEndpoint::Discussions {
+            .get_with_retry(&GitLabReadEndpoint::Discussions {
                 project_id,
                 merge_request_iid,
                 pagination,
@@ -139,7 +139,7 @@ pub async fn acquire_github_prior_review(
     let mut authenticated_user_id: Option<u64> = None;
     for _ in 0..MAX_PAGES {
         let response = client
-            .graphql(&json!({
+            .graphql_query(&json!({
                 "query": GITHUB_REVIEW_THREADS_QUERY,
                 "variables": {
                     "owner": repository.owner(),

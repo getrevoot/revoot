@@ -23,6 +23,7 @@ pub mod gitlab_transport;
 pub mod local_review;
 pub mod prior_review;
 pub mod providers;
+pub(crate) mod retry;
 pub mod review_checkpoint;
 pub mod review_command;
 pub mod review_engine;

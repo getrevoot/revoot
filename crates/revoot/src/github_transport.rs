@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
@@ -17,8 +17,10 @@ use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio::time::{Instant, timeout_at};
 
 use crate::github_checkout::GitHubRepositorySlug;
+use crate::retry::{RetryJitter, RetryPolicy, retry_after, retryable_server_status};
 
 const ADAPTER_ID: &str = "github-rest";
 const MAX_TOKEN_BYTES: usize = 4_096;
@@ -143,6 +145,7 @@ pub enum GitHubFailureKind {
     Conflict,
     Unprocessable,
     RateLimited,
+    RequestTimeout,
     Server,
     UnexpectedStatus,
     ResponseTooLarge,
@@ -153,6 +156,7 @@ pub enum GitHubFailureKind {
 pub struct GitHubTransportError {
     pub kind: GitHubFailureKind,
     pub status: Option<u16>,
+    pub retry_after: Option<Duration>,
 }
 
 impl GitHubTransportError {
@@ -161,7 +165,16 @@ impl GitHubTransportError {
     const DUPLICATE_CREDENTIAL: Self = Self::new(GitHubFailureKind::DuplicateCredential, None);
 
     const fn new(kind: GitHubFailureKind, status: Option<u16>) -> Self {
-        Self { kind, status }
+        Self {
+            kind,
+            status,
+            retry_after: None,
+        }
+    }
+
+    const fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 }
 
@@ -171,6 +184,7 @@ impl fmt::Debug for GitHubTransportError {
             .debug_struct("GitHubTransportError")
             .field("kind", &self.kind)
             .field("status", &self.status)
+            .field("retry_after", &self.retry_after)
             .finish()
     }
 }
@@ -254,6 +268,7 @@ pub struct GitHubClient {
     http: reqwest::Client,
     api_root: Url,
     token: GitHubToken,
+    retry: RetryPolicy,
     #[cfg(test)]
     loopback_host: Option<HeaderValue>,
 }
@@ -356,6 +371,7 @@ impl GitHubClient {
             http,
             api_root,
             token,
+            retry: RetryPolicy::default(),
             #[cfg(test)]
             loopback_host: None,
         })
@@ -372,7 +388,7 @@ impl GitHubClient {
         segments: &[&str],
         query: &[(&str, String)],
     ) -> Result<GitHubResponse, GitHubTransportError> {
-        self.request(Method::GET, repository, segments, query, None)
+        self.request(Method::GET, repository, segments, query, None, true)
             .await
     }
 
@@ -388,8 +404,15 @@ impl GitHubClient {
         body: &T,
     ) -> Result<GitHubResponse, GitHubTransportError> {
         let body = serde_json::to_vec(body).map_err(|_| invalid_response())?;
-        self.request(Method::POST, Some(repository), segments, &[], Some(body))
-            .await
+        self.request(
+            Method::POST,
+            Some(repository),
+            segments,
+            &[],
+            Some(body),
+            false,
+        )
+        .await
     }
 
     /// Execute one bounded JSON PATCH.
@@ -404,8 +427,15 @@ impl GitHubClient {
         body: &T,
     ) -> Result<GitHubResponse, GitHubTransportError> {
         let body = serde_json::to_vec(body).map_err(|_| invalid_response())?;
-        self.request(Method::PATCH, Some(repository), segments, &[], Some(body))
-            .await
+        self.request(
+            Method::PATCH,
+            Some(repository),
+            segments,
+            &[],
+            Some(body),
+            false,
+        )
+        .await
     }
 
     /// Execute one bounded GraphQL POST against the GitHub or GHES sibling endpoint.
@@ -424,7 +454,27 @@ impl GitHubClient {
             "/graphql"
         });
         let body = serde_json::to_vec(body).map_err(|_| invalid_response())?;
-        self.send(Method::POST, url, Some(body)).await
+        self.send(Method::POST, url, Some(body), false).await
+    }
+
+    /// Execute a GraphQL query as an explicitly replay-safe read operation.
+    /// GraphQL mutations use [`Self::graphql`] and are never blindly replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redaction-safe serialization, transport, status, or response failure.
+    pub async fn graphql_query<T: Serialize + ?Sized>(
+        &self,
+        body: &T,
+    ) -> Result<GitHubResponse, GitHubTransportError> {
+        let mut url = self.api_root.clone();
+        url.set_path(if self.api_root.path() == "/api/v3" {
+            "/api/graphql"
+        } else {
+            "/graphql"
+        });
+        let body = serde_json::to_vec(body).map_err(|_| invalid_response())?;
+        self.send(Method::POST, url, Some(body), true).await
     }
 
     async fn request(
@@ -434,6 +484,7 @@ impl GitHubClient {
         segments: &[&str],
         query: &[(&str, String)],
         body: Option<Vec<u8>>,
+        replay_safe: bool,
     ) -> Result<GitHubResponse, GitHubTransportError> {
         let mut url = self.api_root.clone();
         {
@@ -457,10 +508,58 @@ impl GitHubClient {
             url.query_pairs_mut()
                 .extend_pairs(query.iter().map(|(name, value)| (*name, value.as_str())));
         }
-        self.send(method, url, body).await
+        self.send(method, url, body, replay_safe).await
     }
 
     async fn send(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+        replay_safe: bool,
+    ) -> Result<GitHubResponse, GitHubTransportError> {
+        let started = Instant::now();
+        let deadline = started + self.retry.total_budget;
+        let mut jitter = RetryJitter::for_operation();
+        for attempt in 1..=self.retry.max_attempts {
+            let result = timeout_at(
+                deadline,
+                self.send_once(method.clone(), url.clone(), body.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(GitHubTransportError::new(
+                    GitHubFailureKind::RequestTimeout,
+                    None,
+                ))
+            });
+            let error = match result {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            if !replay_safe || !github_read_retryable(&error) || attempt == self.retry.max_attempts
+            {
+                return Err(error);
+            }
+            let delay = self.retry.delay(attempt, error.retry_after, &mut jitter);
+            let Some(wake) = Instant::now().checked_add(delay) else {
+                return Err(error);
+            };
+            if wake > deadline {
+                return Err(error);
+            }
+            eprintln!(
+                "revoot: platform=github operation=safe_read attempt={} retry_reason={:?} delay_ms={} outcome=retrying",
+                attempt,
+                error.kind,
+                delay.as_millis()
+            );
+            tokio::time::sleep_until(wake).await;
+        }
+        unreachable!("validated retry policy always performs at least one attempt")
+    }
+
+    async fn send_once(
         &self,
         method: Method,
         url: Url,
@@ -482,6 +581,7 @@ impl GitHubClient {
             .await
             .map_err(|_| GitHubTransportError::new(GitHubFailureKind::Transport, None))?;
         let status = response.status();
+        let retry_after = retry_after(response.headers(), SystemTime::now());
         if response
             .headers()
             .get(CONTENT_ENCODING)
@@ -524,7 +624,7 @@ impl GitHubClient {
             bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            return Err(status_error(status));
+            return Err(status_error(status).with_retry_after(retry_after));
         }
         Ok(GitHubResponse {
             status: status.as_u16(),
@@ -554,6 +654,12 @@ impl GitHubClient {
             api_root: Url::parse(&format!("http://{address}"))
                 .map_err(|_| invalid_configuration())?,
             token,
+            retry: RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+                total_budget: Duration::from_secs(1),
+                ..RetryPolicy::default()
+            },
             loopback_host: Some(HeaderValue::from_static("api.github.com")),
         })
     }
@@ -611,11 +717,22 @@ fn status_error(status: StatusCode) -> GitHubTransportError {
         StatusCode::NOT_FOUND => GitHubFailureKind::NotFound,
         StatusCode::CONFLICT => GitHubFailureKind::Conflict,
         StatusCode::UNPROCESSABLE_ENTITY => GitHubFailureKind::Unprocessable,
+        StatusCode::REQUEST_TIMEOUT => GitHubFailureKind::RequestTimeout,
         value if value == StatusCode::TOO_MANY_REQUESTS => GitHubFailureKind::RateLimited,
         value if value.is_server_error() => GitHubFailureKind::Server,
         _ => GitHubFailureKind::UnexpectedStatus,
     };
     GitHubTransportError::new(kind, Some(status.as_u16()))
+}
+
+fn github_read_retryable(error: &GitHubTransportError) -> bool {
+    matches!(
+        error.kind,
+        GitHubFailureKind::Transport
+            | GitHubFailureKind::RequestTimeout
+            | GitHubFailureKind::RateLimited
+    ) || matches!(error.kind, GitHubFailureKind::Server)
+        && error.status.is_some_and(retryable_server_status)
 }
 
 const fn invalid_configuration() -> GitHubTransportError {
@@ -629,6 +746,28 @@ const fn invalid_response() -> GitHubTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn request_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0);
+            bytes.extend_from_slice(&chunk[..read]);
+            if bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                return bytes;
+            }
+        }
+    }
+
+    async fn respond(stream: &mut tokio::net::TcpStream, status: &str, extra: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: 2\r\n{extra}Connection: close\r\n\r\n{{}}"
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
 
     #[test]
     fn credential_precedence_is_explicit_and_debug_is_redacted() {
@@ -662,5 +801,61 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("1, 2, 3"));
         assert!(GitHubCustomCaBundle::from_der(vec![certificate], [9; 32]).is_err());
+    }
+
+    #[tokio::test]
+    async fn safe_reads_retry_transient_statuses_with_one_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, extra) in [
+                ("503 Service Unavailable", "Retry-After: 0\r\n"),
+                ("408 Request Timeout", ""),
+                ("200 OK", ""),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = request_head(&mut stream).await;
+                assert!(request.starts_with(b"GET /user "));
+                respond(&mut stream, status, extra).await;
+            }
+        });
+        let client = GitHubClient::new_for_loopback(
+            GitHubToken::new(b"test-token".to_vec()).unwrap(),
+            address,
+        )
+        .unwrap();
+        let response = client.get(None, &["user"], &[]).await.unwrap();
+        assert_eq!(response.status, 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_writes_are_not_blindly_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = request_head(&mut stream).await;
+            assert!(request.starts_with(b"POST /repos/acme/widgets/pulls/7/comments "));
+            respond(&mut stream, "503 Service Unavailable", "").await;
+        });
+        let client = GitHubClient::new_for_loopback(
+            GitHubToken::new(b"test-token".to_vec()).unwrap(),
+            address,
+        )
+        .unwrap();
+        let repository = GitHubRepositorySlug::parse("acme/widgets").unwrap();
+        let result = client
+            .post(
+                &repository,
+                &["pulls", "7", "comments"],
+                &serde_json::json!({}),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("publication write must fail")
+        };
+        assert_eq!(error.kind, GitHubFailureKind::Server);
+        server.await.unwrap();
     }
 }

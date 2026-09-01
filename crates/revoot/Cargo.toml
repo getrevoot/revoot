@@ -12,6 +12,7 @@ similar.workspace = true
 libc.workspace = true
 revoot-core.workspace = true
 reqwest.workspace = true
+httpdate.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,3 +29,6 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "deny"
 pedantic = "deny"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

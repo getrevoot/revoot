@@ -9,6 +9,11 @@ Every adapter must demonstrate:
 - user/assistant text, read-only tool definitions, tool calls, and tool results;
 - response and streaming normalization into the shared model contract;
 - usage accounting, finish reasons, deadlines, and cooperative cancellation;
+- one shared bounded retry budget for eligible pre-acceptance transport
+  failures, HTTP 408, transient HTTP 429, and selected 5xx responses, including
+  capped `Retry-After` handling and jitter;
+- no replay after a successful response starts, with payload-free reporting
+  that provider usage or cost may be ambiguous;
 - payload-free authentication, permission, rate-limit, timeout, unavailable,
   malformed-response, and oversized-response errors; and
 - no credential, prompt, tool payload, or raw response in Debug, Display,

@@ -84,6 +84,34 @@ The product bounds shown above are final ceilings. A repository configuration
 may request lower limits, while an environment variable or CLI option can
 override that request only within the product bounds.
 
+### API retry policy
+
+Each provider request has one shared retry loop across adapters: at most four
+total attempts (the initial request plus three retries), a 1-second exponential
+backoff with jitter, a 30-second per-delay cap, and a 60-second total retry
+budget. The request and review deadlines still dominate that budget. Valid
+`Retry-After` delay-seconds and HTTP-date values take precedence but are capped;
+missing, malformed, duplicated, or past values fall back to the bounded
+schedule. Transient connection-establishment failures, HTTP 408, HTTP 429, and
+selected 5xx responses are eligible. Authentication, authorization, malformed
+requests, protocol failures, and recognized permanent quota or billing 429s
+stop immediately.
+
+Once a provider has started a successful response, an interruption is not
+replayed: provider acceptance and resulting usage may be ambiguous, so an
+automatic retry could duplicate model cost. The payload-free terminal
+diagnostic reports that ambiguity without retaining response content.
+
+GitHub and standalone GitLab reads use the same four-attempt, 60-second policy.
+GitLab snapshot and publication controllers retain their tighter local delays
+inside their existing overall operation deadlines, using the same capped
+exponential-jitter primitive. Review, comment, thread, description, and other
+publication writes are not blindly retried. A write may be attempted again only
+when it is intrinsically idempotent or GitLab's endpoint-specific inventory
+reconciliation proves that replay is safe. CI job timeouts should exceed the
+review deadline plus checkout and publication time; retries never extend a
+Revoot operation's own deadline.
+
 ### Code-host network
 
 | Variable | Default | Accepted value and effect |

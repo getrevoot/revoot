@@ -312,6 +312,8 @@ pub struct ProviderError {
     kind: ProviderErrorKind,
     status_code: Option<u16>,
     retryable: bool,
+    retry_after: Option<std::time::Duration>,
+    cost_ambiguous: bool,
 }
 
 impl ProviderError {
@@ -321,7 +323,15 @@ impl ProviderError {
             kind,
             status_code,
             retryable,
+            retry_after: None,
+            cost_ambiguous: false,
         }
+    }
+
+    #[must_use]
+    pub const fn with_retry_after(mut self, retry_after: Option<std::time::Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 
     #[must_use]
@@ -337,6 +347,22 @@ impl ProviderError {
     #[must_use]
     pub const fn retryable(self) -> bool {
         self.retryable
+    }
+
+    #[must_use]
+    pub const fn retry_after(self) -> Option<std::time::Duration> {
+        self.retry_after
+    }
+
+    #[must_use]
+    pub const fn with_cost_ambiguous(mut self) -> Self {
+        self.cost_ambiguous = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn cost_ambiguous(self) -> bool {
+        self.cost_ambiguous
     }
 }
 

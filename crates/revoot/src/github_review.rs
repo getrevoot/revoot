@@ -966,7 +966,7 @@ fn thread_resolution_denied(error: &GraphQlError) -> bool {
 
 async fn authenticated_user(client: &GitHubClient) -> Result<GitHubUser, GitHubReviewError> {
     let response = client
-        .graphql(&serde_json::json!({
+        .graphql_query(&serde_json::json!({
             "query": "query RevootViewer { viewer { databaseId } }"
         }))
         .await?;
