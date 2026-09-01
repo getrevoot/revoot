@@ -1750,12 +1750,7 @@ fn execute_candidate(
     runtime: &mut WorkerRuntime<'_>,
 ) -> Result<Value, ToolExecutionError> {
     let args = strict_input::<CandidateArgs>(input)?;
-    if runtime.candidates.len() >= MAX_CANDIDATES
-        || runtime
-            .candidates
-            .iter()
-            .any(|candidate| candidate.candidate_id == args.candidate.candidate_id)
-    {
+    if runtime.candidates.len() >= MAX_CANDIDATES {
         return Err(recoverable("candidate"));
     }
     let anchor = runtime
@@ -1786,8 +1781,29 @@ fn execute_candidate(
         runtime.anchor_table,
     )
     .map_err(|_| recoverable("candidate"))?;
-    runtime.candidates.push(args.candidate);
-    Ok(json!({"status":"accepted"}))
+    let mut candidate = args.candidate;
+    candidate.candidate_id = canonical_candidate_id(
+        &runtime.cursor_handle_digest,
+        candidate.candidate_id.as_str(),
+    );
+    if runtime
+        .candidates
+        .iter()
+        .any(|existing| existing.candidate_id == candidate.candidate_id)
+    {
+        return Err(recoverable("candidate"));
+    }
+    let candidate_id = candidate.candidate_id.clone();
+    runtime.candidates.push(candidate);
+    Ok(json!({"status":"accepted", "candidate_id": candidate_id}))
+}
+
+fn canonical_candidate_id(group_digest: &Sha256Digest, local_id: &str) -> String {
+    let binding = format!("{}\0{local_id}", group_digest.as_str());
+    format!(
+        "candidate:v1:{}",
+        Sha256Digest::of_bytes(binding.as_bytes()).as_str()
+    )
 }
 
 fn execute_complete(
@@ -3760,6 +3776,19 @@ mod tests {
         }));
         assert!(encode_result(json!({"ok":true})).is_ok());
         assert!(encode_result(json!({"body":"x".repeat(MAX_TOOL_RESULT_BYTES)})).is_err());
+    }
+
+    #[test]
+    fn candidate_ids_are_stable_and_group_scoped() {
+        let first_group = Sha256Digest::of_bytes(b"group-a");
+        let second_group = Sha256Digest::of_bytes(b"group-b");
+        let first = canonical_candidate_id(&first_group, "finding-1");
+
+        assert_eq!(first, canonical_candidate_id(&first_group, "finding-1"));
+        assert_ne!(first, canonical_candidate_id(&second_group, "finding-1"));
+        assert_ne!(first, canonical_candidate_id(&first_group, "finding-2"));
+        assert!(first.starts_with("candidate:v1:"));
+        assert!(first.len() <= 128);
     }
 
     #[test]
