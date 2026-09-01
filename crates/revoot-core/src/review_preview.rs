@@ -5,7 +5,7 @@
 //! temporary artifact locations.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Serialize};
 
@@ -224,8 +224,9 @@ impl ReviewPreview {
             self.omissions.len(),
         );
         for group in &self.groups {
-            output.push_str(&format!(
-                "- {}: {} files, {} changed lines, {} diff bytes, {} anchors, {:?}, complex={}, {} rules\n",
+            let _ = writeln!(
+                output,
+                "- {}: {} files, {} changed lines, {} diff bytes, {} anchors, {:?}, complex={}, {} rules",
                 group.id.as_str(),
                 group.files.len(),
                 group.total_changed_lines,
@@ -233,11 +234,11 @@ impl ReviewPreview {
                 group.anchor_count,
                 group.initial_context,
                 group.complex,
-                group.rule_ids.len(),
-            ));
+                group.rule_ids.len()
+            );
         }
         for (reason, count) in omission_counts {
-            output.push_str(&format!("- omitted {:?}: {}\n", reason, count));
+            let _ = writeln!(output, "- omitted {reason:?}: {count}");
         }
         output
     }

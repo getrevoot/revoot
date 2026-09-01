@@ -102,11 +102,22 @@ impl ScanLimits {
 
 /// One post-change local source input. The body is consumed only while the
 /// plan is constructed and is not retained in the plan.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ScanFileInput {
     pub path: RepositoryPath,
     pub tracking: ScanFileTracking,
     pub content: String,
+}
+
+impl fmt::Debug for ScanFileInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScanFileInput")
+            .field("path", &self.path)
+            .field("tracking", &self.tracking)
+            .field("content", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Exact body-free identity and range for one bounded source chunk.
@@ -705,7 +716,7 @@ mod tests {
                 .flat_map(|file| &file.chunks)
                 .all(|chunk| {
                     chunk.body_bytes <= limits.max_chunk_bytes
-                        && chunk.end_line - chunk.start_line + 1 <= limits.max_chunk_lines
+                        && chunk.end_line - chunk.start_line < limits.max_chunk_lines
                 })
         );
         let json = String::from_utf8(left.canonical_json(&inputs).unwrap()).unwrap();
@@ -856,5 +867,17 @@ mod tests {
                 "unexpected authority field: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn source_input_debug_is_redacted() {
+        let input = input(
+            "src/lib.rs",
+            ScanFileTracking::Tracked,
+            "private source sentinel",
+        );
+        let debug = format!("{input:?}");
+        assert!(!debug.contains("private source sentinel"));
+        assert!(debug.contains("[redacted]"));
     }
 }

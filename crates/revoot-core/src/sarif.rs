@@ -18,6 +18,7 @@ const SARIF_SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
 const MAX_RESULTS: usize = 250;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 const MAX_POLICY_VERSION_BYTES: usize = 128;
+const TRUNCATED_MESSAGE_SUFFIX: &str = "\n\n[message truncated]";
 
 /// Body-free aggregate coverage included in SARIF run properties.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -230,6 +231,7 @@ impl SarifLog {
 ///
 /// Rejects excessive or duplicate results, unknown anchors, invalid coverage,
 /// unsafe paths, line zero, invalid message controls, or serialization failure.
+#[allow(clippy::too_many_lines)]
 pub fn render_sarif(
     findings: &[RankedFinding],
     anchors: &AnchorTable,
@@ -379,13 +381,12 @@ fn bounded_message(message: &str) -> String {
     if message.len() <= MAX_MESSAGE_BYTES {
         return message.to_owned();
     }
-    const SUFFIX: &str = "\n\n[message truncated]";
-    let mut end = MAX_MESSAGE_BYTES - SUFFIX.len();
+    let mut end = MAX_MESSAGE_BYTES - TRUNCATED_MESSAGE_SUFFIX.len();
     while !message.is_char_boundary(end) {
         end -= 1;
     }
     let mut bounded = message[..end].to_owned();
-    bounded.push_str(SUFFIX);
+    bounded.push_str(TRUNCATED_MESSAGE_SUFFIX);
     bounded
 }
 

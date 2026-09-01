@@ -5,9 +5,13 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod agent_manifest;
+pub mod concurrency_trace;
 pub mod config;
+pub mod coverage_gate;
 pub mod delegation;
 pub mod diff;
+pub mod diff_hazards;
 pub mod egress;
 pub mod error;
 pub mod evaluation;
@@ -15,7 +19,10 @@ pub mod execution_graph;
 pub mod findings;
 pub mod gitlab_context;
 pub mod gitlab_wire;
+pub mod group_metrics;
+pub mod lineage_coverage;
 pub mod partition;
+pub mod phase_budget;
 pub mod provider;
 pub mod publication;
 pub mod repository;
@@ -23,19 +30,36 @@ pub mod review_budget;
 pub mod review_group;
 pub mod review_history;
 pub mod review_preview;
+pub mod review_report;
+pub mod review_tools;
 pub mod review_verification;
 pub mod review_worker;
 pub mod sarif;
 pub mod scan;
 pub mod snapshot;
+pub mod token_efficiency;
 pub mod tool_cursor;
+pub mod worker_transcript;
 
+pub use agent_manifest::{
+    AgentAuthorityState, AgentCliWorkflow, AgentCliWorkflowId, AgentIntegrationAuthority,
+    AgentIntegrationManifest, AgentManifestError, AgentMcpAccess, AgentMcpSurface, AgentMcpTool,
+    AgentMcpTransport, build_agent_integration_manifest,
+};
+pub use concurrency_trace::{
+    ConcurrencyTrace, ConcurrencyTraceError, ConcurrencyTraceEvent, ConcurrencyTraceUsage,
+    ConcurrencyWorkItem, ProviderSettlementStatus, WorkerSignal, build_concurrency_trace,
+};
 pub use config::{
     AssignmentScope, ConfigAssignment, ConfigCandidate, ConfigExplainRecord, ConfigField,
     ConfigKey, ConfigKeyError, ConfigSource, ConfigValue, ConfigValueKind, ConfigurationError,
     ConfigurationResolution, ConfigurationSchema, ConstraintViolation, EffectiveConfiguration,
     PolicyConstraint, PolicyExplanation, PolicyRule, RequestedConfiguration, ResolvedValue,
     SourceProvenance, ValueConstraint, ValueViolation,
+};
+pub use coverage_gate::{
+    CompleteGroupRejection, CoverageCompletionGate, CoverageGateError, GroupCompletion,
+    GroupPartialCause,
 };
 pub use delegation::{
     DelegationCanonicalError, DelegationError, DelegationExclusion, DelegationFile,
@@ -44,6 +68,11 @@ pub use delegation::{
 };
 pub use diff::{
     DiffSide, ParsedFileDiff, UnifiedDiffError, UnifiedDiffLimits, parse_gitlab_file_diff,
+};
+pub use diff_hazards::{
+    DiffHazardError, DiffHazardFileInput, DiffHazardHunkInput, DiffHazardInspection,
+    DiffHazardReport, DiffHazardSignal, DiffHazardToken, DiffHunkHazardDecision,
+    DiffHunkLineClasses, classify_diff_hazards,
 };
 pub use egress::{
     AllowedProviderEgress, AllowedProviderOrigin, CanonicalHostname, CanonicalHttpsEndpoint,
@@ -89,6 +118,17 @@ pub use gitlab_wire::{
     parse_discussions_page, parse_exact_diff_version_response, parse_merge_request_response,
     parse_project_response, parse_raw_blob_response, parse_response_metadata,
 };
+pub use group_metrics::{
+    GroupFileManifest, GroupFileMetrics, GroupHunkCoverageRequirement, GroupHunkManifest,
+    GroupHunkMetrics, GroupInitialContext, GroupInlineMetrics, GroupMetricsError,
+    GroupMetricsPolicy, GroupPlanningMetrics, ReviewGroupMetricsReport, build_group_metrics,
+};
+pub use lineage_coverage::{
+    AuthorizedLineageAction, AuthorizedLineageDecision, DeliveredAnchorEvidence,
+    LineageAuthorization, LineageCoverageError, LineageCoverageEvidence, LineageDecisionResponse,
+    LineagePreservationReason, LineageResolutionEvidence, PriorLineageRecord, PriorLineageTarget,
+    ProposedLineageDecision, ProposedLineageDisposition, authorize_lineage_decisions,
+};
 pub use partition::{
     OmittedReviewFile, PartitionBuildError, PartitionCanonicalError, PartitionConfigurationError,
     PartitionCoverage, PartitionLimits, PartitionReplayError, ReviewFileClass, ReviewFileInput,
@@ -96,6 +136,12 @@ pub use partition::{
     ReviewSelectionPolicy, ReviewValue, ReviewValueReason, ReviewValueTier, ReviewWorkUnit,
     WorkUnitFile, WorkUnitId, build_partition_plan, classify_review_value,
     is_sensitive_model_context_path,
+};
+pub use phase_budget::{
+    AllocatedRequestPhase, DispatchSignal, DispatchedPhaseGroup, GlobalRequestPhase,
+    GroupDispatchCandidate, GroupDispatchResult, GroupRequestPhase, PhaseBudgetAllocator,
+    PhaseBudgetError, PhaseBudgetLimits, PhaseBudgetSnapshot, PhaseBudgetUsage, PhaseGroupHandle,
+    PhaseRequestAllocation,
 };
 pub use provider::ProviderErrorKind as DirectProviderErrorKind;
 pub use provider::{
@@ -142,6 +188,17 @@ pub use review_preview::{
     ReviewPreviewGroupInput, ReviewPreviewInitialContext, ReviewPreviewOmission, ReviewPreviewRule,
     ReviewPreviewRuleSource, ReviewPreviewStrategy, build_review_preview,
 };
+pub use review_report::{
+    ReviewReportCoverage, ReviewReportError, ReviewReportFinding, ReviewReportLineage,
+    ReviewReportLineageDisposition, ReviewReportOverview, ReviewReportPhase,
+    ReviewReportPhaseUsage, ReviewReportPublication, ReviewReportSelection, ReviewReportState,
+    ReviewReportStrategy, ReviewReportUsage, ReviewReportUsageTotals, ReviewReportV3,
+};
+pub use review_tools::{
+    ReviewToolAuthority, ReviewToolContract, ReviewToolCoverageEffect, ReviewToolId,
+    ReviewToolLimits, ReviewToolPermission, ReviewToolRegistry, ReviewToolRegistryError,
+    build_review_tool_registry,
+};
 pub use review_verification::{
     AdjudicatedOverview, AdjudicationOutcome, AdjudicationSuppression,
     AdjudicationSuppressionReason, AdjudicatorResponse, AdjudicatorResponseError,
@@ -179,9 +236,19 @@ pub use snapshot::{
     SnapshotEvidence, SnapshotReadiness, SnapshotScope, TrustedAnchor, UnrepresentedFileCount,
     bind_latest_snapshot,
 };
+pub use token_efficiency::{
+    EfficiencyGroup, EfficiencyHunkDelivery, EfficiencyPhase, EfficiencyPhaseTotals,
+    EfficiencyRequest, EfficiencyToolResult, TokenEfficiencyError, TokenEfficiencyReport,
+    measure_token_efficiency,
+};
 pub use tool_cursor::{
     CursorTool, ToolCursorBinding, ToolCursorError, ToolCursorStore, ToolPageRequest,
     ToolResultLimits, ToolResultLimitsError, ToolResultPage,
+};
+pub use worker_transcript::{
+    TranscriptModelPhase, TranscriptPartialReason, TranscriptTerminalOutcome, TranscriptTool,
+    WorkerTranscript, WorkerTranscriptError, WorkerTranscriptEvent, WorkerTranscriptPlan,
+    WorkerTranscriptUsage, build_worker_transcript,
 };
 
 /// The schema version for machine-readable doctor output.

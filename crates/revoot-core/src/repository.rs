@@ -650,7 +650,7 @@ impl RepositoryToolbox {
         } else {
             regex::escape(&request.query)
         };
-        let matcher = RegexBuilder::new(&pattern)
+        let compiled_regex = RegexBuilder::new(&pattern)
             .case_insensitive(!request.case_sensitive)
             .size_limit(1024 * 1024)
             .dfa_size_limit(1024 * 1024)
@@ -718,7 +718,7 @@ impl RepositoryToolbox {
             collect_regex_matches(
                 path,
                 text,
-                &matcher,
+                &compiled_regex,
                 request.max_results,
                 &mut matches,
                 &mut truncated,
@@ -880,14 +880,14 @@ fn collect_matches(
 fn collect_regex_matches(
     path: &RepositoryRelativePath,
     text: &str,
-    matcher: &Regex,
+    compiled_regex: &Regex,
     max_results: u32,
     matches: &mut Vec<SearchMatch>,
     truncated: &mut bool,
 ) {
     let maximum = usize::try_from(max_results).unwrap_or(usize::MAX);
     for (line_index, line) in text.lines().enumerate() {
-        for matched in matcher.find_iter(line) {
+        for matched in compiled_regex.find_iter(line) {
             if matches.len() == maximum {
                 *truncated = true;
                 return;
