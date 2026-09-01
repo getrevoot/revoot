@@ -51,7 +51,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_shells_include_the_single_review_surface() {
+    fn all_shells_include_review_and_read_only_auxiliary_surfaces() {
         for shell in [
             CompletionShell::Bash,
             CompletionShell::Zsh,
@@ -60,6 +60,12 @@ mod tests {
             let completion = render(shell);
             assert!(completion.ends_with('\n'));
             assert!(completion.contains("review"));
+            for command in ["scan", "delegate", "rules", "mcp"] {
+                assert!(completion.contains(command));
+            }
+            assert!(completion.contains("preview"));
+            assert!(completion.contains("effort"));
+            assert!(completion.contains("sarif"));
             assert!(completion.contains("--mr") || completion.contains("-l mr"));
             assert!(completion.contains("--pr") || completion.contains("-l pr"));
             assert!(completion.contains("--repo") || completion.contains("-l repo"));

@@ -101,6 +101,23 @@ Use `revoot review --help` for command options, `--format json` for the v3
 machine-readable report, or `--format sarif` for SARIF 2.1.0. Host agents can
 start the read-only stdio integration with `revoot mcp serve`.
 
+Provider-free inspection commands expose the same deterministic preparation
+contracts without sending source to a model:
+
+```sh
+revoot review --preview
+revoot scan --preview --format json
+revoot rules check src/lib.rs --json
+revoot delegate preview
+revoot delegate rule src/lib.rs
+```
+
+`scan --preview` produces a body-free, immutable local scan plan. Untracked
+files require the explicit local `--include-untracked` flag and are rejected in
+CI. Model-backed scan execution is not enabled until the shared group-worker
+engine is wired; the command fails clearly at that boundary instead of
+claiming findings.
+
 ## Running Revoot locally
 
 Run Revoot locally to catch issues before opening a pull or merge request, or

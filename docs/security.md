@@ -63,6 +63,27 @@ developers can review work in progress. The same sensitive-path policy still
 applies, but CI's tracked-only guarantee does not. Keep unrelated sensitive
 files outside a locally reviewed worktree or exclude them explicitly.
 
+## Private diff handling and bounded context
+
+Selected unified diffs are materialized for one run in a randomized private
+temporary directory. The directory is mode `0700`, artifact files are mode
+`0600`, filenames are internal digests rather than repository paths, and the
+model never receives an artifact filesystem path. RAII cleanup removes the
+store on success, error, or cancellation.
+
+Groups no larger than 16 KiB may receive their complete diff once when the
+whole request remains inside the 32,000-token target. Larger groups receive
+only file and hunk metadata initially. Workers fetch exact bounded hunk pages
+with `read_diff` or search the private artifacts with `search_diff`; no large
+group is partially inlined. Tool results are deterministically paginated and
+never exceed 32 KiB. Delivered coverage is recorded from successful inline and
+tool results rather than model claims.
+
+Rebased model turns retain the immutable compact group brief, a structured
+checkpoint of at most 4 KiB, and only the latest tool-call/result exchange.
+Older source slices and raw conversation history are not repeatedly inserted,
+persisted, or summarized by another model call.
+
 ## Prompt-injection containment
 
 Repository content is placed in delimited user content and is explicitly
@@ -84,6 +105,13 @@ deduplication and freshness checks. Model-authored Markdown links, images,
 external URLs, code-host quick actions, marker injection, and control characters
 are rejected; HTML is escaped. The model never receives a publication tool or
 a host token.
+
+The stdio MCP server exposes the same bounded read-only repository and diff
+handlers through opaque process-local review handles. It has no listener,
+publication, write, command, provider-call, credential, environment, or network
+tool. Cursor tokens are authenticated and bound to the handle, snapshot, tool,
+and query; stale, tampered, cross-handle, and cross-snapshot cursors fail closed.
+Standard output is reserved for protocol JSON.
 
 These are capability controls, not a claim that prompt injection is solved. A
 successful injection can still influence analysis or cause allowed repository
