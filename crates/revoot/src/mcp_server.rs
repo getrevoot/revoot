@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use revoot_core::{
-    AgentBudget, AgentBudgetLimits, CancellationToken, CodeSearchRequest, CursorTool,
-    FindingsEnvelope, LineRange, LocalSnapshotIdentity, PartitionLimits, RepositoryRelativePath,
+    AgentBudget, AgentBudgetLimits, AnchorPosition, AnchorTable, CancellationToken,
+    CodeSearchRequest, CursorTool, FindingsEnvelope, IssuedWorkUnitAnchors, LineRange,
+    LocalSnapshotIdentity, PartitionLimits, ProviderCancellationReason, RepositoryRelativePath,
     RepositoryToolLimits, RepositoryToolbox, ReviewSelectionPolicy, Sha256Digest,
     ToolCursorBinding, ToolCursorStore, ToolPageRequest, ToolResultLimits, UnifiedDiffLimits,
 };
@@ -21,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::config::{RepositoryReviewPolicy, resolve_review_configuration};
 use crate::diff_artifact::{
-    DEFAULT_DIFF_PAGE_BYTES, DiffArtifactStore, DiffSearchKind, DiffSearchRequest,
+    DEFAULT_DIFF_PAGE_BYTES, DiffArtifactStore, DiffHunkManifest, DiffSearchKind, DiffSearchRequest,
 };
 use crate::local_review::{
     LocalReviewContextOptions, build_local_review_context, capture_local_git,
@@ -32,6 +33,7 @@ static HANDLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MCP_RESULT_BYTES: usize = 32 * 1024;
 const MCP_PAGE_BYTES: u32 = 30 * 1024;
 const MCP_SOURCE_SLICE_BYTES: u64 = 24 * 1024;
+const MAX_LIVE_REVIEWS: usize = 8;
 
 struct OpenReview {
     root: PathBuf,
@@ -40,18 +42,24 @@ struct OpenReview {
     toolbox: RepositoryToolbox,
     diffs: DiffArtifactStore,
     changed_paths: Vec<RepositoryRelativePath>,
-    anchor_ids: BTreeSet<String>,
+    anchors: AnchorTable,
+    issued_anchors: IssuedWorkUnitAnchors,
+    work_unit_by_path: BTreeMap<RepositoryRelativePath, String>,
     snapshot_digest: String,
     repository_policy: RepositoryReviewPolicy,
+    opened_sequence: u64,
 }
 
+#[derive(Clone)]
 pub struct RevootMcpServer {
-    reviews: Mutex<BTreeMap<String, Arc<OpenReview>>>,
-    cursors: ToolCursorStore,
+    trusted_root: Arc<PathBuf>,
+    reviews: Arc<Mutex<BTreeMap<String, Arc<OpenReview>>>>,
+    cursors: Arc<ToolCursorStore>,
 }
 
 impl RevootMcpServer {
-    fn new() -> Result<Self, &'static str> {
+    fn new(root: &Path) -> Result<Self, &'static str> {
+        let trusted_root = std::fs::canonicalize(root).map_err(|_| "repository unavailable")?;
         let mut secret = [0_u8; 32];
         getrandom::fill(&mut secret).map_err(|_| "cursor initialization failed")?;
         let cursors = ToolCursorStore::new(
@@ -63,18 +71,37 @@ impl RevootMcpServer {
         )
         .map_err(|_| "cursor initialization failed")?;
         Ok(Self {
-            reviews: Mutex::new(BTreeMap::new()),
-            cursors,
+            trusted_root: Arc::new(trusted_root),
+            reviews: Arc::new(Mutex::new(BTreeMap::new())),
+            cursors: Arc::new(cursors),
         })
     }
 
-    fn open_review(&self, arguments: &JsonObject) -> Result<Value, &'static str> {
-        let root = match arguments.get("repository_root").and_then(Value::as_str) {
-            Some(root) => PathBuf::from(root),
-            None => std::env::current_dir().map_err(|_| "repository unavailable")?,
-        };
+    #[allow(
+        clippy::too_many_lines,
+        reason = "snapshot construction keeps the trusted-root, artifact, and handle bindings visible"
+    )]
+    fn open_review(
+        &self,
+        arguments: &JsonObject,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, &'static str> {
+        if cancellation.is_cancelled() {
+            return Err("tool call cancelled");
+        }
+        let requested = arguments
+            .get("repository_root")
+            .and_then(Value::as_str)
+            .map_or_else(|| self.trusted_root.as_ref().clone(), PathBuf::from);
+        let root = std::fs::canonicalize(requested).map_err(|_| "repository unavailable")?;
+        if !root.starts_with(self.trusted_root.as_ref()) {
+            return Err("repository outside server authority");
+        }
         let base = arguments.get("base").and_then(Value::as_str);
         let capture = capture_local_git(&root, base).map_err(|_| "review snapshot unavailable")?;
+        if cancellation.is_cancelled() {
+            return Err("tool call cancelled");
+        }
         let context = build_local_review_context(
             capture,
             &LocalReviewContextOptions {
@@ -105,8 +132,10 @@ impl RevootMcpServer {
             },
         )
         .map_err(|_| "review snapshot unavailable")?;
+        if cancellation.is_cancelled() {
+            return Err("tool call cancelled");
+        }
         let repository_policy = repository_policy(&context.root, &context.identity.base_sha)?;
-        let cancellation = CancellationToken::default();
         let toolbox = RepositoryToolbox::open_selected(
             &context.root,
             RepositoryToolLimits {
@@ -115,7 +144,7 @@ impl RevootMcpServer {
             },
             context.repository_diffs.clone(),
             context.repository_paths.iter().cloned(),
-            &cancellation,
+            cancellation,
         )
         .map_err(|_| "repository inventory unavailable")?;
         let changed_paths = toolbox
@@ -130,6 +159,7 @@ impl RevootMcpServer {
         let root = std::fs::canonicalize(&context.root).map_err(|_| "repository unavailable")?;
         let inferred_base = context.inferred_base.clone();
         let identity = context.identity.clone();
+        let anchors = context.anchors.clone();
         let snapshot_digest = context.partition.plan_sha256.as_str().to_owned();
         let sequence = HANDLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let handle = revoot_core::Sha256Digest::of_bytes(
@@ -142,32 +172,77 @@ impl RevootMcpServer {
         )
         .as_str()
         .to_owned();
-        let anchor_ids = context
-            .anchors
+        let issued_anchors = context
+            .partition
+            .work_units
             .iter()
-            .map(|anchor| anchor.id.as_str().to_owned())
+            .map(|unit| {
+                (
+                    unit.id.as_str().to_owned(),
+                    unit.files
+                        .iter()
+                        .flat_map(|file| file.anchor_ids.iter().cloned())
+                        .collect(),
+                )
+            })
             .collect();
-        self.reviews
+        let work_unit_by_path = context
+            .partition
+            .work_units
+            .iter()
+            .flat_map(|unit| {
+                unit.files.iter().map(|file| {
+                    (
+                        RepositoryRelativePath::try_from(file.path.new_path.as_str().to_owned()),
+                        unit.id.as_str().to_owned(),
+                    )
+                })
+            })
+            .map(|(path, work_unit_id)| {
+                path.map(|path| (path, work_unit_id))
+                    .map_err(|_| "review partition unavailable")
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut reviews = self
+            .reviews
             .lock()
-            .map_err(|_| "server state unavailable")?
-            .insert(
-                handle.clone(),
-                Arc::new(OpenReview {
-                    root,
-                    inferred_base,
-                    identity,
-                    toolbox,
-                    diffs,
-                    changed_paths,
-                    anchor_ids,
-                    snapshot_digest: snapshot_digest.clone(),
-                    repository_policy,
-                }),
-            );
+            .map_err(|_| "server state unavailable")?;
+        if reviews.len() >= MAX_LIVE_REVIEWS
+            && let Some(oldest) = reviews
+                .iter()
+                .min_by_key(|(_, review)| review.opened_sequence)
+                .map(|(handle, _)| handle.clone())
+        {
+            reviews.remove(&oldest);
+        }
+        reviews.insert(
+            handle.clone(),
+            Arc::new(OpenReview {
+                root,
+                inferred_base,
+                identity,
+                toolbox,
+                diffs,
+                changed_paths,
+                anchors,
+                issued_anchors,
+                work_unit_by_path,
+                snapshot_digest: snapshot_digest.clone(),
+                repository_policy,
+                opened_sequence: sequence,
+            }),
+        );
         Ok(json!({"handle": handle, "snapshot": snapshot_digest}))
     }
 
-    fn review(&self, arguments: &JsonObject) -> Result<Arc<OpenReview>, &'static str> {
+    fn review(
+        &self,
+        arguments: &JsonObject,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<OpenReview>, &'static str> {
+        if cancellation.is_cancelled() {
+            return Err("tool call cancelled");
+        }
         let handle = arguments
             .get("handle")
             .and_then(Value::as_str)
@@ -179,20 +254,40 @@ impl RevootMcpServer {
             .get(handle)
             .cloned()
             .ok_or("stale or unknown review handle")?;
-        let current = capture_local_git(&review.root, Some(&review.inferred_base))
-            .map_err(|_| "stale or unknown review handle")?;
+        let current = capture_local_git(&review.root, Some(&review.inferred_base));
+        let Ok(current) = current else {
+            self.evict_handle(handle)?;
+            return Err("stale or unknown review handle");
+        };
+        if cancellation.is_cancelled() {
+            return Err("tool call cancelled");
+        }
         if current.identity != review.identity {
+            self.evict_handle(handle)?;
             return Err("stale or unknown review handle");
         }
         Ok(review)
     }
 
+    fn evict_handle(&self, handle: &str) -> Result<(), &'static str> {
+        self.reviews
+            .lock()
+            .map_err(|_| "server state unavailable")?
+            .remove(handle);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn execute(&self, name: &str, arguments: &JsonObject) -> Result<Value, &'static str> {
+    fn execute(
+        &self,
+        name: &str,
+        arguments: &JsonObject,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, &'static str> {
         if name == "revoot_open_review" {
-            return self.open_review(arguments);
+            return self.open_review(arguments, cancellation);
         }
-        let review = self.review(arguments)?;
+        let review = self.review(arguments, cancellation)?;
         match name {
             "revoot_list_changed_files" => {
                 let items = review
@@ -200,7 +295,19 @@ impl RevootMcpServer {
                     .manifest(&review.changed_paths)
                     .map_err(|_| "manifest unavailable")?
                     .into_iter()
-                    .map(|item| serde_json::to_value(item).map_err(|_| "serialization failed"))
+                    .map(|item| {
+                        let work_unit_id = review
+                            .work_unit_by_path
+                            .get(&item.path)
+                            .ok_or("manifest unavailable")?;
+                        let mut value =
+                            serde_json::to_value(item).map_err(|_| "serialization failed")?;
+                        value
+                            .as_object_mut()
+                            .ok_or("serialization failed")?
+                            .insert("work_unit_id".to_owned(), json!(work_unit_id));
+                        Ok::<Value, &'static str>(value)
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 self.paginate(&review, arguments, CursorTool::ListChangedFiles, &items)
             }
@@ -208,13 +315,42 @@ impl RevootMcpServer {
                 let items = diff_read_arguments(arguments)?
                     .into_iter()
                     .map(|(path, hunk, page)| {
-                        review
+                        let manifest = review
+                            .diffs
+                            .manifest(std::slice::from_ref(&path))
+                            .map_err(|_| "diff page unavailable")?;
+                        let indexed_hunk = manifest[0]
+                            .hunks
+                            .iter()
+                            .find(|indexed| indexed.hunk_id == hunk)
+                            .ok_or("diff page unavailable")?;
+                        let anchors = review
+                            .anchors
+                            .iter()
+                            .filter(|anchor| {
+                                anchor.path.old_path.as_str() == path.as_str()
+                                    || anchor.path.new_path.as_str() == path.as_str()
+                            })
+                            .filter(|anchor| anchor_in_hunk(anchor.position, indexed_hunk))
+                            .map(|anchor| {
+                                json!({
+                                    "anchor_id":anchor.id,
+                                    "position":anchor.position
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let mut value = review
                             .diffs
                             .read_hunk_page(&path, &hunk, page)
                             .map_err(|_| "diff page unavailable")
                             .and_then(|value| {
                                 serde_json::to_value(value).map_err(|_| "serialization failed")
-                            })
+                            })?;
+                        value
+                            .as_object_mut()
+                            .ok_or("serialization failed")?
+                            .insert("anchors".to_owned(), json!(anchors));
+                        Ok::<Value, &'static str>(value)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 self.paginate(&review, arguments, CursorTool::ReadDiff, &items)
@@ -230,7 +366,7 @@ impl RevootMcpServer {
                                 &path,
                                 LineRange { start, end },
                                 &mut budget,
-                                &CancellationToken::default(),
+                                cancellation,
                                 0,
                             )
                             .map_err(|_| "file read unavailable")
@@ -300,7 +436,7 @@ impl RevootMcpServer {
                             max_results: maximum,
                         },
                         &mut budget,
-                        &CancellationToken::default(),
+                        cancellation,
                         0,
                     )
                     .map_err(|_| "code search unavailable")?;
@@ -372,13 +508,22 @@ impl RevootMcpServer {
                 let findings: FindingsEnvelope =
                     serde_json::from_value(value).map_err(|_| "invalid findings")?;
                 findings.validate().map_err(|_| "invalid findings")?;
+                let issued = review.issued_anchors.get(&findings.work_unit_id);
                 let unknown = findings
                     .findings
                     .iter()
-                    .filter(|finding| !review.anchor_ids.contains(finding.anchor_id.as_str()))
+                    .filter(|finding| {
+                        issued.is_none_or(|anchors| {
+                            revoot_core::AnchorId::try_from(finding.anchor_id.clone())
+                                .map_or(true, |anchor| !anchors.contains(&anchor))
+                        })
+                    })
                     .map(|finding| finding.anchor_id.as_str())
                     .collect::<Vec<_>>();
-                Ok(json!({"valid": unknown.is_empty(), "unknown_anchor_ids": unknown}))
+                Ok(json!({
+                    "valid": issued.is_some() && unknown.is_empty(),
+                    "unknown_anchor_ids": unknown
+                }))
             }
             _ => Err("unknown tool"),
         }
@@ -458,20 +603,43 @@ impl ServerHandler for RevootMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let arguments = request.arguments.unwrap_or_default();
-        let result = match self.execute(request.name.as_ref(), &arguments) {
-            Ok(value) if encoded_value_len(&value) <= MCP_RESULT_BYTES => {
-                let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
-                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-                result.structured_content = Some(value);
-                result
+        let name = request.name.into_owned();
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let server = self.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            server.execute(&name, &arguments, &worker_cancellation)
+        });
+        let execution = tokio::select! {
+            result = &mut worker => result.map_err(|_| "tool execution failed"),
+            () = context.ct.cancelled() => {
+                cancellation.cancel(ProviderCancellationReason::UserRequested);
+                worker.await.map_err(|_| "tool execution failed")
             }
-            Ok(_) => CallToolResult::error(vec![ContentBlock::text("tool result exceeds limit")]),
-            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        let result = match execution {
+            Ok(Ok(value)) => bounded_success(value),
+            Ok(Err(message)) | Err(message) => {
+                CallToolResult::error(vec![ContentBlock::text(message)])
+            }
         };
         Ok(result.into())
+    }
+}
+
+fn bounded_success(value: Value) -> CallToolResult {
+    if encoded_value_len(&value) > MCP_RESULT_BYTES {
+        return CallToolResult::error(vec![ContentBlock::text("tool result exceeds limit")]);
+    }
+    let mut result = CallToolResult::success(Vec::new());
+    result.structured_content = Some(value);
+    if serde_json::to_vec(&result).map_or(true, |encoded| encoded.len() > MCP_RESULT_BYTES) {
+        CallToolResult::error(vec![ContentBlock::text("tool result exceeds limit")])
+    } else {
+        result
     }
 }
 
@@ -601,6 +769,23 @@ fn file_read_arguments(
 fn path_argument(arguments: &JsonObject) -> Result<RepositoryRelativePath, &'static str> {
     RepositoryRelativePath::try_from(string_argument(arguments, "path")?.to_owned())
         .map_err(|_| "invalid repository path")
+}
+
+fn anchor_in_hunk(position: AnchorPosition, hunk: &DiffHunkManifest) -> bool {
+    match position {
+        AnchorPosition::Deletion { old_line } => {
+            old_line >= hunk.old_start && old_line < hunk.old_start.saturating_add(hunk.old_count)
+        }
+        AnchorPosition::Addition { new_line } => {
+            new_line >= hunk.new_start && new_line < hunk.new_start.saturating_add(hunk.new_count)
+        }
+        AnchorPosition::Context { old_line, new_line } => {
+            old_line >= hunk.old_start
+                && old_line < hunk.old_start.saturating_add(hunk.old_count)
+                && new_line >= hunk.new_start
+                && new_line < hunk.new_start.saturating_add(hunk.new_count)
+        }
+    }
 }
 
 fn path_arguments(
@@ -739,13 +924,13 @@ fn local_budget() -> Result<AgentBudget, &'static str> {
 /// # Errors
 ///
 /// Returns a payload-free error if the runtime, transport, or protocol service fails.
-pub fn serve_stdio(_root: &Path) -> Result<(), &'static str> {
+pub fn serve_stdio(root: &Path) -> Result<(), &'static str> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| "MCP runtime unavailable")?;
     runtime.block_on(async {
-        let service = RevootMcpServer::new()?
+        let service = RevootMcpServer::new(root)?
             .serve(rmcp::transport::stdio())
             .await
             .map_err(|_| "MCP startup failed")?;
@@ -772,9 +957,14 @@ mod tests {
 
     impl ProtocolHarness {
         async fn start() -> Self {
+            Self::start_at(Path::new(".")).await
+        }
+
+        async fn start_at(root: &Path) -> Self {
             let (server_transport, client_transport) = tokio::io::duplex(256 * 1024);
+            let root = root.to_path_buf();
             let server = tokio::spawn(async move {
-                let service = RevootMcpServer::new()
+                let service = RevootMcpServer::new(&root)
                     .expect("server")
                     .serve(server_transport)
                     .await
@@ -812,7 +1002,7 @@ mod tests {
         async fn start_discover() -> Self {
             let (server_transport, client_transport) = tokio::io::duplex(256 * 1024);
             let server = tokio::spawn(async move {
-                let service = RevootMcpServer::new()
+                let service = RevootMcpServer::new(Path::new("."))
                     .expect("server")
                     .serve(server_transport)
                     .await
@@ -1067,6 +1257,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trusted_root_handle_capacity_and_total_result_bounds_fail_closed() {
+        let fixture = RepositoryFixture::new();
+        let server = RevootMcpServer::new(fixture.path()).expect("server");
+        let outside = RepositoryFixture::new();
+        let outside_arguments = json!({
+            "repository_root": outside.path(),
+            "base": "main"
+        });
+        assert_eq!(
+            server.open_review(
+                outside_arguments.as_object().expect("outside arguments"),
+                &CancellationToken::default(),
+            ),
+            Err("repository outside server authority")
+        );
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel(ProviderCancellationReason::UserRequested);
+        assert_eq!(
+            server.open_review(
+                outside_arguments.as_object().expect("outside arguments"),
+                &cancelled,
+            ),
+            Err("tool call cancelled")
+        );
+
+        let arguments = json!({"repository_root": fixture.path(), "base": "main"});
+        let first = server
+            .open_review(
+                arguments.as_object().expect("open arguments"),
+                &CancellationToken::default(),
+            )
+            .expect("first review");
+        let first_handle = first["handle"].as_str().expect("first handle").to_owned();
+        let first_directory = server
+            .reviews
+            .lock()
+            .expect("reviews")
+            .get(&first_handle)
+            .expect("first review")
+            .diffs
+            .directory_path()
+            .to_path_buf();
+        for _ in 1..=MAX_LIVE_REVIEWS {
+            server
+                .open_review(
+                    arguments.as_object().expect("open arguments"),
+                    &CancellationToken::default(),
+                )
+                .expect("bounded review");
+        }
+        assert_eq!(
+            server.reviews.lock().expect("reviews").len(),
+            MAX_LIVE_REVIEWS
+        );
+        assert!(
+            !server
+                .reviews
+                .lock()
+                .expect("reviews")
+                .contains_key(&first_handle)
+        );
+        assert!(!first_directory.exists());
+
+        let small = bounded_success(json!({"status":"ok"}));
+        assert!(serde_json::to_vec(&small).expect("small result").len() <= MCP_RESULT_BYTES);
+        assert!(small.content.is_empty());
+        let oversized = bounded_success(json!({"body":"x".repeat(MCP_RESULT_BYTES)}));
+        assert_eq!(oversized.is_error, Some(true));
+    }
+
     #[tokio::test]
     async fn protocol_negotiates_lists_tools_and_rejects_unknown_handles_cleanly() {
         let mut harness = ProtocolHarness::start().await;
@@ -1119,13 +1381,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_rejects_repository_roots_outside_server_authority() {
+        let trusted = tempfile::tempdir().expect("trusted root");
+        let outside = RepositoryFixture::new();
+        let mut harness = ProtocolHarness::start_at(trusted.path()).await;
+        let response = harness
+            .request(
+                7,
+                "tools/call",
+                json!({
+                    "name":"revoot_open_review",
+                    "arguments":{"repository_root":outside.path(),"base":"main"}
+                }),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "repository outside server authority"
+        );
+    }
+
+    #[tokio::test]
     #[allow(
         clippy::too_many_lines,
         reason = "one protocol session demonstrates handle freshness and effective rule reads"
     )]
     async fn protocol_calls_are_bounded_snapshot_bound_and_rules_are_effective() {
         let fixture = RepositoryFixture::new();
-        let mut harness = ProtocolHarness::start().await;
+        let mut harness = ProtocolHarness::start_at(fixture.path()).await;
         let opened = harness
             .request(
                 10,
@@ -1161,6 +1445,73 @@ mod tests {
             .await;
         assert_ne!(changed["result"]["isError"], true);
         assert!(encoded_value_len(&changed["result"]["structuredContent"]) <= 1024);
+        assert_eq!(changed["result"]["content"], json!([]));
+        let manifest = &changed["result"]["structuredContent"]["items"][0];
+        let work_unit_id = manifest["work_unit_id"]
+            .as_str()
+            .expect("work-unit ID")
+            .to_owned();
+        let hunk_id = manifest["hunks"][0]["hunk_id"]
+            .as_str()
+            .expect("hunk ID")
+            .to_owned();
+        let diff = harness
+            .request(
+                15,
+                "tools/call",
+                json!({
+                    "name":"revoot_read_diff",
+                    "arguments":{
+                        "handle":handle,
+                        "path":"src/lib.rs",
+                        "hunk_id":hunk_id,
+                        "page":1
+                    }
+                }),
+            )
+            .await;
+        let anchor_id = diff["result"]["structuredContent"]["items"][0]["anchors"][0]["anchor_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("issued anchor: {diff}"))
+            .to_owned();
+        let envelope = |unit: &str| {
+            json!({
+                "schema_version":"revoot.findings/v1",
+                "work_unit_id":unit,
+                "findings":[{
+                    "anchor_id":anchor_id,
+                    "severity":"high",
+                    "confidence_percent":90,
+                    "category":"correctness",
+                    "title":"Exact delivered issue",
+                    "explanation":"The delivered line demonstrates a concrete defect.",
+                    "evidence":"The exact issued anchor was read through the bounded diff tool."
+                }],
+                "summary":"One exact finding."
+            })
+        };
+        let valid = harness
+            .request(
+                16,
+                "tools/call",
+                json!({
+                    "name":"revoot_validate_findings",
+                    "arguments":{"handle":handle,"findings":envelope(&work_unit_id)}
+                }),
+            )
+            .await;
+        assert_eq!(valid["result"]["structuredContent"]["valid"], true);
+        let cross_unit = harness
+            .request(
+                17,
+                "tools/call",
+                json!({
+                    "name":"revoot_validate_findings",
+                    "arguments":{"handle":handle,"findings":envelope("wu1_fabricated")}
+                }),
+            )
+            .await;
+        assert_eq!(cross_unit["result"]["structuredContent"]["valid"], false);
 
         let metadata = harness
             .request(

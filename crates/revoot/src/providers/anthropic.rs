@@ -252,11 +252,14 @@ pub fn decode_sse_fixture(input: &[u8]) -> Result<Vec<ModelStreamEvent>, Provide
     let text = std::str::from_utf8(input).map_err(|_| json_error())?;
     let mut events = Vec::new();
     let mut input_usage = ModelUsage::default();
-    for record in text
+    let mut started = false;
+    let mut completed = false;
+    for (record_index, record) in text
         .split("\n\n")
         .filter(|record| !record.trim().is_empty())
+        .enumerate()
     {
-        if record.len() > MAX_SSE_EVENT_BYTES || events.len() >= MAX_SSE_EVENTS {
+        if record.len() > MAX_SSE_EVENT_BYTES || record_index >= MAX_SSE_EVENTS {
             return Err(json_error());
         }
         let data = record
@@ -265,16 +268,24 @@ pub fn decode_sse_fixture(input: &[u8]) -> Result<Vec<ModelStreamEvent>, Provide
             .ok_or_else(json_error)?;
         let value: Value = serde_json::from_str(data).map_err(|_| json_error())?;
         let root = object(&value)?;
-        match string(root, "type")? {
+        let event_type = string(root, "type")?;
+        if completed && event_type != "message_stop" {
+            return Err(json_error());
+        }
+        match event_type {
             "message_start" => {
-                let message = object(required(root, "message")?)?;
-                input_usage = decode_usage(required(message, "usage")?)?;
-                events.push(ModelStreamEvent::MessageStart {
-                    provider_response_id: Some(bounded_string(message, "id", 256)?),
-                    model: bounded_string(message, "model", 256)?,
-                });
+                if started {
+                    return Err(json_error());
+                }
+                let (event, usage) = decode_sse_message_start(root)?;
+                events.push(event);
+                input_usage = usage;
+                started = true;
             }
             "content_block_start" => {
+                if !started {
+                    return Err(json_error());
+                }
                 let index = u32_field(root, "index")?;
                 let block = object(required(root, "content_block")?)?;
                 if string(block, "type")? == "tool_use" {
@@ -286,6 +297,9 @@ pub fn decode_sse_fixture(input: &[u8]) -> Result<Vec<ModelStreamEvent>, Provide
                 }
             }
             "content_block_delta" => {
+                if !started {
+                    return Err(json_error());
+                }
                 let index = u32_field(root, "index")?;
                 let delta = object(required(root, "delta")?)?;
                 match string(delta, "type")? {
@@ -304,20 +318,11 @@ pub fn decode_sse_fixture(input: &[u8]) -> Result<Vec<ModelStreamEvent>, Provide
                 }
             }
             "message_delta" => {
-                let delta = object(required(root, "delta")?)?;
-                let usage = object(required(root, "usage")?)?;
-                input_usage.output_tokens = u64_field(usage, "output_tokens")?;
-                let finish_reason = match string(delta, "stop_reason")? {
-                    "end_turn" | "stop_sequence" => ModelFinishReason::Stop,
-                    "tool_use" => ModelFinishReason::ToolUse,
-                    "max_tokens" => ModelFinishReason::Length,
-                    "refusal" => ModelFinishReason::ContentFilter,
-                    _ => ModelFinishReason::Unknown,
-                };
-                events.push(ModelStreamEvent::MessageComplete {
-                    finish_reason,
-                    usage: input_usage,
-                });
+                if !started {
+                    return Err(json_error());
+                }
+                events.push(decode_sse_message_complete(root, input_usage)?);
+                completed = true;
             }
             "ping" | "content_block_stop" | "message_stop" => {}
             "error" => {
@@ -330,10 +335,43 @@ pub fn decode_sse_fixture(input: &[u8]) -> Result<Vec<ModelStreamEvent>, Provide
             _ => return Err(json_error()),
         }
     }
-    if events.is_empty() {
+    if !started || !completed {
         return Err(json_error());
     }
     Ok(events)
+}
+
+fn decode_sse_message_start(
+    root: &Map<String, Value>,
+) -> Result<(ModelStreamEvent, ModelUsage), ProviderError> {
+    let message = object(required(root, "message")?)?;
+    let usage = decode_usage(required(message, "usage")?)?;
+    Ok((
+        ModelStreamEvent::MessageStart {
+            provider_response_id: Some(bounded_string(message, "id", 256)?),
+            model: bounded_string(message, "model", 256)?,
+        },
+        usage,
+    ))
+}
+
+fn decode_sse_message_complete(
+    root: &Map<String, Value>,
+    mut usage: ModelUsage,
+) -> Result<ModelStreamEvent, ProviderError> {
+    let delta = object(required(root, "delta")?)?;
+    usage.output_tokens = u64_field(object(required(root, "usage")?)?, "output_tokens")?;
+    let finish_reason = match string(delta, "stop_reason")? {
+        "end_turn" | "stop_sequence" => ModelFinishReason::Stop,
+        "tool_use" => ModelFinishReason::ToolUse,
+        "max_tokens" => ModelFinishReason::Length,
+        "refusal" => ModelFinishReason::ContentFilter,
+        _ => ModelFinishReason::Unknown,
+    };
+    Ok(ModelStreamEvent::MessageComplete {
+        finish_reason,
+        usage,
+    })
 }
 
 fn object(value: &Value) -> Result<&Map<String, Value>, ProviderError> {
@@ -413,6 +451,41 @@ mod tests {
     }
 
     #[test]
+    fn request_fixture_preserves_batched_tool_result_ids_in_order() {
+        let request = ModelRequest {
+            model: "claude-test".to_owned(),
+            system: Some("Review code".to_owned()),
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                content: vec![
+                    ModelContent::ToolResult {
+                        tool_use_id: "toolu_01".to_owned(),
+                        content: "first".to_owned(),
+                        is_error: false,
+                    },
+                    ModelContent::ToolResult {
+                        tool_use_id: "toolu_02".to_owned(),
+                        content: "second".to_owned(),
+                        is_error: false,
+                    },
+                ],
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 512,
+            temperature: None,
+        };
+        let encoded = encode_request(&request);
+        assert_eq!(
+            encoded["messages"][0]["content"][0]["tool_use_id"],
+            "toolu_01"
+        );
+        assert_eq!(
+            encoded["messages"][0]["content"][1]["tool_use_id"],
+            "toolu_02"
+        );
+    }
+
+    #[test]
     fn recorded_response_fixture_normalizes_tool_use() {
         let fixture = br#"{
           "id":"msg_01","type":"message","role":"assistant","model":"claude-test",
@@ -424,6 +497,29 @@ mod tests {
         assert_eq!(response.finish_reason, ModelFinishReason::ToolUse);
         assert_eq!(response.usage.cached_input_tokens, 5);
         assert!(matches!(response.content[1], ModelContent::ToolUse { .. }));
+    }
+
+    #[test]
+    fn recorded_response_preserves_parallel_tool_call_ids_in_order() {
+        let fixture = br#"{
+          "id":"msg_01","type":"message","role":"assistant","model":"claude-test",
+          "content":[
+            {"type":"tool_use","id":"toolu_01","name":"read_file","input":{"path":"src/a.rs"}},
+            {"type":"tool_use","id":"toolu_02","name":"read_file","input":{"path":"src/b.rs"}}
+          ],
+          "stop_reason":"tool_use",
+          "usage":{"input_tokens":21,"output_tokens":8}
+        }"#;
+        let response = decode_response(fixture).expect("valid recorded fixture");
+        let ids = response
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                ModelContent::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["toolu_01", "toolu_02"]);
     }
 
     #[test]
@@ -455,6 +551,39 @@ data: {"type":"message_stop"}
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn recorded_sse_rejects_incomplete_out_of_order_and_oversized_events() {
+        let incomplete = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","model":"claude-test","usage":{"input_tokens":1,"output_tokens":0}}}
+
+"#;
+        assert_eq!(
+            decode_sse_fixture(incomplete)
+                .expect_err("completion is mandatory")
+                .kind(),
+            ProviderErrorKind::Protocol
+        );
+
+        let out_of_order = br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"secret"}}
+
+"#;
+        let error = decode_sse_fixture(out_of_order).expect_err("start is mandatory");
+        assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+        assert!(!format!("{error:?}").contains("secret"));
+
+        let oversized = format!(
+            "data: {{\"type\":\"ping\",\"padding\":\"{}\"}}\n\n",
+            "x".repeat(MAX_SSE_EVENT_BYTES)
+        );
+        assert_eq!(
+            decode_sse_fixture(oversized.as_bytes())
+                .expect_err("event is bounded")
+                .kind(),
+            ProviderErrorKind::Protocol
+        );
     }
 
     #[test]
