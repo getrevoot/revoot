@@ -15,7 +15,7 @@ use revoot_core::{
     AnchorTable, AuthorizedLineageDecision, CancellationToken, GroupCoverageLedger,
     PriorReviewContext, PriorReviewSource, PriorReviewState, RepositoryToolbox, ReviewBudgetBroker,
     ReviewBudgetUsage, ReviewEffort, ReviewGroupId, ReviewOutcome, ReviewPartitionPlan,
-    Sha256Digest, VerifiedCandidate,
+    ReviewReportPhase, ReviewReportPhaseUsage, Sha256Digest, VerifiedCandidate,
 };
 
 use crate::config::RepositoryReviewPolicy;
@@ -134,6 +134,7 @@ pub struct ToolFirstEngineReport {
     pub verified_candidates: u32,
     pub verification_suppressions: u32,
     pub budget_usage: ReviewBudgetUsage,
+    pub phase_usage: Vec<ReviewReportPhaseUsage>,
 }
 
 /// Closed phase failure without provider or repository payloads.
@@ -209,6 +210,10 @@ where
     execute_and_reduce(request, prepared).await
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the top-level phase sequence keeps artifact lifetime and accounting reconciliation visible"
+)]
 async fn execute_and_reduce<C>(
     request: ToolFirstEngineRequest<C>,
     prepared: ToolFirstPreparedReview,
@@ -221,6 +226,7 @@ where
         selected_inputs,
         group_plan,
         grouping_mode,
+        grouping_usage,
         packets,
     } = prepared;
     let group_inputs =
@@ -313,7 +319,19 @@ where
         &request.prior_review,
     )
     .map_err(ToolFirstEngineError::Reduction)?;
-    let budget_usage = request.budget.snapshot().usage;
+    let budget_snapshot = request.budget.snapshot();
+    if budget_snapshot.outstanding != revoot_core::OutstandingReviewReservations::default() {
+        return Err(ToolFirstEngineError::ExecutionAccounting);
+    }
+    let budget_usage = budget_snapshot.usage;
+    let phase_usage = ordered_phase_usage(
+        grouping_usage,
+        execution.phase_usage.planning,
+        execution.phase_usage.review,
+        execution.phase_usage.verification,
+        adjudication.usage,
+    );
+    reconcile_phase_usage(&phase_usage, budget_usage)?;
     apply_aggregate_usage(&mut result.outcome, budget_usage, verified.len())?;
     Ok(ToolFirstEngineReport {
         result,
@@ -327,7 +345,67 @@ where
             .map_err(|_| ToolFirstEngineError::ExecutionAccounting)?,
         verification_suppressions,
         budget_usage,
+        phase_usage,
     })
+}
+
+fn ordered_phase_usage(
+    grouping: ReviewBudgetUsage,
+    planning: ReviewBudgetUsage,
+    review: ReviewBudgetUsage,
+    verification: ReviewBudgetUsage,
+    adjudication: ReviewBudgetUsage,
+) -> Vec<ReviewReportPhaseUsage> {
+    [
+        (ReviewReportPhase::Grouping, grouping),
+        (ReviewReportPhase::Planning, planning),
+        (ReviewReportPhase::Review, review),
+        (ReviewReportPhase::Verification, verification),
+        (ReviewReportPhase::Adjudication, adjudication),
+    ]
+    .into_iter()
+    .map(|(phase, usage)| ReviewReportPhaseUsage {
+        phase,
+        model_requests: usage.model_requests,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        tool_calls: usage.tool_calls,
+        cost_microusd: usage.cost_microusd,
+    })
+    .collect()
+}
+
+fn reconcile_phase_usage(
+    phases: &[ReviewReportPhaseUsage],
+    aggregate: ReviewBudgetUsage,
+) -> Result<(), ToolFirstEngineError> {
+    let totals = phases
+        .iter()
+        .try_fold(
+            (0_u32, 0_u64, 0_u64, 0_u32, 0_u64),
+            |(requests, input, output, tools, cost), phase| {
+                Some((
+                    requests.checked_add(phase.model_requests)?,
+                    input.checked_add(phase.input_tokens)?,
+                    output.checked_add(phase.output_tokens)?,
+                    tools.checked_add(phase.tool_calls)?,
+                    cost.checked_add(phase.cost_microusd)?,
+                ))
+            },
+        )
+        .ok_or(ToolFirstEngineError::ExecutionAccounting)?;
+    if totals
+        != (
+            aggregate.model_requests,
+            aggregate.input_tokens,
+            aggregate.output_tokens,
+            aggregate.tool_calls,
+            aggregate.cost_microusd,
+        )
+    {
+        return Err(ToolFirstEngineError::ExecutionAccounting);
+    }
+    Ok(())
 }
 
 fn validate_request<C>(request: &ToolFirstEngineRequest<C>) -> Result<(), ToolFirstEngineError> {
@@ -884,6 +962,22 @@ mod tests {
             result.result.outcome,
             ReviewOutcome::NoFindings { .. }
         ));
+        assert_eq!(
+            result
+                .phase_usage
+                .iter()
+                .map(|usage| usage.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ReviewReportPhase::Grouping,
+                ReviewReportPhase::Planning,
+                ReviewReportPhase::Review,
+                ReviewReportPhase::Verification,
+                ReviewReportPhase::Adjudication,
+            ]
+        );
+        reconcile_phase_usage(&result.phase_usage, result.budget_usage)
+            .expect("phase totals reconcile");
         assert_eq!(
             provider.calls.load(Ordering::Relaxed),
             usize::try_from(result.group_count).expect("group count") + 1

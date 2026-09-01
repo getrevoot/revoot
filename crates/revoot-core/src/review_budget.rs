@@ -105,6 +105,53 @@ pub struct ReviewModelUsage {
     pub cost_microusd: u64,
 }
 
+/// Payload-free usage charged for exactly one successfully reserved provider call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReviewCallUsage {
+    pub model_requests: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_microusd: u64,
+}
+
+impl ReviewCallUsage {
+    #[must_use]
+    pub const fn conservative(reservation: ReviewModelReservation) -> Self {
+        Self {
+            model_requests: 1,
+            input_tokens: reservation.input_tokens,
+            output_tokens: reservation.output_tokens,
+            cost_microusd: reservation.cost_microusd,
+        }
+    }
+
+    #[must_use]
+    pub const fn settled(settlement: ReviewModelSettlement) -> Self {
+        let usage = match settlement {
+            ReviewModelSettlement::Reported(usage)
+            | ReviewModelSettlement::Conservative { charged: usage, .. } => usage,
+        };
+        Self {
+            model_requests: 1,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cost_microusd: usage.cost_microusd,
+        }
+    }
+
+    #[must_use]
+    pub const fn into_budget_usage(self) -> ReviewBudgetUsage {
+        ReviewBudgetUsage {
+            model_requests: self.model_requests,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            tool_calls: 0,
+            cost_microusd: self.cost_microusd,
+            elapsed_millis: 0,
+        }
+    }
+}
+
 /// Settled aggregate usage. Outstanding capacity is reported separately.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -808,6 +855,35 @@ mod tests {
             })
         );
         assert_eq!(broker.snapshot().usage.input_tokens, 80);
+    }
+
+    #[test]
+    fn per_call_usage_matches_reported_and_conservative_settlements() {
+        let reported = ReviewModelSettlement::Reported(ReviewModelUsage {
+            input_tokens: 12,
+            output_tokens: 3,
+            cost_microusd: 4,
+        });
+        assert_eq!(
+            ReviewCallUsage::settled(reported).into_budget_usage(),
+            ReviewBudgetUsage {
+                model_requests: 1,
+                input_tokens: 12,
+                output_tokens: 3,
+                cost_microusd: 4,
+                ..ReviewBudgetUsage::default()
+            }
+        );
+        assert_eq!(
+            ReviewCallUsage::conservative(reservation()).into_budget_usage(),
+            ReviewBudgetUsage {
+                model_requests: 1,
+                input_tokens: 80,
+                output_tokens: 20,
+                cost_microusd: 10,
+                ..ReviewBudgetUsage::default()
+            }
+        );
     }
 
     #[test]

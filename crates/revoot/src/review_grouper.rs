@@ -3,8 +3,8 @@
 use revoot_core::provider::ProviderAdapter;
 use revoot_core::{
     CancellationToken, ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRole,
-    ReviewBudgetBroker, ReviewGroupPlan, ReviewModelReservation, ReviewModelUsage,
-    ReviewPartitionPlan,
+    ReviewBudgetBroker, ReviewBudgetUsage, ReviewCallUsage, ReviewGroupPlan,
+    ReviewModelReservation, ReviewModelUsage, ReviewPartitionPlan,
 };
 
 use crate::grouping::{
@@ -68,6 +68,7 @@ pub enum ReviewGrouperMode {
 pub struct ReviewGrouperOutcome {
     pub plan: ReviewGroupPlan,
     pub mode: ReviewGrouperMode,
+    pub usage: ReviewBudgetUsage,
 }
 
 /// Stable trusted-input failure. Provider-side failures are outcomes, not errors.
@@ -109,6 +110,7 @@ pub async fn run_review_grouper(
             return Ok(ReviewGrouperOutcome {
                 plan,
                 mode: ReviewGrouperMode::DeterministicSmallSelection,
+                usage: ReviewBudgetUsage::default(),
             });
         }
         GroupingPreparation::MetadataRequest(metadata) => metadata,
@@ -120,6 +122,7 @@ pub async fn run_review_grouper(
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::Cancelled,
+            ReviewBudgetUsage::default(),
         ));
     }
     let input = metadata
@@ -148,6 +151,7 @@ pub async fn run_review_grouper(
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::InputTooLarge,
+            ReviewBudgetUsage::default(),
         ));
     }
     let reservation = ReviewModelReservation {
@@ -159,12 +163,14 @@ pub async fn run_review_grouper(
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::BudgetUnavailable,
+            ReviewBudgetUsage::default(),
         ));
     };
     let Ok(response) = adapter.complete(&request, cancellation).await else {
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::ProviderFailure,
+            ReviewCallUsage::conservative(reservation).into_budget_usage(),
         ));
     };
     let usage = (response.usage.input_tokens != 0 || response.usage.output_tokens != 0).then_some(
@@ -174,33 +180,40 @@ pub async fn run_review_grouper(
             cost_microusd: config.reserved_cost_microusd,
         },
     );
-    if permit.commit(usage, clock.now_millis()).is_err() {
+    let Ok(settlement) = permit.commit(usage, clock.now_millis()) else {
+        let usage = ReviewCallUsage::conservative(reservation).into_budget_usage();
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::BudgetSettlement,
+            usage,
         ));
-    }
+    };
+    let call_usage = ReviewCallUsage::settled(settlement).into_budget_usage();
     if response.finish_reason != ModelFinishReason::Stop || response.content.len() != 1 {
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::InvalidResponse,
+            call_usage,
         ));
     }
     let Some(ModelContent::Text { text }) = response.content.first() else {
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::InvalidResponse,
+            call_usage,
         ));
     };
     let Ok(plan) = parse_grouping_proposal(partition, text.as_bytes()) else {
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::InvalidResponse,
+            call_usage,
         ));
     };
     Ok(ReviewGrouperOutcome {
         plan,
         mode: ReviewGrouperMode::Semantic,
+        usage: call_usage,
     })
 }
 
@@ -219,10 +232,12 @@ fn validate_config(config: &ReviewGrouperConfig) -> Result<(), ReviewGrouperErro
 fn fallback_outcome(
     plan: ReviewGroupPlan,
     reason: ReviewGrouperFallbackReason,
+    usage: ReviewBudgetUsage,
 ) -> ReviewGrouperOutcome {
     ReviewGrouperOutcome {
         plan,
         mode: ReviewGrouperMode::DeterministicFallback(reason),
+        usage,
     }
 }
 
@@ -353,6 +368,9 @@ mod tests {
         .expect("semantic grouping");
         assert_eq!(outcome.mode, ReviewGrouperMode::Semantic);
         assert_eq!(outcome.plan.source, ReviewGroupingSource::Semantic);
+        assert_eq!(outcome.usage.model_requests, 1);
+        assert_eq!(outcome.usage.input_tokens, 100);
+        assert_eq!(outcome.usage.output_tokens, 30);
         assert_eq!(adapter.request_count(), 1);
         let requests = adapter.requests.lock().expect("requests");
         assert!(requests[0].tools.is_empty());
@@ -504,6 +522,9 @@ mod tests {
             .await
             .expect("fallback");
             assert_fallback(&outcome, reason);
+            assert_eq!(outcome.usage.model_requests, 1);
+            assert!(outcome.usage.input_tokens > 0);
+            assert!(outcome.usage.output_tokens > 0);
             assert_eq!(adapter.request_count(), 1);
         }
     }

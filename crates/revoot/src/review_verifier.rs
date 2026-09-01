@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use revoot_core::provider::ProviderAdapter;
 use revoot_core::{
     CancellationToken, ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRole,
-    PreparedVerificationBatch, ReviewBudgetBroker, ReviewModelReservation, ReviewModelUsage,
-    VerificationOutcome, VerifierDecision, VerifierDecisionKind, VerifierResponse,
-    VerifierSuppressionReason, apply_verifier_response,
+    PreparedVerificationBatch, ReviewBudgetBroker, ReviewBudgetUsage, ReviewCallUsage,
+    ReviewModelReservation, ReviewModelUsage, VerificationOutcome, VerifierDecision,
+    VerifierDecisionKind, VerifierResponse, VerifierSuppressionReason, apply_verifier_response,
 };
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +81,13 @@ pub enum ReviewVerifierOutcome {
     NoCandidates,
     Verified(VerificationOutcome),
     Partial(PartialVerifierSuppression),
+}
+
+/// Payload-free verifier outcome paired with the exact broker charge for its call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewVerifierRun {
+    pub outcome: ReviewVerifierOutcome,
+    pub usage: ReviewBudgetUsage,
 }
 
 #[derive(Serialize)]
@@ -167,25 +174,68 @@ pub async fn run_review_verifier(
     cancellation: &CancellationToken,
     clock: &dyn ReviewVerifierClock,
 ) -> ReviewVerifierOutcome {
+    run_review_verifier_accounted(
+        adapter,
+        config,
+        batch,
+        evidence,
+        aggregate_budget,
+        cancellation,
+        clock,
+    )
+    .await
+    .outcome
+}
+
+/// Run the verifier and retain the exact payload-free charge for phase accounting.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the one-call fail-closed lifecycle keeps each conservative charge adjacent to its outcome"
+)]
+pub async fn run_review_verifier_accounted(
+    adapter: &dyn ProviderAdapter,
+    config: &ReviewVerifierConfig,
+    batch: &PreparedVerificationBatch,
+    evidence: Vec<VerifierEvidence>,
+    aggregate_budget: &ReviewBudgetBroker,
+    cancellation: &CancellationToken,
+    clock: &dyn ReviewVerifierClock,
+) -> ReviewVerifierRun {
+    let finish = |outcome, usage| ReviewVerifierRun { outcome, usage };
     if batch.candidates.is_empty() {
-        return ReviewVerifierOutcome::NoCandidates;
+        return finish(
+            ReviewVerifierOutcome::NoCandidates,
+            ReviewBudgetUsage::default(),
+        );
     }
     let partial = |reason| partial_suppression(batch, reason);
     if cancellation.is_cancelled() {
-        return partial(ReviewVerifierFailureReason::Cancelled);
+        return finish(
+            partial(ReviewVerifierFailureReason::Cancelled),
+            ReviewBudgetUsage::default(),
+        );
     }
     if !valid_config(config) {
-        return partial(ReviewVerifierFailureReason::InvalidConfiguration);
+        return finish(
+            partial(ReviewVerifierFailureReason::InvalidConfiguration),
+            ReviewBudgetUsage::default(),
+        );
     }
     let Ok(evidence) = validate_evidence(batch, evidence) else {
-        return partial(ReviewVerifierFailureReason::InvalidEvidence);
+        return finish(
+            partial(ReviewVerifierFailureReason::InvalidEvidence),
+            ReviewBudgetUsage::default(),
+        );
     };
     let Ok(input) = serde_json::to_string(&VerifierInput {
         schema_version: VerifierResponse::SCHEMA_VERSION,
         candidates: &batch.candidates,
         evidence: &evidence,
     }) else {
-        return partial(ReviewVerifierFailureReason::InvalidEvidence);
+        return finish(
+            partial(ReviewVerifierFailureReason::InvalidEvidence),
+            ReviewBudgetUsage::default(),
+        );
     };
     let request = ModelRequest {
         model: config.model.clone(),
@@ -199,12 +249,25 @@ pub async fn run_review_verifier(
         temperature: None,
     };
     if request.validate().is_err() {
-        return partial(ReviewVerifierFailureReason::InvalidConfiguration);
+        return finish(
+            partial(ReviewVerifierFailureReason::InvalidConfiguration),
+            ReviewBudgetUsage::default(),
+        );
     }
     let request_bytes = match serde_json::to_vec(&request) {
         Ok(bytes) if bytes.len() <= config.max_input_bytes => bytes.len(),
-        Ok(_) => return partial(ReviewVerifierFailureReason::InputTooLarge),
-        Err(_) => return partial(ReviewVerifierFailureReason::InvalidEvidence),
+        Ok(_) => {
+            return finish(
+                partial(ReviewVerifierFailureReason::InputTooLarge),
+                ReviewBudgetUsage::default(),
+            );
+        }
+        Err(_) => {
+            return finish(
+                partial(ReviewVerifierFailureReason::InvalidEvidence),
+                ReviewBudgetUsage::default(),
+            );
+        }
     };
     let reservation = ReviewModelReservation {
         input_tokens: u64::try_from(request_bytes).unwrap_or(u64::MAX),
@@ -212,10 +275,17 @@ pub async fn run_review_verifier(
         cost_microusd: config.reserved_cost_microusd,
     };
     let Ok(permit) = aggregate_budget.reserve_model_request(reservation, clock.now_millis()) else {
-        return partial(ReviewVerifierFailureReason::BudgetUnavailable);
+        return finish(
+            partial(ReviewVerifierFailureReason::BudgetUnavailable),
+            ReviewBudgetUsage::default(),
+        );
     };
     let Ok(response) = adapter.complete(&request, cancellation).await else {
-        return partial(ReviewVerifierFailureReason::ProviderFailure);
+        drop(permit);
+        return finish(
+            partial(ReviewVerifierFailureReason::ProviderFailure),
+            ReviewCallUsage::conservative(reservation).into_budget_usage(),
+        );
     };
     let reported_usage = (response.usage.input_tokens != 0 || response.usage.output_tokens != 0)
         .then_some(ReviewModelUsage {
@@ -225,25 +295,29 @@ pub async fn run_review_verifier(
             // request cost, so the conservative reservation remains charged.
             cost_microusd: config.reserved_cost_microusd,
         });
-    if permit.commit(reported_usage, clock.now_millis()).is_err() {
-        return partial(ReviewVerifierFailureReason::BudgetSettlement);
-    }
+    let Ok(settlement) = permit.commit(reported_usage, clock.now_millis()) else {
+        return finish(
+            partial(ReviewVerifierFailureReason::BudgetSettlement),
+            ReviewCallUsage::conservative(reservation).into_budget_usage(),
+        );
+    };
+    let usage = ReviewCallUsage::settled(settlement).into_budget_usage();
     if response.finish_reason != ModelFinishReason::Stop || response.content.len() != 1 {
-        return partial(ReviewVerifierFailureReason::InvalidResponse);
+        return finish(partial(ReviewVerifierFailureReason::InvalidResponse), usage);
     }
     let Some(ModelContent::Text { text }) = response.content.first() else {
-        return partial(ReviewVerifierFailureReason::InvalidResponse);
+        return finish(partial(ReviewVerifierFailureReason::InvalidResponse), usage);
     };
     if text.len() > MAX_VERIFIER_RESPONSE_BYTES {
-        return partial(ReviewVerifierFailureReason::InvalidResponse);
+        return finish(partial(ReviewVerifierFailureReason::InvalidResponse), usage);
     }
     let verifier_response = match serde_json::from_str::<WireVerifierResponse>(text) {
         Ok(response) => response.into_domain(),
-        Err(_) => return partial(ReviewVerifierFailureReason::InvalidResponse),
+        Err(_) => return finish(partial(ReviewVerifierFailureReason::InvalidResponse), usage),
     };
     match apply_verifier_response(batch, verifier_response) {
-        Ok(outcome) => ReviewVerifierOutcome::Verified(outcome),
-        Err(_) => partial(ReviewVerifierFailureReason::InvalidResponse),
+        Ok(outcome) => finish(ReviewVerifierOutcome::Verified(outcome), usage),
+        Err(_) => finish(partial(ReviewVerifierFailureReason::InvalidResponse), usage),
     }
 }
 
@@ -468,7 +542,7 @@ mod tests {
                 },
             },
         ]))]);
-        let outcome = run_review_verifier(
+        let run = run_review_verifier_accounted(
             &adapter,
             &ReviewVerifierConfig::new("fixture-model"),
             &batch,
@@ -478,6 +552,10 @@ mod tests {
             &TestClock::default(),
         )
         .await;
+        assert_eq!(run.usage.model_requests, 1);
+        assert_eq!(run.usage.input_tokens, 100);
+        assert_eq!(run.usage.output_tokens, 30);
+        let outcome = run.outcome;
         let ReviewVerifierOutcome::Verified(outcome) = outcome else {
             panic!("expected verified outcome, got {outcome:?}")
         };
@@ -577,7 +655,7 @@ mod tests {
             Some(503),
             true,
         ))]);
-        let outcome = run_review_verifier(
+        let run = run_review_verifier_accounted(
             &adapter,
             &ReviewVerifierConfig::new("fixture-model"),
             &batch,
@@ -587,6 +665,10 @@ mod tests {
             &TestClock::default(),
         )
         .await;
+        assert_eq!(run.usage.model_requests, 1);
+        assert!(run.usage.input_tokens > 0);
+        assert_eq!(run.usage.output_tokens, 4_096);
+        let outcome = run.outcome;
         assert_eq!(
             outcome,
             ReviewVerifierOutcome::Partial(PartialVerifierSuppression {

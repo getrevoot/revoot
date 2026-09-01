@@ -6,7 +6,8 @@ use std::fmt;
 use revoot_core::provider::ProviderAdapter;
 use revoot_core::{
     AnchorTable, CancellationToken, RepositoryRelativePath, RepositoryToolbox, ReviewBudgetBroker,
-    ReviewEffort, ReviewGroupId, ReviewGroupPlan, ReviewPartitionPlan, Sha256Digest,
+    ReviewBudgetUsage, ReviewEffort, ReviewGroupId, ReviewGroupPlan, ReviewPartitionPlan,
+    Sha256Digest,
 };
 
 use crate::diff_artifact::{DEFAULT_DIFF_PAGE_BYTES, DiffArtifactStore};
@@ -72,6 +73,7 @@ pub struct ToolFirstPreparedReview {
     pub selected_inputs: TrustedSelectedReviewInputs,
     pub group_plan: ReviewGroupPlan,
     pub grouping_mode: ReviewGrouperMode,
+    pub grouping_usage: ReviewBudgetUsage,
     pub packets: BTreeMap<ReviewGroupId, PreparedReviewGroupPacket>,
 }
 
@@ -82,6 +84,7 @@ impl fmt::Debug for ToolFirstPreparedReview {
             .field("artifact_count", &self.artifacts.artifact_count())
             .field("group_count", &self.group_plan.groups.len())
             .field("grouping_mode", &self.grouping_mode)
+            .field("grouping_usage", &self.grouping_usage)
             .field("packet_count", &self.packets.len())
             .finish_non_exhaustive()
     }
@@ -208,6 +211,7 @@ async fn finish_preparation(
         selected_inputs,
         group_plan: grouping.plan,
         grouping_mode: grouping.mode,
+        grouping_usage: grouping.usage,
         packets,
     })
 }

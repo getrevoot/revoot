@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use revoot_core::{
     AgentBudgetUsage, CancellationToken, GroupCoverageLedger, ProviderAdapter, ReviewBudgetBroker,
-    ReviewGroupId, ReviewGroupPlan, SuppressedVerificationCandidate, VerifiedCandidate,
+    ReviewBudgetUsage, ReviewGroupId, ReviewGroupPlan, SuppressedVerificationCandidate,
+    VerifiedCandidate,
 };
 
 use crate::diff_artifact::DiffArtifactStore;
@@ -26,7 +27,8 @@ use crate::review_group_packet::PreparedReviewGroupPacket;
 use crate::review_rule_bundle::ReviewRuleBundle;
 use crate::review_verifier::{
     PartialVerifierSuppression, ReviewVerifierClock, ReviewVerifierConfig,
-    ReviewVerifierFailureReason, ReviewVerifierOutcome, VerifierEvidence, run_review_verifier,
+    ReviewVerifierFailureReason, ReviewVerifierOutcome, VerifierEvidence,
+    run_review_verifier_accounted,
 };
 
 /// One prepared group and its host-backed discussion context.
@@ -81,8 +83,17 @@ pub struct ExecutedReviewGroup {
     pub verification: GroupVerificationStatus,
     pub coverage: GroupCoverageLedger,
     pub usage: AgentBudgetUsage,
+    pub phase_usage: ReviewGroupExecutionPhaseUsage,
     pub provider_turns: u32,
     pub tool_calls: u32,
+}
+
+/// Exact payload-free broker charges attributed to one isolated group.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReviewGroupExecutionPhaseUsage {
+    pub planning: ReviewBudgetUsage,
+    pub review: ReviewBudgetUsage,
+    pub verification: ReviewBudgetUsage,
 }
 
 /// Complete concurrent execution reduction in scheduler priority order.
@@ -91,6 +102,7 @@ pub struct ReviewGroupExecutionReport {
     pub groups: Vec<ExecutedReviewGroup>,
     pub schedule: GroupScheduleSnapshot,
     pub stop_reason: Option<GroupRuntimeStopReason>,
+    pub phase_usage: ReviewGroupExecutionPhaseUsage,
 }
 
 /// Payload-free orchestration construction or runtime failure.
@@ -325,7 +337,7 @@ where
     C: ReviewVerifierClock,
 {
     let evidence = required_verifier_evidence(&worker);
-    let verification = run_review_verifier(
+    let verifier = run_review_verifier_accounted(
         provider,
         verifier_config,
         &worker.candidates,
@@ -335,7 +347,7 @@ where
         clock,
     )
     .await;
-    let (verification, verifier_failed) = verification_status(verification);
+    let (verification, verifier_failed) = verification_status(verifier.outcome);
     let worker_outcome = scheduler_outcome(&worker.status);
     let result = ExecutedReviewGroup {
         group_id: scheduled.group.id.clone(),
@@ -344,6 +356,11 @@ where
         verification,
         coverage: worker.coverage,
         usage: worker.usage,
+        phase_usage: ReviewGroupExecutionPhaseUsage {
+            planning: worker.phase_usage.planning,
+            review: worker.phase_usage.review,
+            verification: verifier.usage,
+        },
         provider_turns: worker.provider_turns,
         tool_calls: worker.tool_calls,
     };
@@ -488,11 +505,33 @@ fn reduce_report(
     if !results.is_empty() {
         return Err(ReviewGroupExecutionError::ResultBookkeeping);
     }
+    let phase_usage = groups
+        .iter()
+        .try_fold(
+            ReviewGroupExecutionPhaseUsage::default(),
+            |mut total, group| {
+                add_budget_usage(&mut total.planning, group.phase_usage.planning)?;
+                add_budget_usage(&mut total.review, group.phase_usage.review)?;
+                add_budget_usage(&mut total.verification, group.phase_usage.verification)?;
+                Some(total)
+            },
+        )
+        .ok_or(ReviewGroupExecutionError::ResultBookkeeping)?;
     Ok(ReviewGroupExecutionReport {
         groups,
         schedule: runtime.schedule,
         stop_reason: runtime.stop_reason,
+        phase_usage,
     })
+}
+
+fn add_budget_usage(target: &mut ReviewBudgetUsage, value: ReviewBudgetUsage) -> Option<()> {
+    target.model_requests = target.model_requests.checked_add(value.model_requests)?;
+    target.input_tokens = target.input_tokens.checked_add(value.input_tokens)?;
+    target.output_tokens = target.output_tokens.checked_add(value.output_tokens)?;
+    target.tool_calls = target.tool_calls.checked_add(value.tool_calls)?;
+    target.cost_microusd = target.cost_microusd.checked_add(value.cost_microusd)?;
+    Some(())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -889,6 +928,7 @@ mod tests {
                 candidate_findings: 1,
                 ..AgentBudgetUsage::default()
             },
+            phase_usage: crate::group_worker_engine::GroupWorkerPhaseUsage::default(),
             provider_turns: 2,
             tool_calls: 3,
         }

@@ -19,9 +19,10 @@ use revoot_core::{
     GroupCompletion, GroupCoverageLedger, GroupPartialCause, LineRange, ModelContent,
     ModelFinishReason, ModelMessage, ModelRequest, ModelRole, ModelTool, PreparedVerificationBatch,
     PriorReviewContext, ProviderAdapter, RepositoryPath, RepositoryRelativePath, RepositoryToolbox,
-    ReviewBudgetBroker, ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
-    ReviewWorkerCheckpoint, ReviewWorkerError, ReviewWorkerPhase, ReviewWorkerPlan,
-    ReviewWorkerState, Sha256Digest, UnreadHunkDisposition, WorkUnitId, prepare_verification_batch,
+    ReviewBudgetBroker, ReviewBudgetUsage, ReviewCallUsage, ReviewModelReservation,
+    ReviewModelSettlement, ReviewModelUsage, ReviewWorkerCheckpoint, ReviewWorkerError,
+    ReviewWorkerPhase, ReviewWorkerPlan, ReviewWorkerState, Sha256Digest, UnreadHunkDisposition,
+    WorkUnitId, prepare_verification_batch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -186,8 +187,15 @@ pub struct GroupWorkerOutput {
     pub status: GroupWorkerStatus,
     pub coverage: GroupCoverageLedger,
     pub usage: AgentBudgetUsage,
+    pub phase_usage: GroupWorkerPhaseUsage,
     pub provider_turns: u32,
     pub tool_calls: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GroupWorkerPhaseUsage {
+    pub planning: ReviewBudgetUsage,
+    pub review: ReviewBudgetUsage,
 }
 
 impl fmt::Debug for GroupWorkerOutput {
@@ -200,6 +208,7 @@ impl fmt::Debug for GroupWorkerOutput {
             .field("status", &self.status)
             .field("coverage", &self.coverage)
             .field("usage", &self.usage)
+            .field("phase_usage", &self.phase_usage)
             .field("provider_turns", &self.provider_turns)
             .field("tool_calls", &self.tool_calls)
             .finish()
@@ -238,6 +247,7 @@ struct WorkerRuntime<'a> {
     coverage_gate: Option<CoverageCompletionGate>,
     final_coverage: Option<GroupCoverageLedger>,
     provider_usage: AgentBudgetUsage,
+    phase_usage: GroupWorkerPhaseUsage,
     started_at_millis: u64,
     candidates: Vec<CandidateForVerification>,
     delivered_evidence_ids: BTreeSet<String>,
@@ -310,6 +320,7 @@ pub async fn run_group_worker(
         coverage_gate: Some(request.coverage_gate),
         final_coverage: None,
         provider_usage: AgentBudgetUsage::default(),
+        phase_usage: GroupWorkerPhaseUsage::default(),
         started_at_millis: started_at,
         candidates: Vec::new(),
         delivered_evidence_ids: BTreeSet::new(),
@@ -404,6 +415,11 @@ pub async fn run_group_worker(
         let Ok(response) = adapter.complete(&model_request, cancellation).await else {
             drop(permit);
             record_provider_usage(&mut runtime, reservation);
+            record_phase_call(
+                &mut runtime,
+                state.phase(),
+                ReviewCallUsage::conservative(reservation),
+            );
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Provider);
         };
         let reported = (response.usage.input_tokens != 0 || response.usage.output_tokens != 0)
@@ -415,9 +431,19 @@ pub async fn run_group_worker(
         let settlement = permit.commit(reported, clock.now_millis());
         let Ok(settlement) = settlement else {
             record_provider_usage(&mut runtime, reservation);
+            record_phase_call(
+                &mut runtime,
+                state.phase(),
+                ReviewCallUsage::conservative(reservation),
+            );
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Budget);
         };
         record_provider_settlement(&mut runtime, settlement);
+        record_phase_call(
+            &mut runtime,
+            state.phase(),
+            ReviewCallUsage::settled(settlement),
+        );
         let Ok(tool_calls) = validate_provider_response(&response, &request.model) else {
             return partial_output(
                 &mut state,
@@ -461,6 +487,7 @@ pub async fn run_group_worker(
                 return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Budget);
             }
             runtime.tool_calls = runtime.tool_calls.saturating_add(1);
+            record_phase_tool_call(&mut runtime, phase_before);
             let body = match execute_tool(
                 &name,
                 input.clone(),
@@ -507,17 +534,7 @@ fn validate_request(
     request: &GroupWorkerRequest,
     diff_store: &DiffArtifactStore,
 ) -> Result<(), GroupWorkerError> {
-    if request.model.is_empty()
-        || request.system_policy.trim().is_empty()
-        || request.system_policy.contains('\0')
-        || adapter.adapter_id().is_empty()
-        || request.limits.max_output_tokens == 0
-        || request.limits.max_output_tokens > 4_096
-        || request.limits.max_input_tokens == 0
-        || request.limits.max_input_tokens > MAX_REQUEST_INPUT_TOKENS
-        || request.limits.max_request_bytes == 0
-        || request.limits.max_request_bytes > MAX_REQUEST_BYTES
-    {
+    if !valid_worker_configuration(adapter, request) {
         return Err(GroupWorkerError::Configuration);
     }
     if request.plan.group_id != request.initial_packet.group_brief.group_id
@@ -608,6 +625,19 @@ fn validate_request(
         return Err(GroupWorkerError::GroupBinding);
     }
     Ok(())
+}
+
+fn valid_worker_configuration(adapter: &dyn ProviderAdapter, request: &GroupWorkerRequest) -> bool {
+    !request.model.is_empty()
+        && !request.system_policy.trim().is_empty()
+        && !request.system_policy.contains('\0')
+        && !adapter.adapter_id().is_empty()
+        && request.limits.max_output_tokens != 0
+        && request.limits.max_output_tokens <= 4_096
+        && request.limits.max_input_tokens != 0
+        && request.limits.max_input_tokens <= MAX_REQUEST_INPUT_TOKENS
+        && request.limits.max_request_bytes != 0
+        && request.limits.max_request_bytes <= MAX_REQUEST_BYTES
 }
 
 fn validate_rule_bundle_binding(request: &GroupWorkerRequest) -> Result<(), GroupWorkerError> {
@@ -1828,6 +1858,7 @@ fn complete_output(
         status: GroupWorkerStatus::Complete(completion),
         coverage: output_coverage(runtime)?,
         usage: output_usage(runtime),
+        phase_usage: runtime.phase_usage,
         provider_turns: state.provider_turns(),
         tool_calls: runtime.tool_calls,
     })
@@ -1854,6 +1885,7 @@ fn partial_output(
         status: GroupWorkerStatus::Partial(reason),
         coverage: output_coverage(runtime)?,
         usage: output_usage(runtime),
+        phase_usage: runtime.phase_usage,
         provider_turns: state.provider_turns(),
         tool_calls: runtime.tool_calls,
     })
@@ -1887,6 +1919,34 @@ fn record_provider_usage(runtime: &mut WorkerRuntime<'_>, usage: ReviewModelRese
         .provider_usage
         .cost_microusd
         .saturating_add(usage.cost_microusd);
+}
+
+fn record_phase_call(
+    runtime: &mut WorkerRuntime<'_>,
+    phase: ReviewWorkerPhase,
+    call: ReviewCallUsage,
+) {
+    let target = phase_budget_usage(runtime, phase);
+    target.model_requests = target.model_requests.saturating_add(call.model_requests);
+    target.input_tokens = target.input_tokens.saturating_add(call.input_tokens);
+    target.output_tokens = target.output_tokens.saturating_add(call.output_tokens);
+    target.cost_microusd = target.cost_microusd.saturating_add(call.cost_microusd);
+}
+
+fn record_phase_tool_call(runtime: &mut WorkerRuntime<'_>, phase: ReviewWorkerPhase) {
+    let target = phase_budget_usage(runtime, phase);
+    target.tool_calls = target.tool_calls.saturating_add(1);
+}
+
+fn phase_budget_usage<'a>(
+    runtime: &'a mut WorkerRuntime<'_>,
+    phase: ReviewWorkerPhase,
+) -> &'a mut ReviewBudgetUsage {
+    if matches!(phase, ReviewWorkerPhase::Planning) {
+        &mut runtime.phase_usage.planning
+    } else {
+        &mut runtime.phase_usage.review
+    }
 }
 
 fn output_coverage(runtime: &WorkerRuntime<'_>) -> Result<GroupCoverageLedger, GroupWorkerError> {

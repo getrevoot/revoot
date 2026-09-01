@@ -6,8 +6,9 @@ use revoot_core::provider::ProviderAdapter;
 use revoot_core::{
     AdjudicatedOverview, AdjudicationFallbackCoverage, AdjudicationOutcome, AdjudicatorResponse,
     CancellationToken, ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRole,
-    ReviewBudgetBroker, ReviewBudgetUsage, ReviewModelReservation, ReviewModelUsage,
-    VerifiedCandidate, apply_adjudicator_response, deterministic_adjudication_fallback,
+    ReviewBudgetBroker, ReviewBudgetUsage, ReviewCallUsage, ReviewModelReservation,
+    ReviewModelUsage, VerifiedCandidate, apply_adjudicator_response,
+    deterministic_adjudication_fallback,
 };
 use serde::Serialize;
 
@@ -109,6 +110,7 @@ pub struct ReviewAdjudicatorOutcome {
     pub outcome: AdjudicationOutcome,
     pub mode: ReviewAdjudicationMode,
     pub partial: bool,
+    pub usage: ReviewBudgetUsage,
 }
 
 /// Stable invalid-input or fallback-construction failure.
@@ -213,10 +215,12 @@ pub async fn run_review_adjudicator(
         );
     };
     let Ok(response) = adapter.complete(&request, cancellation).await else {
-        return fallback(
+        drop(permit);
+        return fallback_with_usage(
             verified,
             context.coverage,
             ReviewAdjudicatorFallbackReason::ProviderFailure,
+            ReviewCallUsage::conservative(reservation).into_budget_usage(),
         );
     };
     let usage = (response.usage.input_tokens != 0 || response.usage.output_tokens != 0).then_some(
@@ -226,32 +230,37 @@ pub async fn run_review_adjudicator(
             cost_microusd: config.reserved_cost_microusd,
         },
     );
-    if permit.commit(usage, clock.now_millis()).is_err() {
-        return fallback(
+    let Ok(settlement) = permit.commit(usage, clock.now_millis()) else {
+        return fallback_with_usage(
             verified,
             context.coverage,
             ReviewAdjudicatorFallbackReason::BudgetSettlement,
+            ReviewCallUsage::conservative(reservation).into_budget_usage(),
         );
-    }
+    };
+    let call_usage = ReviewCallUsage::settled(settlement).into_budget_usage();
     if response.finish_reason != ModelFinishReason::Stop || response.content.len() != 1 {
-        return fallback(
+        return fallback_with_usage(
             verified,
             context.coverage,
             ReviewAdjudicatorFallbackReason::InvalidResponse,
+            call_usage,
         );
     }
     let Some(ModelContent::Text { text }) = response.content.first() else {
-        return fallback(
+        return fallback_with_usage(
             verified,
             context.coverage,
             ReviewAdjudicatorFallbackReason::InvalidResponse,
+            call_usage,
         );
     };
     if text.len() > MAX_ADJUDICATOR_RESPONSE_BYTES {
-        return fallback(
+        return fallback_with_usage(
             verified,
             context.coverage,
             ReviewAdjudicatorFallbackReason::InvalidResponse,
+            call_usage,
         );
     }
     let outcome = serde_json::from_str::<AdjudicatorResponse>(text)
@@ -262,11 +271,13 @@ pub async fn run_review_adjudicator(
             outcome,
             mode: ReviewAdjudicationMode::Model,
             partial: context.coverage.partial,
+            usage: call_usage,
         }),
-        None => fallback(
+        None => fallback_with_usage(
             verified,
             context.coverage,
             ReviewAdjudicatorFallbackReason::InvalidResponse,
+            call_usage,
         ),
     }
 }
@@ -324,8 +335,17 @@ fn valid_text(value: &str, maximum_bytes: usize) -> bool {
 
 fn fallback(
     verified: &[VerifiedCandidate],
+    coverage: AdjudicationFallbackCoverage,
+    reason: ReviewAdjudicatorFallbackReason,
+) -> Result<ReviewAdjudicatorOutcome, ReviewAdjudicatorError> {
+    fallback_with_usage(verified, coverage, reason, ReviewBudgetUsage::default())
+}
+
+fn fallback_with_usage(
+    verified: &[VerifiedCandidate],
     mut coverage: AdjudicationFallbackCoverage,
     reason: ReviewAdjudicatorFallbackReason,
+    usage: ReviewBudgetUsage,
 ) -> Result<ReviewAdjudicatorOutcome, ReviewAdjudicatorError> {
     coverage.partial = true;
     let outcome = deterministic_adjudication_fallback(verified, coverage)
@@ -334,6 +354,7 @@ fn fallback(
         outcome,
         mode: ReviewAdjudicationMode::DeterministicFallback(reason),
         partial: true,
+        usage,
     })
 }
 
@@ -356,6 +377,7 @@ fn no_candidates(coverage: AdjudicationFallbackCoverage) -> ReviewAdjudicatorOut
         },
         mode: ReviewAdjudicationMode::NoVerifiedCandidates,
         partial: coverage.partial,
+        usage: ReviewBudgetUsage::default(),
     }
 }
 
@@ -523,6 +545,9 @@ mod tests {
         .await
         .expect("adjudication");
         assert_eq!(result.mode, ReviewAdjudicationMode::Model);
+        assert_eq!(result.usage.model_requests, 1);
+        assert!(result.usage.input_tokens > 0);
+        assert_eq!(result.usage.output_tokens, 4_096);
         assert_eq!(result.outcome.publish[0], candidates[1]);
         let requests = adapter.requests.lock().expect("requests");
         assert_eq!(requests.len(), 1);
