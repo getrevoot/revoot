@@ -1,18 +1,18 @@
 # Tool-first review engine redesign
 
-Status: approved for implementation
+Status: implemented
 
 ## Outcome
 
-Replace Revoot's single global review conversation with a native Rust,
-tool-first review engine. The engine keeps Revoot's immutable snapshots,
+Revoot uses a native Rust, tool-first review engine instead of a single global
+review conversation. The engine keeps Revoot's immutable snapshots,
 base-commit configuration, exact anchors, provider adapters, budgets, prior
 review lineage, publication controllers, and evaluation corpus. It adds
 semantic grouping, isolated group workers, effort-based review rounds,
 adaptive diff delivery, explicit coverage, candidate verification, scan and
 delegation workflows, SARIF, and a read-only stdio MCP server.
 
-The shipped product remains one Rust binary. It must not require Go, Bun,
+The shipped product remains one Rust binary. It does not require Go, Bun,
 Node, a model CLI, a shell, or a Git executable at runtime. OpenAI Responses
 and Anthropic Messages remain the only direct model providers.
 

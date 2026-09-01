@@ -50,6 +50,28 @@ mise run install:cargo:smoke
 
 `package:macos` requires an Apple Silicon macOS host.
 
+For a tool-first engine release, also verify the user-facing contracts before
+promotion:
+
+- `revoot review --help`, `revoot scan --help`,
+  `revoot rules check --help`, and `revoot delegate --help` match the
+  documented CLI, while stdio MCP discovery lists only the documented tools;
+- provider conformance covers direct Anthropic Messages and OpenAI Responses,
+  batched tools, rebased turns, missing usage, cancellation, and malformed
+  responses, with no Bedrock or generic-endpoint fixture;
+- the stable JSON golden is `revoot.review-report/v3` with five ordered usage
+  phases, and review/scan SARIF 2.1.0 goldens use exact non-zero anchors;
+- preview, rule diagnostics, and delegation complete without provider
+  credentials or calls; and
+- Linux artifacts remain static and stripped, macOS remains ARM64-native and
+  stripped, and the shipped executable has no Go, Node, Bun, model CLI, shell,
+  or Git runtime dependency.
+
+The OCI image may contain Git for CI checkout compatibility, but Revoot must
+not execute it. Packaging smoke tests should continue to assert that repository
+hooks and reviewed code are never run and that the image process drops to its
+documented non-root identity.
+
 ## Publish
 
 Approve and merge the generated release pull request with a merge commit. The

@@ -18,6 +18,36 @@ Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a repository or
 organization secret. Optional Actions variables `REVOOT_PROVIDER` and
 `REVOOT_MODEL` override the `auto` defaults.
 
+Revoot calls the selected Anthropic or OpenAI API directly. The workflow does
+not install or launch a model CLI, Node, Bun, or another agent harness, and
+Revoot does not support Bedrock. The binary inspects the checkout through its
+embedded Git implementation and does not invoke Git, repository hooks, a
+shell, or reviewed code during the review.
+
+## Review execution and report
+
+The generated job runs the tool-first engine with a ten-minute job timeout. It
+selects and risk-ranks files deterministically, uses metadata-only semantic
+grouping when needed, and runs isolated groups with bounded read/search tools.
+Large group diffs are not copied into every model turn. Coverage in the report
+is based on hunk pages actually delivered to workers.
+
+The job writes `revoot-review.json` and uploads it for seven days even when a
+later publication step fails. The file uses `revoot.review-report/v3` and
+contains exact finding coordinates, overview, lineage/publication state,
+selection, strategy, risk-adaptive coverage, and five reconciled usage phases.
+It contains bounded consumer-facing finding prose and evidence, which may quote
+approved source, but no prompts, raw responses, raw tool payloads,
+automatically retained source pages, or temporary diff paths.
+
+Budget exhaustion or incomplete required coverage returns verified findings as
+an explicitly partial review and stops new group dispatch. A partial review
+never resolves an existing lineage automatically. Publication failure remains
+exit status 3; a computed partial review is not itself a publication failure.
+Set `REVOOT_REVIEW_EFFORT` and `REVOOT_MAX_PARALLEL_GROUPS`, or use the
+corresponding local CLI flags, to change operator-owned effort and concurrency.
+The repository configuration can only lower resource ceilings.
+
 No extra GitHub token is required to publish comments and the evolving summary.
 The generated workflow grants its short-lived `GITHUB_TOKEN` repository read
 and pull-request write access; comments appear as `github-actions[bot]`. Revoot
@@ -59,11 +89,13 @@ provider credential can be supplied safely.
 Revoot reads existing review threads before each run. It updates one summary
 and does not repeat an established finding unless semantic review confirms that
 the issue recurred. When GitHub permits thread resolution, Revoot can retire an
-old thread and re-anchor the recurrence. Otherwise it retains the existing open
-lineage instead of creating a second active conversation, while recording the
-current occurrence in the overview. Human-resolved findings remain suppressed
-unless review establishes a materially new occurrence. Embedded metadata
-identifies Revoot-owned comments; the pull request remains the state store.
+old thread and publish the recurrence at its current exact issued anchor. It
+never asks the model to relocate an old target. Otherwise it retains the
+existing open lineage instead of creating a second active conversation, while
+recording the current occurrence in the overview. Human-resolved findings
+remain suppressed unless review establishes a materially new occurrence.
+Embedded metadata identifies Revoot-owned comments; the pull request remains
+the state store.
 
 Revoot checks the pull-request head and discussion state again before writing.
 It stops publication if either changed during the review. When ordinary human
@@ -83,6 +115,11 @@ request write access:
 ```sh
 REVOOT_GITHUB_TOKEN=... OPENAI_API_KEY=... revoot review --pr 42
 ```
+
+Use `revoot review --pr 42 --preview --format json` to inspect the immutable
+selection, grouping/rule metadata, and budgets without discovering provider
+credentials, calling a model, or publishing. SARIF is available only for a
+completed review and resolves locations through exact issued anchors.
 
 Credentials are checked in this order: `REVOOT_GITHUB_TOKEN`, `GH_TOKEN`, then
 `GITHUB_TOKEN`.

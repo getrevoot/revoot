@@ -44,13 +44,14 @@ ticket = "ENG-1842"
 
 ## Fields
 
-`review.include`, `review.exclude`, and `model_context.exclude` accept exact paths, directory prefixes
-ending in `/**`, and suffixes beginning with `**/*`. Inclusion narrows the
-changed-file review scope. Exclusion takes precedence. `review.exclude` does not
-prevent Revoot from reading an unchanged checkout file when it is crucial to
-verifying a finding; `model_context.exclude` prevents both changed-file prompt
-inclusion and auxiliary toolbox access. It is loaded from the comparison base
-commit and can only narrow the built-in sensitive-path policy.
+`review.include`, `review.exclude`, and `model_context.exclude` accept exact
+paths, directory prefixes ending in `/**`, and suffixes beginning with `**/*`.
+Inclusion narrows the changed-file review scope. Exclusion takes precedence.
+`review.exclude` does not prevent Revoot from reading an unchanged checkout file
+when it is crucial to verifying a finding; `model_context.exclude` prevents
+inline context, diff-tool access, and auxiliary snapshot reads. It is loaded
+from the comparison base commit and can only narrow the built-in sensitive-path
+policy.
 
 `review.minimum_confidence` is clamped to the supported high-signal range of
 70–100. `review.max_findings` may lower the product ceiling but cannot raise it.
@@ -90,6 +91,11 @@ values must be unsigned decimal numbers, booleans must be exactly `true` or
 | `REVOOT_DEADLINE_SECONDS` | `600` | Unsigned review deadline; effective range `1` through `600` seconds. |
 | `REVOOT_PUBLICATION_ENABLED` | `false` | Whether a host-backed review may publish comments. Generated CI sets this to `true`. |
 | `REVOOT_FORK_BEHAVIOR` | `skip` | GitLab fork behavior: `skip` or `report-only`. GitHub fork behavior is encoded in the generated workflow. |
+
+The provider values are closed: `anthropic` uses Anthropic Messages and
+`openai` uses OpenAI Responses over their canonical HTTPS APIs. Revoot does not
+support Bedrock, a generic compatible-provider base URL, a provider CLI, or a
+repository-configured endpoint.
 
 The product bounds shown above are final ceilings. A repository configuration
 may request lower limits, while an environment variable or CLI option can
@@ -163,6 +169,50 @@ cannot redefine tiers, promote paths, or expand the low-signal quota. This keeps
 cost behavior predictable and prevents a proposed change from buying itself
 more reviewer attention.
 
+Test code remains ordinary standard-signal reviewable code. It is not excluded
+by default. Effective guidance follows a fixed order: compiled safety
+invariants, base-commit repository guidance, matching repository rules,
+embedded language guidance, then the generic review rule. Repository guidance
+is always untrusted data and cannot configure providers, tools, execution,
+network access, MCP, or publication authority.
+
+## Tool-first context and coverage
+
+Selections of one to three files are grouped deterministically without a model
+call. Four or more selected files may use one metadata-only grouping request;
+diff bodies are never part of that request, and invalid or unavailable grouping
+falls back to deterministic groups.
+
+`model_context.max_inline_diff_bytes` and
+`REVOOT_MAX_INLINE_DIFF_BYTES` control an all-or-nothing optimization. When a
+complete group diff is within the effective threshold and request target, it is
+inlined once. Otherwise the group starts with file and hunk manifests and reads
+bounded pages through local tools. A large group is never partially inlined.
+The default and product maximum are 16,384 bytes; repository configuration may
+only lower it.
+
+Coverage is based on successfully delivered content, not model claims. Every
+high-risk hunk page is required. Standard-risk files require at least one hunk,
+all locally promoted hazardous hunks, and an explicit disposition for unread
+hunks. Low-risk files may remain manifest-only when policy permits. Missing
+required coverage, budget exhaustion, or a tool/provider/verifier failure makes
+the result partial; a policy-complete low-risk deferral remains visible without
+failing the run.
+
+Global model requests, combined input/output tokens, output tokens, local tool
+calls, cost reservation, and deadline capacity are atomically reserved before
+dispatch. High-signal groups dispatch first, with stable path ordering for
+ties. The engine stops new dispatch on exhaustion and retains already verified
+partial results. Per-group effort bounds are low: one review round and at most
+12 turns; medium: two rounds and at most 20 turns; high: three rounds and at
+most 32 turns.
+
+Direct provider adapters report token usage but not authoritative monetary
+cost. Revoot therefore derives the internal conservative cost capacity from the
+effective model-request ceiling at 500,000 micro-USD per request. This is an
+accounting reservation, not a configurable spending limit, and cannot reduce a
+64- or 256-request ceiling to a smaller implicit request count.
+
 Suppressions match the exact `finding_key` emitted in the JSON review report.
 Each suppression requires a reason and a valid, non-expired UTC date. An
 optional ticket provides a traceable owner. Duplicate, malformed, or expired
@@ -198,7 +248,9 @@ trusted environment or CLI policy.
 
 The review deadline is bounded to 1–600 seconds, and the all-or-nothing inline
 diff threshold is bounded to 1–16,384 bytes. Repository configuration may lower
-either default but cannot expand it.
+either default but cannot expand it. Repository configuration may also lower
+model-token and tool-call budgets, but cannot choose effort, concurrency,
+tools, grouping strategy, or publication behavior.
 
 Use `revoot config explain --base-config .revoot.toml --json` to inspect scalar
 provenance, effective policy clamps, structured rules, and suppressions without
