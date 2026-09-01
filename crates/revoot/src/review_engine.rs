@@ -27,9 +27,11 @@ use crate::git_history::{GitHistoryError, GitHistoryToolbox};
 use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
 
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
+const MAX_SYNTHESIS_RESERVE_BYTES: u64 = 64 * 1024;
+const TOOL_RESULT_ENVELOPE_RESERVE_BYTES: u64 = 1024;
 
 /// Version of the trusted reviewer policy used in quality evidence.
-pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v12";
+pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v13";
 
 const SYSTEM_PROMPT: &str = r"You are Revoot, one automatic code reviewer.
 Implementation and review are separate jobs, even when agents perform both.
@@ -89,6 +91,8 @@ returned by show_diff; never invent or derive one. Follow show_diff pagination
 until the relevant hunks and their anchors have been inspected. If a candidate is suppressed
 because evidence is missing, obtain that evidence and resubmit it once; do not
 merely repeat the candidate.
+If a tool reports conversation_budget_low, stop exploration and submit the
+review summary using the evidence already gathered.
 Silence is correct when no well-supported improvement remains. Risk describes
 the change surface, not the number or severity of findings. The final overview
 must summarize implementation consequences without retelling the author's
@@ -716,20 +720,35 @@ pub async fn run_review(
             if !seen_tool_ids.insert(id.clone()) {
                 return Err(ReviewEngineError::new(ReviewEngineErrorKind::ToolContract));
             }
-            let execution = execute_tool(
-                &name,
-                input,
-                &mut run,
-                &toolbox,
-                history.as_ref(),
-                &prior_review,
-                &cancellation,
-                clock.now_millis(),
-                &request.anchors,
-                request.limits,
-                &mut summary,
-                &mut evidence,
-            );
+            let available_result_bytes = available_tool_result_bytes(
+                &messages,
+                &tools,
+                &results,
+                request.limits.max_conversation_bytes,
+                name != "submit_review_summary",
+            )?;
+            let execution = if available_result_bytes == 0 {
+                Err(conversation_budget_low())
+            } else {
+                let mut tool_limits = request.limits;
+                tool_limits.max_tool_result_bytes = tool_limits
+                    .max_tool_result_bytes
+                    .min(available_result_bytes);
+                execute_tool(
+                    &name,
+                    input,
+                    &mut run,
+                    &toolbox,
+                    history.as_ref(),
+                    &prior_review,
+                    &cancellation,
+                    clock.now_millis(),
+                    &request.anchors,
+                    tool_limits,
+                    &mut summary,
+                    &mut evidence,
+                )
+            };
             let (result, is_error) = match execution {
                 Ok(result) => (result, false),
                 Err(error)
@@ -758,6 +777,10 @@ pub async fn run_review(
 
 fn recoverable_tool_error(error: ReviewEngineError) -> String {
     match (error.kind, error.budget_dimension) {
+        (
+            ReviewEngineErrorKind::ToolContract,
+            Some(ReviewBudgetDimension::ConversationBytes),
+        ) => r#"{"error":"conversation_budget_low","retryable":false,"action":"stop exploration and submit_review_summary using evidence already gathered"}"#.to_owned(),
         (
             ReviewEngineErrorKind::ToolContract,
             Some(ReviewBudgetDimension::ToolResultBytes),
@@ -1636,17 +1659,53 @@ fn tool_result_too_large() -> ReviewEngineError {
     }
 }
 
+fn conversation_budget_low() -> ReviewEngineError {
+    ReviewEngineError {
+        kind: ReviewEngineErrorKind::ToolContract,
+        provider_kind: None,
+        provider_status: None,
+        budget_dimension: Some(ReviewBudgetDimension::ConversationBytes),
+    }
+}
+
+fn available_tool_result_bytes(
+    messages: &[ModelMessage],
+    tools: &[ModelTool],
+    pending_results: &[ModelContent],
+    maximum: u64,
+    preserve_synthesis_headroom: bool,
+) -> Result<u64, ReviewEngineError> {
+    let mut projected_messages = messages.to_vec();
+    if !pending_results.is_empty() {
+        projected_messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: pending_results.to_vec(),
+        });
+    }
+    let occupied = serialized_len(&projected_messages)?.saturating_add(serialized_len(tools)?);
+    let synthesis_reserve = if preserve_synthesis_headroom {
+        MAX_SYNTHESIS_RESERVE_BYTES.min(maximum / 4)
+    } else {
+        0
+    };
+    Ok(maximum
+        .saturating_sub(occupied)
+        .saturating_sub(synthesis_reserve)
+        .saturating_sub(TOOL_RESULT_ENVELOPE_RESERVE_BYTES))
+}
+
+fn serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<u64, ReviewEngineError> {
+    let length = serde_json::to_vec(value).map_err(|_| internal())?.len();
+    Ok(u64::try_from(length).unwrap_or(u64::MAX))
+}
+
 fn enforce_conversation_bound(
     messages: &[ModelMessage],
     tools: &[ModelTool],
     maximum: u64,
 ) -> Result<(), ReviewEngineError> {
-    let message_bytes = serde_json::to_vec(messages)
-        .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-        .map_err(|_| internal())?;
-    let tool_bytes = serde_json::to_vec(tools)
-        .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-        .map_err(|_| internal())?;
+    let message_bytes = serialized_len(messages)?;
+    let tool_bytes = serialized_len(tools)?;
     if message_bytes.saturating_add(tool_bytes) > maximum {
         Err(ReviewEngineError::budget(
             ReviewBudgetDimension::ConversationBytes,
@@ -2517,6 +2576,33 @@ mod tests {
             ReviewEngineLimits::default().max_tool_result_bytes,
             64 * 1024
         );
+    }
+
+    #[test]
+    fn conversation_headroom_is_reserved_for_final_synthesis() {
+        let messages = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "x".repeat(8 * 1024),
+            }],
+        }];
+        let tools = Vec::<ModelTool>::new();
+        let occupied = serialized_len(&messages).expect("message length")
+            + serialized_len(&tools).expect("tool length");
+        let maximum = occupied + 2 * 1024;
+        assert_eq!(
+            available_tool_result_bytes(&messages, &tools, &[], maximum, true)
+                .expect("reserved headroom"),
+            0
+        );
+        assert_eq!(
+            available_tool_result_bytes(&messages, &tools, &[], maximum, false)
+                .expect("final result headroom"),
+            1024
+        );
+        let recovery = recoverable_tool_error(conversation_budget_low());
+        assert!(recovery.contains("conversation_budget_low"));
+        assert!(recovery.contains("submit_review_summary"));
     }
 
     #[test]
