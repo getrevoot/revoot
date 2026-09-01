@@ -49,6 +49,12 @@ Optional `REVOOT_PROVIDER` and `REVOOT_MODEL` variables override the `auto`
 defaults. The [configuration reference](docs/configuration.md) lists every
 supported environment and CI variable, including defaults and precedence.
 
+Pre-acceptance provider connection failures, transient provider rate limits,
+and safe code-host reads are retried within one bounded operation budget.
+Publication mutations and provider failures after acceptance is ambiguous
+are never blindly replayed because repeating them could duplicate work or model
+usage. See the configuration reference for the retry limits.
+
 For GitHub Actions:
 
 ```sh

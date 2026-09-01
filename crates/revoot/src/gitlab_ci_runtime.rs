@@ -407,7 +407,7 @@ pub async fn probe_gitlab_user(client: &GitLabReadClient) -> Result<u64, GitLabP
     }
 
     let response = client
-        .get(&GitLabReadEndpoint::CurrentUser)
+        .get_with_retry(&GitLabReadEndpoint::CurrentUser)
         .await
         .map_err(|error| classify_probe_transport(&error))?;
     let user: UserProjection = serde_json::from_slice(response.observation().body.as_slice())

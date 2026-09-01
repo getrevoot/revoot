@@ -1571,7 +1571,7 @@ async fn acquire_gitlab_checkpoint_hint(
 ) -> Option<ReviewCheckpoint> {
     let identity = &snapshot.evidence().identity.version;
     let response = client
-        .get(&GitLabReadEndpoint::MergeRequest {
+        .get_with_retry(&GitLabReadEndpoint::MergeRequest {
             project_id: identity.scope.project_id,
             merge_request_iid: identity.scope.merge_request_iid,
         })

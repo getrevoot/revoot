@@ -35,6 +35,7 @@ use crate::gitlab_transport::{
     GitLabFailureKind, GitLabPagination, GitLabReadClient, GitLabReadEndpoint, GitLabTextPosition,
     GitLabTransportError, GitLabWriteClient, GitLabWriteEndpoint, GitLabWriteFailureEffect,
 };
+use crate::retry::{RetryJitter, RetryPolicy};
 use crate::review_overview::update_description;
 
 const HARD_MAX_REQUESTS: u32 = 100_000;
@@ -953,18 +954,25 @@ impl<'controller, 'client> PublicationRun<'controller, 'client> {
             .read_retry_attempts
             .saturating_add(self.evidence.write_retry_attempts)
             .min(31);
-        let factor = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
-        let delay = retry_after
-            .unwrap_or_else(|| {
-                self.controller
-                    .limits
-                    .initial_backoff
-                    .saturating_mul(factor)
-            })
-            .min(self.controller.limits.max_backoff);
-        if retry_after.is_some_and(|value| value > self.controller.limits.max_retry_after) {
-            return Err(GitLabPublicationFailure::RetryExhausted);
+        let retry_after =
+            retry_after.map(|value| value.min(self.controller.limits.max_retry_after));
+        let mut jitter = RetryJitter::new(u64::from(exponent).saturating_add(1));
+        let delay = RetryPolicy {
+            max_attempts: self
+                .controller
+                .limits
+                .max_read_attempts
+                .max(self.controller.limits.max_write_attempts),
+            initial_delay: self.controller.limits.initial_backoff,
+            max_delay: self.controller.limits.max_backoff,
+            max_retry_after: self.controller.limits.max_retry_after,
+            total_budget: self.deadline.saturating_duration_since(Instant::now()),
         }
+        .delay(
+            u8::try_from(exponent).unwrap_or(u8::MAX).saturating_add(1),
+            retry_after,
+            &mut jitter,
+        );
         timeout_at(self.deadline, sleep(delay))
             .await
             .map_err(|_| GitLabPublicationFailure::Deadline)

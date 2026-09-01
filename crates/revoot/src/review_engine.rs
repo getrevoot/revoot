@@ -27,9 +27,11 @@ use crate::git_history::{GitHistoryError, GitHistoryToolbox};
 use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
 
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
+const MAX_SYNTHESIS_RESERVE_BYTES: u64 = 64 * 1024;
+const TOOL_RESULT_ENVELOPE_RESERVE_BYTES: u64 = 1024;
 
 /// Version of the trusted reviewer policy used in quality evidence.
-pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v11";
+pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v13";
 
 const SYSTEM_PROMPT: &str = r"You are Revoot, one automatic code reviewer.
 Implementation and review are separate jobs, even when agents perform both.
@@ -85,9 +87,12 @@ proof without restating the explanation. Challenge each
 hypothesis before calling submit_candidate_finding. Before submitting, call
 show_diff for every changed path that anchors a finding and inspect relevant
 repository context with read_file or search. Use only an exact anchor ID
-returned by show_diff; never invent or derive one. If a candidate is suppressed
+returned by show_diff; never invent or derive one. Follow show_diff pagination
+until the relevant hunks and their anchors have been inspected. If a candidate is suppressed
 because evidence is missing, obtain that evidence and resubmit it once; do not
 merely repeat the candidate.
+If a tool reports conversation_budget_low, stop exploration and submit the
+review summary using the evidence already gathered.
 Silence is correct when no well-supported improvement remains. Risk describes
 the change surface, not the number or severity of findings. The final overview
 must summarize implementation consequences without retelling the author's
@@ -715,20 +720,35 @@ pub async fn run_review(
             if !seen_tool_ids.insert(id.clone()) {
                 return Err(ReviewEngineError::new(ReviewEngineErrorKind::ToolContract));
             }
-            let execution = execute_tool(
-                &name,
-                input,
-                &mut run,
-                &toolbox,
-                history.as_ref(),
-                &prior_review,
-                &cancellation,
-                clock.now_millis(),
-                &request.anchors,
-                request.limits,
-                &mut summary,
-                &mut evidence,
-            );
+            let available_result_bytes = available_tool_result_bytes(
+                &messages,
+                &tools,
+                &results,
+                request.limits.max_conversation_bytes,
+                name != "submit_review_summary",
+            )?;
+            let execution = if available_result_bytes == 0 {
+                Err(conversation_budget_low())
+            } else {
+                let mut tool_limits = request.limits;
+                tool_limits.max_tool_result_bytes = tool_limits
+                    .max_tool_result_bytes
+                    .min(available_result_bytes);
+                execute_tool(
+                    &name,
+                    input,
+                    &mut run,
+                    &toolbox,
+                    history.as_ref(),
+                    &prior_review,
+                    &cancellation,
+                    clock.now_millis(),
+                    &request.anchors,
+                    tool_limits,
+                    &mut summary,
+                    &mut evidence,
+                )
+            };
             let (result, is_error) = match execution {
                 Ok(result) => (result, false),
                 Err(error)
@@ -738,7 +758,7 @@ pub async fn run_review(
                             | ReviewEngineErrorKind::CandidateContract
                     ) =>
                 {
-                    (recoverable_tool_error(error.kind), true)
+                    (recoverable_tool_error(error), true)
                 }
                 Err(error) => return Err(error),
             };
@@ -755,9 +775,17 @@ pub async fn run_review(
     }
 }
 
-fn recoverable_tool_error(kind: ReviewEngineErrorKind) -> String {
-    match kind {
-        ReviewEngineErrorKind::CandidateContract => {
+fn recoverable_tool_error(error: ReviewEngineError) -> String {
+    match (error.kind, error.budget_dimension) {
+        (
+            ReviewEngineErrorKind::ToolContract,
+            Some(ReviewBudgetDimension::ConversationBytes),
+        ) => r#"{"error":"conversation_budget_low","retryable":false,"action":"stop exploration and submit_review_summary using evidence already gathered"}"#.to_owned(),
+        (
+            ReviewEngineErrorKind::ToolContract,
+            Some(ReviewBudgetDimension::ToolResultBytes),
+        ) => r#"{"error":"tool_result_too_large","retryable":true,"action":"request a narrower line range or search scope"}"#.to_owned(),
+        (ReviewEngineErrorKind::CandidateContract, _) => {
             r#"{"error":"candidate_contract","retryable":true}"#.to_owned()
         }
         _ => r#"{"error":"tool_contract","retryable":true}"#.to_owned(),
@@ -946,8 +974,17 @@ fn model_tools(history_available: bool, prior_review_available: bool) -> Vec<Mod
         ),
         model_tool(
             "show_diff",
-            "Show the exact changed-file diff and the trusted anchor IDs for its changed lines. Use an exact returned anchor_id for candidate findings.",
-            object_schema(&["path"]),
+            "Show a bounded page of the exact changed-file diff and the trusted anchor IDs for changed lines on that page. Ranges use one-based diff-text lines. Follow next_start_line while relevant hunks remain, and use an exact returned anchor_id for candidate findings.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"]
+            }),
         ),
     ];
     if history_available {
@@ -1130,8 +1167,10 @@ struct SearchArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PathArgs {
+struct ShowDiffArgs {
     path: String,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1274,30 +1313,20 @@ fn execute_tool(
         }
         "show_diff" => {
             ensure_allowed(run, AgentTool::ShowDiff)?;
-            let args: PathArgs = strict_input(input)?;
+            let args: ShowDiffArgs = strict_input(input)?;
             let path = RepositoryRelativePath::try_from(args.path).map_err(|_| tool_contract())?;
             let result = toolbox
                 .show_diff(&path, run.budget_mut(), cancellation, now_millis)
                 .map_err(map_repository_error)?;
             evidence.inspected_diff_paths.insert(path.clone());
-            let changed_line_anchors = anchors
-                .iter()
-                .filter(|(_, anchor)| {
-                    anchor.path == path
-                        && !matches!(anchor.position, AnchorPosition::Context { .. })
-                })
-                .map(|(anchor_id, anchor)| {
-                    json!({
-                        "anchor_id": anchor_id,
-                        "position": anchor.position,
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "path": result.path,
-                "content": result.content,
-                "changed_line_anchors": changed_line_anchors,
-            })
+            bounded_show_diff_page(
+                &result.path,
+                &result.content,
+                anchors,
+                args.start_line,
+                args.end_line,
+                limits.max_tool_result_bytes,
+            )?
         }
         "list_change_commits" => {
             ensure_allowed(run, AgentTool::ListChangeCommits)?;
@@ -1437,6 +1466,165 @@ fn execute_tool(
     encode_tool_result(&value, limits.max_tool_result_bytes)
 }
 
+fn bounded_show_diff_page(
+    path: &RepositoryRelativePath,
+    content: &str,
+    anchors: &BTreeMap<String, ReviewAnchor>,
+    requested_start: Option<u32>,
+    requested_end: Option<u32>,
+    maximum_bytes: u64,
+) -> Result<Value, ReviewEngineError> {
+    let lines = content.split_inclusive('\n').collect::<Vec<_>>();
+    let total_lines = u32::try_from(lines.len()).map_err(|_| tool_contract())?;
+    if total_lines == 0 {
+        return Ok(json!({
+            "path": path,
+            "start_line": 0,
+            "end_line": 0,
+            "total_lines": 0,
+            "next_start_line": null,
+            "truncated": false,
+            "content": "",
+            "changed_line_anchors": [],
+        }));
+    }
+
+    let start = requested_start.unwrap_or(1);
+    let requested_end = requested_end.unwrap_or(total_lines);
+    if start == 0 || start > total_lines || requested_end < start {
+        return Err(tool_contract());
+    }
+    let last = requested_end.min(total_lines);
+    let positions = diff_line_positions(&lines);
+
+    let mut lower = start;
+    let mut upper = last;
+    let first = show_diff_page_value(path, &lines, &positions, anchors, start, start, total_lines);
+    if encoded_len(&first)? > maximum_bytes {
+        return Err(tool_result_too_large());
+    }
+    while lower < upper {
+        let middle = lower + (upper - lower).div_ceil(2);
+        let candidate = show_diff_page_value(
+            path,
+            &lines,
+            &positions,
+            anchors,
+            start,
+            middle,
+            total_lines,
+        );
+        if encoded_len(&candidate)? <= maximum_bytes {
+            lower = middle;
+        } else {
+            upper = middle - 1;
+        }
+    }
+    Ok(show_diff_page_value(
+        path,
+        &lines,
+        &positions,
+        anchors,
+        start,
+        lower,
+        total_lines,
+    ))
+}
+
+fn show_diff_page_value(
+    path: &RepositoryRelativePath,
+    lines: &[&str],
+    positions: &[Option<AnchorPosition>],
+    anchors: &BTreeMap<String, ReviewAnchor>,
+    start: u32,
+    end: u32,
+    total_lines: u32,
+) -> Value {
+    let start_index = usize::try_from(start - 1).unwrap_or(usize::MAX);
+    let end_index = usize::try_from(end).unwrap_or(usize::MAX);
+    let page_positions = positions[start_index..end_index]
+        .iter()
+        .flatten()
+        .filter(|position| !matches!(position, AnchorPosition::Context { .. }))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let changed_line_anchors = anchors
+        .iter()
+        .filter(|(_, anchor)| anchor.path == *path && page_positions.contains(&anchor.position))
+        .map(|(anchor_id, anchor)| {
+            json!({
+                "anchor_id": anchor_id,
+                "position": anchor.position,
+            })
+        })
+        .collect::<Vec<_>>();
+    let content = lines[start_index..end_index].concat();
+    let next_start_line = (end < total_lines).then_some(end + 1);
+    json!({
+        "path": path,
+        "start_line": start,
+        "end_line": end,
+        "total_lines": total_lines,
+        "next_start_line": next_start_line,
+        "truncated": next_start_line.is_some(),
+        "content": content,
+        "changed_line_anchors": changed_line_anchors,
+    })
+}
+
+fn diff_line_positions(lines: &[&str]) -> Vec<Option<AnchorPosition>> {
+    let mut old_line = None;
+    let mut new_line = None;
+    lines
+        .iter()
+        .map(|line| {
+            if let Some((old_start, new_start)) = parse_hunk_starts(line) {
+                old_line = Some(old_start);
+                new_line = Some(new_start);
+                return None;
+            }
+            let (Some(old), Some(new)) = (old_line, new_line) else {
+                return None;
+            };
+            match line.as_bytes().first() {
+                Some(b'+') => {
+                    new_line = Some(new.saturating_add(1));
+                    AnchorPosition::addition(new).ok()
+                }
+                Some(b'-') => {
+                    old_line = Some(old.saturating_add(1));
+                    AnchorPosition::deletion(old).ok()
+                }
+                Some(b' ') => {
+                    old_line = Some(old.saturating_add(1));
+                    new_line = Some(new.saturating_add(1));
+                    AnchorPosition::context(old, new).ok()
+                }
+                Some(b'\\') => None,
+                _ => {
+                    old_line = None;
+                    new_line = None;
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
+    let ranges = line.strip_prefix("@@ -")?;
+    let (old_range, new_and_suffix) = ranges.split_once(" +")?;
+    let (new_range, _) = new_and_suffix.split_once(" @@")?;
+    let old_start = old_range.split(',').next()?.parse().ok()?;
+    let new_start = new_range.split(',').next()?.parse().ok()?;
+    Some((old_start, new_start))
+}
+
+fn encoded_len(value: &Value) -> Result<u64, ReviewEngineError> {
+    let length = serde_json::to_vec(value).map_err(|_| internal())?.len();
+    Ok(u64::try_from(length).unwrap_or(u64::MAX))
+}
+
 fn ensure_allowed(run: &AgentRun, tool: AgentTool) -> Result<(), ReviewEngineError> {
     if run.invocation().allows(tool) {
         Ok(())
@@ -1452,11 +1640,63 @@ fn strict_input<T: for<'de> Deserialize<'de>>(input: Value) -> Result<T, ReviewE
 fn encode_tool_result(value: &Value, maximum: u64) -> Result<String, ReviewEngineError> {
     let encoded = serde_json::to_string(value).map_err(|_| internal())?;
     if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > maximum {
-        return Err(ReviewEngineError::budget(
-            ReviewBudgetDimension::ToolResultBytes,
-        ));
+        return Err(ReviewEngineError {
+            kind: ReviewEngineErrorKind::ToolContract,
+            provider_kind: None,
+            provider_status: None,
+            budget_dimension: Some(ReviewBudgetDimension::ToolResultBytes),
+        });
     }
     Ok(encoded)
+}
+
+fn tool_result_too_large() -> ReviewEngineError {
+    ReviewEngineError {
+        kind: ReviewEngineErrorKind::ToolContract,
+        provider_kind: None,
+        provider_status: None,
+        budget_dimension: Some(ReviewBudgetDimension::ToolResultBytes),
+    }
+}
+
+fn conversation_budget_low() -> ReviewEngineError {
+    ReviewEngineError {
+        kind: ReviewEngineErrorKind::ToolContract,
+        provider_kind: None,
+        provider_status: None,
+        budget_dimension: Some(ReviewBudgetDimension::ConversationBytes),
+    }
+}
+
+fn available_tool_result_bytes(
+    messages: &[ModelMessage],
+    tools: &[ModelTool],
+    pending_results: &[ModelContent],
+    maximum: u64,
+    preserve_synthesis_headroom: bool,
+) -> Result<u64, ReviewEngineError> {
+    let mut projected_messages = messages.to_vec();
+    if !pending_results.is_empty() {
+        projected_messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: pending_results.to_vec(),
+        });
+    }
+    let occupied = serialized_len(&projected_messages)?.saturating_add(serialized_len(tools)?);
+    let synthesis_reserve = if preserve_synthesis_headroom {
+        MAX_SYNTHESIS_RESERVE_BYTES.min(maximum / 4)
+    } else {
+        0
+    };
+    Ok(maximum
+        .saturating_sub(occupied)
+        .saturating_sub(synthesis_reserve)
+        .saturating_sub(TOOL_RESULT_ENVELOPE_RESERVE_BYTES))
+}
+
+fn serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<u64, ReviewEngineError> {
+    let length = serde_json::to_vec(value).map_err(|_| internal())?.len();
+    Ok(u64::try_from(length).unwrap_or(u64::MAX))
 }
 
 fn enforce_conversation_bound(
@@ -1464,12 +1704,8 @@ fn enforce_conversation_bound(
     tools: &[ModelTool],
     maximum: u64,
 ) -> Result<(), ReviewEngineError> {
-    let message_bytes = serde_json::to_vec(messages)
-        .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-        .map_err(|_| internal())?;
-    let tool_bytes = serde_json::to_vec(tools)
-        .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-        .map_err(|_| internal())?;
+    let message_bytes = serialized_len(messages)?;
+    let tool_bytes = serialized_len(tools)?;
     if message_bytes.saturating_add(tool_bytes) > maximum {
         Err(ReviewEngineError::budget(
             ReviewBudgetDimension::ConversationBytes,
@@ -2322,6 +2558,115 @@ mod tests {
                 })
             })
         }));
+    }
+
+    #[test]
+    fn oversized_tool_result_requests_a_narrower_scope_without_raising_limits() {
+        let error = encode_tool_result(&json!({"content": "x".repeat(128)}), 64)
+            .expect_err("oversized result");
+        assert_eq!(error.kind, ReviewEngineErrorKind::ToolContract);
+        assert_eq!(
+            error.budget_dimension,
+            Some(ReviewBudgetDimension::ToolResultBytes)
+        );
+        let recovery = recoverable_tool_error(error);
+        assert!(recovery.contains("tool_result_too_large"));
+        assert!(recovery.contains("narrower line range"));
+        assert_eq!(
+            ReviewEngineLimits::default().max_tool_result_bytes,
+            64 * 1024
+        );
+    }
+
+    #[test]
+    fn conversation_headroom_is_reserved_for_final_synthesis() {
+        let messages = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "x".repeat(8 * 1024),
+            }],
+        }];
+        let tools = Vec::<ModelTool>::new();
+        let occupied = serialized_len(&messages).expect("message length")
+            + serialized_len(&tools).expect("tool length");
+        let maximum = occupied + 2 * 1024;
+        assert_eq!(
+            available_tool_result_bytes(&messages, &tools, &[], maximum, true)
+                .expect("reserved headroom"),
+            0
+        );
+        assert_eq!(
+            available_tool_result_bytes(&messages, &tools, &[], maximum, false)
+                .expect("final result headroom"),
+            1024
+        );
+        let recovery = recoverable_tool_error(conversation_budget_low());
+        assert!(recovery.contains("conversation_budget_low"));
+        assert!(recovery.contains("submit_review_summary"));
+    }
+
+    #[test]
+    fn diff_positions_follow_multiple_unified_hunks() {
+        let lines = [
+            "@@ -2,2 +2,2 @@\n",
+            "-old\n",
+            "+new\n",
+            " same\n",
+            "@@ -10 +11 @@\n",
+            "-before\n",
+            "+after\n",
+        ];
+        assert_eq!(
+            diff_line_positions(&lines),
+            vec![
+                None,
+                Some(AnchorPosition::deletion(2).expect("deletion")),
+                Some(AnchorPosition::addition(2).expect("addition")),
+                Some(AnchorPosition::context(3, 3).expect("context")),
+                None,
+                Some(AnchorPosition::deletion(10).expect("deletion")),
+                Some(AnchorPosition::addition(11).expect("addition")),
+            ]
+        );
+    }
+
+    #[test]
+    fn oversized_diff_and_anchor_catalog_are_returned_as_bounded_pages() {
+        let path = path("src/large.rs");
+        let mut content = "@@ -0,0 +1,300 @@\n".to_owned();
+        let mut anchors = BTreeMap::new();
+        for line in 1..=300 {
+            writeln!(&mut content, "+pub const VALUE_{line}: u32 = {line};")
+                .expect("write diff line");
+            anchors.insert(
+                format!("ga1_{line:064}"),
+                ReviewAnchor {
+                    path: path.clone(),
+                    position: AnchorPosition::addition(line).expect("addition"),
+                },
+            );
+        }
+
+        let maximum = 8 * 1024;
+        let first = bounded_show_diff_page(&path, &content, &anchors, None, None, maximum)
+            .expect("first page");
+        assert!(encoded_len(&first).expect("encoded length") <= maximum);
+        assert_eq!(first["start_line"], 1);
+        assert_eq!(first["total_lines"], 301);
+        assert_eq!(first["truncated"], true);
+        let next = u32::try_from(first["next_start_line"].as_u64().expect("next line"))
+            .expect("bounded line number");
+        assert!(next > 1);
+        assert!(
+            first["changed_line_anchors"]
+                .as_array()
+                .is_some_and(|anchors| !anchors.is_empty())
+        );
+
+        let second = bounded_show_diff_page(&path, &content, &anchors, Some(next), None, maximum)
+            .expect("second page");
+        assert!(encoded_len(&second).expect("encoded length") <= maximum);
+        assert_eq!(second["start_line"], next);
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
@@ -24,6 +24,10 @@ use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+use crate::retry::{
+    RetryJitter, RetryPolicy, retry_after as parse_retry_after, retryable_server_status,
+};
 
 const ADAPTER_ID: &str = "gitlab-rest";
 const API_ROOT_PATH: &str = "/api/v4";
@@ -1038,6 +1042,61 @@ impl GitLabReadClient {
         })
     }
 
+    /// Execute a safe GET with one bounded logical-operation retry budget.
+    /// Controllers that already own a broader budget call [`Self::get`]
+    /// directly so retry loops cannot multiply.
+    ///
+    /// # Errors
+    ///
+    /// Returns the final safe classified error when the operation is permanent
+    /// or its attempt or elapsed-time budget is exhausted.
+    pub async fn get_with_retry(
+        &self,
+        endpoint: &GitLabReadEndpoint,
+    ) -> Result<GitLabReadResponse, GitLabTransportError> {
+        let policy = RetryPolicy::default();
+        let deadline = tokio::time::Instant::now() + policy.total_budget;
+        let mut jitter = RetryJitter::for_operation();
+        for attempt in 1..=policy.max_attempts {
+            let result = tokio::time::timeout_at(deadline, self.get(endpoint)).await;
+            let error = match result {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(error)) => error,
+                Err(_) => {
+                    return Err(failure(
+                        GitLabFailureKind::RequestTimeout,
+                        None,
+                        GitLabResponseMetadata::default(),
+                        false,
+                    ));
+                }
+            };
+            let retry = error.retry();
+            if !retry.eligible_read || attempt == policy.max_attempts {
+                return Err(error);
+            }
+            let delay = policy.delay(
+                attempt,
+                retry.after_seconds.map(Duration::from_secs),
+                &mut jitter,
+            );
+            let Some(wake) = tokio::time::Instant::now().checked_add(delay) else {
+                return Err(error);
+            };
+            if wake > deadline {
+                return Err(error);
+            }
+            eprintln!(
+                "revoot: platform=gitlab operation=safe_read attempt={} retry_reason={:?} delay_ms={} outcome=retrying",
+                attempt,
+                error.kind(),
+                delay.as_millis()
+            );
+            tokio::time::sleep_until(wake).await;
+        }
+        unreachable!("validated retry policy always performs at least one attempt")
+    }
+
     /// Return the exact canonical origin bound into this client.
     #[must_use]
     pub const fn origin(&self) -> &GitLabOrigin {
@@ -1438,7 +1497,10 @@ fn classify_write_status(status: StatusCode, metadata: GitLabResponseMetadata) -
     } else {
         GitLabWriteFailureEffect::Ambiguous
     };
-    let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+    let retryable = matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+    ) || retryable_server_status(status.as_u16());
     write_failure(
         read.kind(),
         Some(status.as_u16()),
@@ -2016,8 +2078,14 @@ fn extract_metadata(headers: &HeaderMap) -> GitLabResponseMetadata {
         strict_u64_header(headers, HeaderName::from_static("ratelimit-remaining"));
     let (reset_epoch_seconds, reset_bad) =
         strict_u64_header(headers, HeaderName::from_static("ratelimit-reset"));
-    let (retry_after_seconds, retry_after_malformed) =
-        strict_u64_header(headers, HeaderName::from_static("retry-after"));
+    let retry_after_value = parse_retry_after(headers, SystemTime::now());
+    let retry_after_present = headers.contains_key(HeaderName::from_static("retry-after"));
+    let retry_after_seconds = retry_after_value.map(|delay| {
+        delay
+            .as_secs()
+            .saturating_add(u64::from(delay.subsec_nanos() > 0))
+    });
+    let retry_after_malformed = retry_after_present && retry_after_value.is_none();
     let retry_after_too_large =
         retry_after_seconds.is_some_and(|value| value > MAX_RETRY_AFTER_SECONDS);
     GitLabResponseMetadata {
@@ -2133,6 +2201,7 @@ fn classify_status(status: StatusCode, metadata: GitLabResponseMetadata) -> GitL
         StatusCode::FORBIDDEN => GitLabFailureKind::Forbidden,
         StatusCode::NOT_FOUND => GitLabFailureKind::NotFound,
         StatusCode::CONFLICT => GitLabFailureKind::Conflict,
+        StatusCode::REQUEST_TIMEOUT => GitLabFailureKind::RequestTimeout,
         StatusCode::TOO_MANY_REQUESTS => GitLabFailureKind::RateLimited,
         status if status.is_redirection() => GitLabFailureKind::RedirectDenied,
         status if status.is_server_error() => GitLabFailureKind::ServerUnavailable,
@@ -2140,8 +2209,9 @@ fn classify_status(status: StatusCode, metadata: GitLabResponseMetadata) -> GitL
     };
     let retryable = matches!(
         kind,
-        GitLabFailureKind::RateLimited | GitLabFailureKind::ServerUnavailable
-    );
+        GitLabFailureKind::RateLimited | GitLabFailureKind::RequestTimeout
+    ) || matches!(kind, GitLabFailureKind::ServerUnavailable)
+        && retryable_server_status(status.as_u16());
     failure(kind, Some(status.as_u16()), metadata, retryable)
 }
 
@@ -2270,6 +2340,40 @@ mod tests {
             }
             let _ = stream.write_all(&response.body).await;
             request
+        });
+        (address, task)
+    }
+
+    async fn serve_sequence(
+        responses: Vec<MockResponse>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind numeric-loopback mock server");
+        let address = listener.local_addr().expect("read mock address");
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("accept mock request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while request.len() < 16 * 1024
+                    && !request.windows(4).any(|part| part == b"\r\n\r\n")
+                {
+                    let count = stream.read(&mut buffer).await.expect("read mock request");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                stream.write_all(&response.head).await.expect("write head");
+                if let Some(delay) = response.body_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                let _ = stream.write_all(&response.body).await;
+                requests.push(request);
+            }
+            requests
         });
         (address, task)
     }
@@ -2522,6 +2626,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_safe_read_retries_without_nesting_transport_attempts() {
+        let (address, server) = serve_sequence(vec![
+            json_response("503 Service Unavailable", "Retry-After: 0\r\n", b"{}"),
+            json_response("200 OK", "", br#"{"id":7}"#),
+        ])
+        .await;
+        let client = GitLabReadClient::new_for_loopback(
+            &config(GitLabTransportLimits::default()),
+            token(),
+            address,
+        )
+        .expect("build test client");
+        let response = client
+            .get_with_retry(&GitLabReadEndpoint::CurrentUser)
+            .await
+            .expect("transient read succeeds");
+        assert_eq!(response.observation().status, 200);
+        let requests = server.await.expect("mock task");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.starts_with(b"GET ")));
+    }
+
+    #[tokio::test]
     async fn rejects_encoded_and_oversized_bodies_before_retention() {
         let response = MockResponse {
             head: b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\nConnection: close\r\n\r\n".to_vec(),
@@ -2607,6 +2734,17 @@ mod tests {
     }
 
     #[test]
+    fn request_timeout_status_is_a_retryable_safe_read() {
+        let error = classify_status(
+            StatusCode::REQUEST_TIMEOUT,
+            GitLabResponseMetadata::default(),
+        );
+        assert_eq!(error.kind(), GitLabFailureKind::RequestTimeout);
+        assert_eq!(error.status(), Some(408));
+        assert!(error.retry().eligible_read);
+    }
+
+    #[test]
     fn pagination_and_custom_ca_identity_are_bounded() {
         assert_eq!(
             GitLabPagination::new(0, 100),
@@ -2660,6 +2798,16 @@ mod tests {
                 "503 Service Unavailable",
                 GitLabFailureKind::ServerUnavailable,
                 true,
+            ),
+            (
+                "408 Request Timeout",
+                GitLabFailureKind::RequestTimeout,
+                true,
+            ),
+            (
+                "501 Not Implemented",
+                GitLabFailureKind::ServerUnavailable,
+                false,
             ),
         ] {
             let (address, server) = serve_once(json_response(status, "", b"{}")).await;
