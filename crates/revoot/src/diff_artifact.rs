@@ -18,7 +18,7 @@ use revoot_core::{
 use serde::Serialize;
 use tempfile::{Builder, TempDir};
 
-pub const DEFAULT_DIFF_PAGE_BYTES: usize = 24 * 1024;
+pub const DEFAULT_DIFF_PAGE_BYTES: usize = 8 * 1024;
 pub const MAX_INLINE_GROUP_DIFF_BYTES: u64 = 16 * 1024;
 pub const MAX_DIFF_SEARCH_MATCHES: u32 = 500;
 

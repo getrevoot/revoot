@@ -1566,6 +1566,7 @@ mod tests {
                 malformed_lineage_response: false,
             });
             let mut review = request(setup, Arc::clone(&provider));
+            review.limits.diff_page_bytes = 24 * 1024;
             review.prior_review = prior_review;
             let result = run_tool_first_engine(review).await.expect("lineage review");
             assert_eq!(provider.worker_stage.load(Ordering::Relaxed), 2);

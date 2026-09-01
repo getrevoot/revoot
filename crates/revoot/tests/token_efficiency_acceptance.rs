@@ -392,6 +392,7 @@ fn engine_request(
     let mut limits = ToolFirstEngineLimits::new("efficiency-model");
     limits.effort = ReviewEffort::Medium;
     limits.max_parallel_groups = 4;
+    limits.diff_page_bytes = 24 * 1024;
     ToolFirstEngineRequest {
         provider,
         toolbox: setup.toolbox,
