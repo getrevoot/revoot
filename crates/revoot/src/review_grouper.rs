@@ -373,7 +373,7 @@ mod tests {
         cancelled.cancel(revoot_core::ProviderCancellationReason::UserRequested);
         let adapter = FakeAdapter::new(Vec::new());
         assert_fallback(
-            run_review_grouper(
+            &run_review_grouper(
                 &adapter,
                 &ReviewGrouperConfig::new("fixture-model"),
                 &partition,
@@ -389,7 +389,7 @@ mod tests {
         let mut config = ReviewGrouperConfig::new("fixture-model");
         config.max_input_bytes = 1;
         assert_fallback(
-            run_review_grouper(
+            &run_review_grouper(
                 &adapter,
                 &config,
                 &partition,
@@ -410,8 +410,10 @@ mod tests {
         let partition = partition(4);
         let facts = facts(&partition);
         let adapter = FakeAdapter::new(vec![Ok(success_response(&partition))]);
-        let mut limits = ReviewBudgetLimits::default();
-        limits.max_model_requests = 1;
+        let limits = ReviewBudgetLimits {
+            max_model_requests: 1,
+            ..ReviewBudgetLimits::default()
+        };
         let exhausted = budget(limits);
         let held = exhausted
             .reserve_model_request(
@@ -424,7 +426,7 @@ mod tests {
             )
             .expect("held request");
         assert_fallback(
-            run_review_grouper(
+            &run_review_grouper(
                 &adapter,
                 &ReviewGrouperConfig::new("fixture-model"),
                 &partition,
@@ -441,7 +443,7 @@ mod tests {
 
         let adapter = FakeAdapter::new(vec![Ok(success_response(&partition))]);
         assert_fallback(
-            run_review_grouper(
+            &run_review_grouper(
                 &adapter,
                 &ReviewGrouperConfig::new("fixture-model"),
                 &partition,
@@ -501,7 +503,7 @@ mod tests {
             )
             .await
             .expect("fallback");
-            assert_fallback(outcome, reason);
+            assert_fallback(&outcome, reason);
             assert_eq!(adapter.request_count(), 1);
         }
     }
@@ -542,7 +544,7 @@ mod tests {
         }
     }
 
-    fn assert_fallback(outcome: ReviewGrouperOutcome, reason: ReviewGrouperFallbackReason) {
+    fn assert_fallback(outcome: &ReviewGrouperOutcome, reason: ReviewGrouperFallbackReason) {
         assert_eq!(
             outcome.mode,
             ReviewGrouperMode::DeterministicFallback(reason)

@@ -86,6 +86,7 @@ use crate::review_engine::{
 use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
 };
+use crate::review_strategy_config::{ReviewStrategyConfiguration, strategy_from_resolved};
 
 const REPORT_SCHEMA_VERSION: &str = "revoot.review-report/v3";
 const MODEL_CATALOG_SCHEMA_VERSION: &str = "revoot.model-catalog/v1";
@@ -879,6 +880,7 @@ async fn run_async(
         environment.iter().cloned(),
     )?;
     let resolution = &resolved.effective;
+    let strategy = typed_review_strategy(&resolved)?;
     let mut prepared = if let Some(repository) = github_repository {
         PreparedReview::GitHub(Box::new(
             acquire_github_context(
@@ -886,6 +888,7 @@ async fn run_async(
                 github_ci.as_ref(),
                 &string_environment,
                 resolution,
+                &strategy,
                 &resolved.repository,
                 DEFERRED_PROVIDER,
                 DEFERRED_MODEL,
@@ -903,6 +906,7 @@ async fn run_async(
                 &origin_policy,
                 environment,
                 resolution,
+                &strategy,
                 &resolved.repository,
                 DEFERRED_PROVIDER,
                 DEFERRED_MODEL,
@@ -968,12 +972,13 @@ async fn run_local_review(
         ));
     }
     let resolution = &resolved.effective;
+    let strategy = typed_review_strategy(&resolved)?;
     let context = build_local_review_context(
         capture,
         &LocalReviewContextOptions {
             provider_adapter: DEFERRED_PROVIDER.to_owned(),
             model_id: DEFERRED_MODEL.to_owned(),
-            agent_limits: agent_limits(resolution)?,
+            agent_limits: agent_limits(resolution, &strategy)?,
             diff_limits: diff_limits(resolution)?,
             selection_policy: selection_policy(resolution, &resolved.repository)?,
             partition_limits: partition_limits(resolution)?,
@@ -1014,6 +1019,7 @@ async fn execute_prepared_review(
         return Ok((provider, model, no_model_review_report(&prepared)));
     }
     let resolution = &resolved.effective;
+    let strategy = typed_review_strategy(&resolved)?;
     let guidance = resolved.repository.guidance_text();
     let attention = prepared.review_attention();
     let review_brief = prepared_review_brief(&prepared, &attention)?;
@@ -1045,17 +1051,6 @@ async fn execute_prepared_review(
     let minimum_confidence_percent =
         u8::try_from(config_unsigned(resolution, "review.minimum_confidence")?)
             .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "minimum confidence is invalid"))?;
-    let effort = match config_string(resolution, "review.effort")? {
-        "low" => revoot_core::ReviewEffort::Low,
-        "medium" => revoot_core::ReviewEffort::Medium,
-        "high" => revoot_core::ReviewEffort::High,
-        _ => {
-            return Err(diagnostic(
-                ErrorCode::ContractInvalid,
-                "review effort is invalid",
-            ));
-        }
-    };
     let mut report = run_review(
         adapter.as_ref(),
         ReviewEngineRequest {
@@ -1075,21 +1070,17 @@ async fn execute_prepared_review(
             initial_omissions,
             limits: ReviewEngineLimits {
                 minimum_confidence_percent,
-                max_inline_diff_bytes: config_unsigned(
-                    resolution,
-                    "model_context.max_inline_diff_bytes",
-                )?,
-                max_parallel_groups: u8::try_from(config_unsigned(
-                    resolution,
-                    "review.max_parallel_groups",
-                )?)
-                .map_err(|_| {
-                    diagnostic(
-                        ErrorCode::ContractInvalid,
-                        "parallel group limit is invalid",
-                    )
-                })?,
-                effort,
+                max_inline_diff_bytes: strategy.max_inline_diff_bytes,
+                max_parallel_groups: strategy.max_parallel_groups,
+                effort: strategy.effort,
+                max_output_tokens_per_turn: u32::try_from(strategy.max_request_output_tokens)
+                    .map_err(|_| {
+                        diagnostic(
+                            ErrorCode::ContractInvalid,
+                            "per-request output token limit is invalid",
+                        )
+                    })?,
+                reserved_input_tokens_per_turn: strategy.target_request_input_tokens,
                 ..ReviewEngineLimits::default()
             },
         },
@@ -1366,6 +1357,7 @@ async fn acquire_github_context(
     ci: Option<&GitHubCiContext>,
     environment: &[(String, String)],
     resolution: &revoot_core::ConfigurationResolution,
+    strategy: &ReviewStrategyConfiguration,
     repository_policy: &RepositoryReviewPolicy,
     provider: &str,
     model: &str,
@@ -1462,7 +1454,7 @@ async fn acquire_github_context(
         &GitHubReviewContextOptions {
             provider_adapter: provider.to_owned(),
             model_id: model.to_owned(),
-            agent_limits: agent_limits(resolution)?,
+            agent_limits: agent_limits(resolution, strategy)?,
             diff_limits: diff_limits(resolution)?,
             selection_policy: selection_policy(resolution, repository_policy)?,
             partition_limits: partition_limits(resolution)?,
@@ -1501,6 +1493,7 @@ async fn acquire_gitlab_context(
     origin_policy: &GitLabOriginPolicy,
     environment: &[(OsString, OsString)],
     resolution: &revoot_core::ConfigurationResolution,
+    strategy: &ReviewStrategyConfiguration,
     repository_policy: &RepositoryReviewPolicy,
     provider: &str,
     model: &str,
@@ -1575,7 +1568,7 @@ async fn acquire_gitlab_context(
         &GitLabReviewContextOptions {
             provider_adapter: provider.to_owned(),
             model_id: model.to_owned(),
-            agent_limits: agent_limits(resolution)?,
+            agent_limits: agent_limits(resolution, strategy)?,
             diff_limits: diff_limits(resolution)?,
             selection_policy: selection_policy(resolution, repository_policy)?,
             partition_limits: partition_limits(resolution)?,
@@ -2457,26 +2450,28 @@ fn provider_setup_error() -> Diagnostic {
 
 fn agent_limits(
     resolution: &revoot_core::ConfigurationResolution,
+    strategy: &ReviewStrategyConfiguration,
 ) -> Result<AgentBudgetLimits, Diagnostic> {
-    let max_model_requests = u32_value(resolution, "budget.max_model_requests")?;
-    let engine_limits = ReviewEngineLimits::default();
-    let request_count = u64::from(max_model_requests);
+    let budget = &strategy.aggregate_budget;
     let max_findings = u32_value(resolution, "budget.max_findings")?;
-    let max_model_tokens = config_unsigned(resolution, "budget.max_model_tokens")?;
-    let max_tool_calls = u32_value(resolution, "budget.max_tool_calls")?;
-    let deadline_seconds = config_unsigned(resolution, "budget.deadline_seconds")?;
     Ok(AgentBudgetLimits {
-        max_turns: max_model_requests,
-        max_model_requests,
+        max_turns: budget.max_model_requests,
+        max_model_requests: budget.max_model_requests,
         max_candidate_findings: max_findings,
-        max_elapsed_millis: deadline_seconds.saturating_mul(1_000),
-        max_input_tokens: max_model_tokens,
-        max_output_tokens: max_model_tokens,
-        max_tool_calls,
-        max_cost_microusd: request_count
-            .saturating_mul(engine_limits.reserved_cost_microusd_per_turn),
+        max_elapsed_millis: budget.max_elapsed_millis,
+        max_input_tokens: budget.max_model_tokens,
+        max_output_tokens: budget.max_output_tokens,
+        max_tool_calls: budget.max_tool_calls,
+        max_cost_microusd: budget.max_cost_microusd,
         ..AgentBudgetLimits::default()
     })
+}
+
+fn typed_review_strategy(
+    resolved: &ResolvedReviewConfiguration,
+) -> Result<ReviewStrategyConfiguration, Diagnostic> {
+    strategy_from_resolved(resolved)
+        .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))
 }
 
 fn partition_limits(
@@ -3101,8 +3096,8 @@ mod tests {
         CanonicalPublication, CanonicalReviewReport, CanonicalSelection, OutputFormat,
         REPORT_SCHEMA_VERSION, ReviewOutput, agent_limits, apply_repository_suppressions,
         fork_behavior, github_publication_failure, minimum_review_risk, parse_args,
-        parse_private_cidr, partition_limits, select_model, validate_bound_job_url,
-        write_report_atomically,
+        parse_private_cidr, partition_limits, select_model, typed_review_strategy,
+        validate_bound_job_url, write_report_atomically,
     };
 
     static LOCAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -3225,7 +3220,8 @@ mod tests {
         assert_eq!(selection.max_files, 1);
         assert_eq!(selection.max_total_bytes, 1);
 
-        let exploration = agent_limits(&resolved.effective).expect("agent limits");
+        let strategy = typed_review_strategy(&resolved).expect("strategy");
+        let exploration = agent_limits(&resolved.effective, &strategy).expect("agent limits");
         let defaults = AgentBudgetLimits::default();
         assert_eq!(
             exploration.max_repository_files,
@@ -3235,6 +3231,8 @@ mod tests {
             exploration.max_repository_bytes,
             defaults.max_repository_bytes
         );
+        assert_eq!(exploration.max_input_tokens, 300_000);
+        assert_eq!(exploration.max_output_tokens, 64 * 4_096);
     }
 
     #[test]

@@ -686,6 +686,7 @@ fn adapt_document(
             if budget.max_model_requests.is_some_and(|value| value > 64)
                 || budget.max_model_tokens.is_some_and(|value| value > 300_000)
                 || budget.max_tool_calls.is_some_and(|value| value > 256)
+                || budget.deadline_seconds.is_some_and(|value| value > 600)
             {
                 return Err(contract_error(
                     "repository budget values may only lower their defaults",
@@ -1119,7 +1120,7 @@ fn product_schema() -> Result<ConfigurationSchema, Diagnostic> {
             600,
             AssignmentScope::RepositoryAndTrusted,
             1,
-            86_400,
+            600,
         ),
         unsigned_field(
             "budget.max_files",
@@ -1168,7 +1169,7 @@ fn product_schema() -> Result<ConfigurationSchema, Diagnostic> {
             16_384,
             AssignmentScope::RepositoryAndTrusted,
             1,
-            65_536,
+            16_384,
         ),
         unsigned_field(
             "review.max_parallel_groups",
@@ -1293,7 +1294,7 @@ fn product_policy() -> Vec<PolicyRule> {
         ("budget.max_model_requests", 1, 256),
         ("budget.max_model_tokens", 1, 2_000_000),
         ("budget.max_tool_calls", 1, 2_048),
-        ("model_context.max_inline_diff_bytes", 1, 65_536),
+        ("model_context.max_inline_diff_bytes", 1, 16_384),
         ("review.max_parallel_groups", 1, 8),
         ("review.context_lines", 0, 200),
         ("review.minimum_confidence", 70, 100),

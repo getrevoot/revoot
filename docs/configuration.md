@@ -196,6 +196,10 @@ configuration, then compiled defaults. Provider/model choice, credentials,
 private-network exceptions, publication, and other operator settings remain
 trusted environment or CLI policy.
 
+The review deadline is bounded to 1–600 seconds, and the all-or-nothing inline
+diff threshold is bounded to 1–16,384 bytes. Repository configuration may lower
+either default but cannot expand it.
+
 Use `revoot config explain --base-config .revoot.toml --json` to inspect scalar
 provenance, effective policy clamps, structured rules, and suppressions without
 loading credentials.
