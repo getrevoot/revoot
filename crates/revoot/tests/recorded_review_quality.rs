@@ -144,7 +144,7 @@ impl RecordedProvider {
             )]));
         }
 
-        let evidence_id = recent
+        let delivered = recent
             .and_then(|value| value["tool_results"].as_array())
             .and_then(|results| {
                 results.iter().find_map(|result| {
@@ -154,11 +154,15 @@ impl RecordedProvider {
                 })
             })
             .and_then(|body| serde_json::from_str::<Value>(body).ok())
-            .and_then(|body| body["evidence_id"].as_str().map(str::to_owned))
+            .ok_or_else(protocol_error)?;
+        let evidence_id = delivered["evidence_id"]
+            .as_str()
+            .map(str::to_owned)
             .ok_or_else(protocol_error)?;
         let mut calls = Vec::new();
         if let Some(diagnosis) = self.diagnosis {
-            let (work_unit_id, anchor_id) = visible_target(&packet, diagnosis.line)?;
+            let (work_unit_id, anchor_id) =
+                visible_target(&packet, &delivered["result"], diagnosis.line)?;
             calls.push((
                 self.call_id(),
                 "submit_candidate_finding",
@@ -348,10 +352,23 @@ fn completion_input() -> Value {
     })
 }
 
-fn visible_target(packet: &Value, new_line: u32) -> Result<(String, String), ProviderError> {
-    for file in packet["files"].as_array().ok_or_else(protocol_error)? {
-        let work_unit_id = file["work_unit_id"].as_str().ok_or_else(protocol_error)?;
-        for anchor in file["anchors"].as_array().ok_or_else(protocol_error)? {
+fn visible_target(
+    packet: &Value,
+    delivered_result: &Value,
+    new_line: u32,
+) -> Result<(String, String), ProviderError> {
+    let files = packet["files"].as_array().ok_or_else(protocol_error)?;
+    for page in delivered_result["pages"]
+        .as_array()
+        .ok_or_else(protocol_error)?
+    {
+        let path = page["path"].as_str().ok_or_else(protocol_error)?;
+        let work_unit_id = files
+            .iter()
+            .find(|file| file["path"].as_str() == Some(path))
+            .and_then(|file| file["work_unit_id"].as_str())
+            .ok_or_else(protocol_error)?;
+        for anchor in page["anchors"].as_array().ok_or_else(protocol_error)? {
             if anchor["position"]["kind"] == "addition"
                 && anchor["position"]["new_line"].as_u64() == Some(u64::from(new_line))
             {

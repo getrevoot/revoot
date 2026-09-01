@@ -103,8 +103,19 @@ pub async fn run_review_grouper(
     cancellation: &CancellationToken,
     clock: &dyn ReviewGrouperClock,
 ) -> Result<ReviewGrouperOutcome, ReviewGrouperError> {
-    let preparation =
-        prepare_grouping(partition, facts).map_err(ReviewGrouperError::Preparation)?;
+    let preparation = match prepare_grouping(partition, facts) {
+        Ok(preparation) => preparation,
+        Err(GroupingError::RequestTooLarge) => {
+            let fallback = deterministic_grouping_fallback(partition)
+                .map_err(ReviewGrouperError::FallbackPlan)?;
+            return Ok(fallback_outcome(
+                fallback,
+                ReviewGrouperFallbackReason::InputTooLarge,
+                ReviewBudgetUsage::default(),
+            ));
+        }
+        Err(error) => return Err(ReviewGrouperError::Preparation(error)),
+    };
     let metadata = match preparation {
         GroupingPreparation::Deterministic(plan) => {
             return Ok(ReviewGrouperOutcome {
@@ -421,6 +432,44 @@ mod tests {
             ReviewGrouperFallbackReason::InputTooLarge,
         );
         assert_eq!(adapter.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_metadata_contract_falls_back_without_dispatch() {
+        let partition = partition(100);
+        let mut facts = facts(&partition);
+        for (file_index, fact) in facts.iter_mut().enumerate() {
+            fact.rule_ids = (0..32)
+                .map(|rule_index| {
+                    format!("rule-{file_index:03}-{rule_index:03}-{}", "x".repeat(100))
+                })
+                .collect();
+        }
+        let adapter = FakeAdapter::new(Vec::new());
+        let budget = budget(ReviewBudgetLimits::default());
+        let outcome = run_review_grouper(
+            &adapter,
+            &ReviewGrouperConfig::new("fixture-model"),
+            &partition,
+            Some(&facts),
+            &budget,
+            &CancellationToken::default(),
+            &TestClock::ticking(),
+        )
+        .await
+        .expect("oversized metadata fallback");
+
+        assert_eq!(
+            outcome.mode,
+            ReviewGrouperMode::DeterministicFallback(ReviewGrouperFallbackReason::InputTooLarge)
+        );
+        assert_eq!(
+            outcome.plan.source,
+            ReviewGroupingSource::DeterministicFallback
+        );
+        assert_eq!(assigned_count(&outcome.plan), 100);
+        assert_eq!(adapter.request_count(), 0);
+        assert_eq!(budget.snapshot().usage, ReviewBudgetUsage::default());
     }
 
     #[test]

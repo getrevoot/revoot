@@ -21,7 +21,7 @@ use crate::diff_artifact::{
 use crate::review_group_inputs::{TrustedGroupFileInput, TrustedReviewGroupInput};
 
 const MAX_REQUEST_INPUT_TOKENS: u64 = 32_000;
-const CONSERVATIVE_PACKET_OVERHEAD_TOKENS: u64 = 1_024;
+const CONSERVATIVE_PACKET_OVERHEAD_TOKENS: u64 = 16_384;
 
 /// Trusted snapshot, plan, and policy identities expected by packet assembly.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -438,7 +438,13 @@ fn build_initial_packet(
     bindings: &ReviewGroupPacketBindings,
     indexed_artifacts: &BTreeMap<RepositoryPath, DiffFileManifest>,
 ) -> Result<ReviewPacketInput, ReviewGroupPacketError> {
-    let files = packet_file_briefs(input, anchor_table)?;
+    let complete = complete_group_diff(
+        input,
+        artifacts,
+        indexed_artifacts,
+        bindings.max_inline_diff_bytes,
+    )?;
+    let files = packet_file_briefs(input, anchor_table, complete.inline_bytes.is_some())?;
     let mut rule_ids = input
         .files
         .iter()
@@ -457,13 +463,30 @@ fn build_initial_packet(
     {
         return Err(ReviewGroupPacketError::HunkBinding);
     }
-    let complete = complete_group_diff(
-        input,
-        artifacts,
-        indexed_artifacts,
-        bindings.max_inline_diff_bytes,
+    let group_brief = ReviewPacketGroupBrief {
+        group_id: input.group.id.as_str().to_owned(),
+        snapshot_sha256: bindings.snapshot_sha256.clone(),
+        partition_sha256: input.partition_sha256.clone(),
+        group_plan_sha256: input.group_plan_sha256.clone(),
+        files,
+    };
+    let policy = ReviewPacketPolicy {
+        system_policy_id: bindings.system_policy_id.clone(),
+        system_policy_sha256: bindings.system_policy_sha256.clone(),
+        rule_ids,
+    };
+    let diff_manifest = ReviewPacketDiffManifest {
+        complete_diff_sha256: complete.sha256.clone(),
+        complete_diff_bytes: complete.bytes,
+        file_count: input.file_count,
+        hunk_count: input.hunk_count,
+    };
+    let manifest_tokens = estimate_manifest_tokens(
+        &group_brief,
+        &policy,
+        &unresolved_coverage_ids,
+        &diff_manifest,
     )?;
-    let manifest_tokens = estimate_manifest_tokens(input, bindings)?;
     if manifest_tokens == 0 || manifest_tokens > MAX_REQUEST_INPUT_TOKENS {
         return Err(ReviewGroupPacketError::ContextCapacity);
     }
@@ -477,29 +500,14 @@ fn build_initial_packet(
         .transpose()?;
     Ok(ReviewPacketInput {
         purpose: ReviewPacketPurpose::GroupInitial,
-        group_brief: ReviewPacketGroupBrief {
-            group_id: input.group.id.as_str().to_owned(),
-            snapshot_sha256: bindings.snapshot_sha256.clone(),
-            partition_sha256: input.partition_sha256.clone(),
-            group_plan_sha256: input.group_plan_sha256.clone(),
-            files,
-        },
-        policy: ReviewPacketPolicy {
-            system_policy_id: bindings.system_policy_id.clone(),
-            system_policy_sha256: bindings.system_policy_sha256.clone(),
-            rule_ids,
-        },
+        group_brief,
+        policy,
         checkpoint: ReviewWorkerCheckpoint::default(),
         plan_summary: None,
         accepted_findings: Vec::new(),
         unresolved_coverage_ids,
         recent_exchange: None,
-        diff_manifest: ReviewPacketDiffManifest {
-            complete_diff_sha256: complete.sha256,
-            complete_diff_bytes: complete.bytes,
-            file_count: input.file_count,
-            hunk_count: input.hunk_count,
-        },
+        diff_manifest,
         complete_diff: Some(complete.value),
         token_estimates: ReviewPacketTokenEstimates {
             manifest_request_tokens: manifest_tokens,
@@ -511,6 +519,7 @@ fn build_initial_packet(
 fn packet_file_briefs(
     input: &TrustedReviewGroupInput,
     anchor_table: &AnchorTable,
+    include_anchors: bool,
 ) -> Result<Vec<ReviewPacketFileBrief>, ReviewGroupPacketError> {
     let mut files = input
         .files
@@ -535,22 +544,26 @@ fn packet_file_briefs(
                 .iter()
                 .find(|group_file| group_file.path.new_path == file.manifest.path)
                 .ok_or(ReviewGroupPacketError::PathBinding)?;
-            let mut anchors = group_file
-                .anchor_ids
-                .iter()
-                .map(|anchor_id| {
-                    let anchor = anchor_table
-                        .resolve(anchor_id.as_str())
-                        .ok_or(ReviewGroupPacketError::AnchorBinding)?;
-                    if anchor.path != group_file.path {
-                        return Err(ReviewGroupPacketError::AnchorBinding);
-                    }
-                    Ok(ReviewPacketAnchorBrief {
-                        anchor_id: anchor.id.clone(),
-                        position: anchor.position,
+            let mut anchors = if include_anchors {
+                group_file
+                    .anchor_ids
+                    .iter()
+                    .map(|anchor_id| {
+                        let anchor = anchor_table
+                            .resolve(anchor_id.as_str())
+                            .ok_or(ReviewGroupPacketError::AnchorBinding)?;
+                        if anchor.path != group_file.path {
+                            return Err(ReviewGroupPacketError::AnchorBinding);
+                        }
+                        Ok(ReviewPacketAnchorBrief {
+                            anchor_id: anchor.id.clone(),
+                            position: anchor.position,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
             anchors.sort_by(|left, right| left.anchor_id.cmp(&right.anchor_id));
             Ok(ReviewPacketFileBrief {
                 path: file.manifest.path.clone(),
@@ -622,21 +635,80 @@ fn complete_group_diff(
 }
 
 fn estimate_manifest_tokens(
-    input: &TrustedReviewGroupInput,
-    bindings: &ReviewGroupPacketBindings,
+    group_brief: &ReviewPacketGroupBrief,
+    policy: &ReviewPacketPolicy,
+    unresolved_coverage_ids: &[String],
+    diff_manifest: &ReviewPacketDiffManifest,
 ) -> Result<u64, ReviewGroupPacketError> {
     #[derive(Serialize)]
+    struct EstimateAnchor<'a> {
+        anchor_id: &'a AnchorId,
+        position: AnchorPosition,
+    }
+    #[derive(Serialize)]
+    struct EstimateFile<'a> {
+        path: &'a RepositoryPath,
+        work_unit_id: &'a WorkUnitId,
+        tier: revoot_core::ReviewValueTier,
+        changed_lines: u32,
+        hunk_ids: &'a [String],
+        anchors: Vec<EstimateAnchor<'a>>,
+    }
+    #[derive(Serialize)]
+    struct EstimateDiff<'a> {
+        complete_diff_sha256: &'a Sha256Digest,
+        complete_diff_bytes: u64,
+        file_count: u32,
+        hunk_count: u32,
+    }
+    #[derive(Serialize)]
     struct EstimateBasis<'a> {
-        input: &'a TrustedReviewGroupInput,
+        group_id: &'a str,
         snapshot_sha256: &'a Sha256Digest,
+        partition_sha256: &'a Sha256Digest,
+        group_plan_sha256: &'a Sha256Digest,
+        files: Vec<EstimateFile<'a>>,
         system_policy_id: &'a str,
         system_policy_sha256: &'a Sha256Digest,
+        rule_ids: &'a [String],
+        unresolved_coverage_ids: &'a [String],
+        diff_manifest: EstimateDiff<'a>,
     }
+    let files = group_brief
+        .files
+        .iter()
+        .map(|file| EstimateFile {
+            path: &file.path,
+            work_unit_id: &file.work_unit_id,
+            tier: file.tier,
+            changed_lines: file.changed_lines,
+            hunk_ids: &file.hunk_ids,
+            anchors: file
+                .anchors
+                .iter()
+                .map(|anchor| EstimateAnchor {
+                    anchor_id: &anchor.anchor_id,
+                    position: anchor.position,
+                })
+                .collect(),
+        })
+        .collect();
     let bytes = serde_json::to_vec(&EstimateBasis {
-        input,
-        snapshot_sha256: &bindings.snapshot_sha256,
-        system_policy_id: &bindings.system_policy_id,
-        system_policy_sha256: &bindings.system_policy_sha256,
+        group_id: &group_brief.group_id,
+        snapshot_sha256: &group_brief.snapshot_sha256,
+        partition_sha256: &group_brief.partition_sha256,
+        group_plan_sha256: &group_brief.group_plan_sha256,
+        files,
+        system_policy_id: &policy.system_policy_id,
+        system_policy_sha256: &policy.system_policy_sha256,
+        rule_ids: &policy.rule_ids,
+        unresolved_coverage_ids,
+        diff_manifest: EstimateDiff {
+            complete_diff_sha256: &diff_manifest.complete_diff_sha256,
+            complete_diff_bytes: diff_manifest.complete_diff_bytes,
+            file_count: diff_manifest.file_count,
+            hunk_count: diff_manifest.hunk_count,
+        },
     })
     .map_err(|_| ReviewGroupPacketError::Serialization)?;
     u64::try_from(bytes.len())
@@ -813,6 +885,11 @@ mod tests {
                 .inline_request_tokens,
             None
         );
+        assert!(
+            prepared.initial_packet.group_brief.files[0]
+                .anchors
+                .is_empty()
+        );
     }
 
     #[test]
@@ -862,6 +939,11 @@ mod tests {
         assert_eq!(
             prepared.initial_packet.group_brief.files[0].hunk_ids.len(),
             1
+        );
+        assert!(
+            prepared.initial_packet.group_brief.files[0]
+                .anchors
+                .is_empty()
         );
     }
 
