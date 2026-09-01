@@ -57,6 +57,7 @@ pub struct ToolFirstEngineLimits {
     pub effort: ReviewEffort,
     pub max_parallel_groups: usize,
     pub diff_page_bytes: usize,
+    pub max_inline_diff_bytes: u64,
     pub grouper: ReviewGrouperConfig,
     pub worker: GroupWorkerLimits,
     pub verifier: ReviewVerifierConfig,
@@ -76,6 +77,7 @@ impl ToolFirstEngineLimits {
             effort: ReviewEffort::Medium,
             max_parallel_groups: 4,
             diff_page_bytes: DEFAULT_DIFF_PAGE_BYTES,
+            max_inline_diff_bytes: crate::diff_artifact::MAX_INLINE_GROUP_DIFF_BYTES,
         }
     }
 }
@@ -197,6 +199,7 @@ where
         grouper: request.limits.grouper.clone(),
         effort: request.limits.effort,
         diff_page_bytes: request.limits.diff_page_bytes,
+        max_inline_diff_bytes: request.limits.max_inline_diff_bytes,
     };
     let prepared = prepare_tool_first_review(
         preparation_input,
@@ -416,6 +419,8 @@ fn validate_request<C>(request: &ToolFirstEngineRequest<C>) -> Result<(), ToolFi
         || limits.model != limits.adjudicator.model
         || !(1..=8).contains(&limits.max_parallel_groups)
         || limits.diff_page_bytes == 0
+        || limits.max_inline_diff_bytes == 0
+        || limits.max_inline_diff_bytes > crate::diff_artifact::MAX_INLINE_GROUP_DIFF_BYTES
         || request.system_policy.trim().is_empty()
         || request.system_policy.len() > MAX_SYSTEM_POLICY_BYTES
         || request.system_policy.contains('\0')

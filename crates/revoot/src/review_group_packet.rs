@@ -32,6 +32,7 @@ pub struct ReviewGroupPacketBindings {
     pub selected_input_sha256: Sha256Digest,
     pub system_policy_id: String,
     pub system_policy_sha256: Sha256Digest,
+    pub max_inline_diff_bytes: u64,
 }
 
 /// Stable prepared state for later conversion into a provider worker request.
@@ -147,6 +148,8 @@ fn validate_bindings(
     if input.partition_sha256 != bindings.partition_sha256
         || input.group_plan_sha256 != bindings.group_plan_sha256
         || input.selected_input_sha256 != bindings.selected_input_sha256
+        || bindings.max_inline_diff_bytes == 0
+        || bindings.max_inline_diff_bytes > MAX_INLINE_GROUP_DIFF_BYTES
     {
         return Err(ReviewGroupPacketError::Binding);
     }
@@ -425,7 +428,12 @@ fn build_initial_packet(
     {
         return Err(ReviewGroupPacketError::HunkBinding);
     }
-    let complete = complete_group_diff(input, artifacts, indexed_artifacts)?;
+    let complete = complete_group_diff(
+        input,
+        artifacts,
+        indexed_artifacts,
+        bindings.max_inline_diff_bytes,
+    )?;
     let manifest_tokens = estimate_manifest_tokens(input, bindings)?;
     if manifest_tokens == 0 || manifest_tokens > MAX_REQUEST_INPUT_TOKENS {
         return Err(ReviewGroupPacketError::ContextCapacity);
@@ -521,6 +529,7 @@ fn complete_group_diff(
     input: &TrustedReviewGroupInput,
     artifacts: &DiffArtifactStore,
     indexed_artifacts: &BTreeMap<RepositoryPath, DiffFileManifest>,
+    max_inline_diff_bytes: u64,
 ) -> Result<CompleteGroupDiff, ReviewGroupPacketError> {
     let relative_paths = indexed_artifacts
         .keys()
@@ -539,7 +548,7 @@ fn complete_group_diff(
         return Err(ReviewGroupPacketError::CountBinding);
     }
     let complete_sha256 = Sha256Digest::of_bytes(complete_body.as_bytes());
-    let (value, inline_bytes) = if complete_bytes <= MAX_INLINE_GROUP_DIFF_BYTES {
+    let (value, inline_bytes) = if complete_bytes <= max_inline_diff_bytes {
         (
             ReviewPacketCompleteDiff::SmallComplete {
                 body: complete_body,
@@ -684,6 +693,32 @@ mod tests {
                 .policy
                 .rule_ids
                 .contains(&"rust.md".to_owned())
+        );
+    }
+
+    #[test]
+    fn trusted_narrower_inline_limit_keeps_complete_diff_manifest_only() {
+        let mut setup = setup(&[small_fixture("src/a.rs")], 1);
+        setup.bindings.max_inline_diff_bytes = 1;
+        let expected_bytes = setup.group_input.exact_diff_bytes;
+        let prepared = prepare_review_group_packet(
+            &setup.group_input,
+            &setup.store,
+            setup.anchor_table,
+            &setup.bindings,
+            ReviewEffort::Low,
+        )
+        .expect("manifest-only packet");
+        assert!(matches!(
+            prepared.initial_packet.complete_diff,
+            Some(ReviewPacketCompleteDiff::LargeManifestOnly { bytes, .. }) if bytes == expected_bytes
+        ));
+        assert_eq!(
+            prepared
+                .initial_packet
+                .token_estimates
+                .inline_request_tokens,
+            None
         );
     }
 
@@ -924,6 +959,7 @@ mod tests {
             selected_input_sha256: group_input.selected_input_sha256.clone(),
             system_policy_id: "review-policy-v1".to_owned(),
             system_policy_sha256: Sha256Digest::of_bytes(b"review policy"),
+            max_inline_diff_bytes: MAX_INLINE_GROUP_DIFF_BYTES,
         };
         Setup {
             fixtures: fixtures.to_vec(),

@@ -155,6 +155,13 @@ pub fn build_tool_first_report(
             evidence_sha256: Sha256Digest::of_bytes(disposition.evidence.as_bytes()),
         })
         .collect();
+    let provided_phase_usage = input
+        .phase_usage
+        .as_ref()
+        .ok_or(ToolFirstReportError::MissingPhaseUsage)?;
+    if provided_phase_usage != &input.engine.phase_usage {
+        return Err(ToolFirstReportError::PhaseUsageMismatch);
+    }
     let usage = phase_usage(input.phase_usage, input.engine.budget_usage)?;
     let report = ReviewReportV3::new(
         report_state(&input.engine.result.outcome),
@@ -635,6 +642,7 @@ mod tests {
             verified_candidates: 1,
             verification_suppressions: 0,
             budget_usage: aggregate,
+            phase_usage: phases(),
         };
         let snapshot_sha256 =
             Sha256Digest::of_bytes(&serde_json::to_vec(&snapshot).expect("snapshot encoding"));

@@ -119,6 +119,12 @@ pub fn reviewer_policy_sha256() -> String {
         .to_owned()
 }
 
+/// Return the immutable reviewer system policy shared by review runtimes.
+#[must_use]
+pub const fn reviewer_system_policy() -> &'static str {
+    SYSTEM_PROMPT
+}
+
 /// Monotonic time source supplied by the trusted application boundary.
 pub trait MonotonicClock {
     fn now_millis(&self) -> u64;

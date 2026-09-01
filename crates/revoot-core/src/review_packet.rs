@@ -534,7 +534,7 @@ fn initial_diff_context(
             }
         }
         ReviewPacketCompleteDiff::LargeManifestOnly { sha256, bytes } => {
-            if *bytes <= MAX_INLINE_DIFF_BYTES
+            if *bytes == 0
                 || *bytes != input.diff_manifest.complete_diff_bytes
                 || *sha256 != input.diff_manifest.complete_diff_sha256
                 || input.token_estimates.inline_request_tokens.is_some()
@@ -786,6 +786,22 @@ mod tests {
         large_input.token_estimates.inline_request_tokens = None;
         let ReviewPacketComposition::Ready(packet) = composer.compose(large_input).unwrap() else {
             panic!("expected ready packet");
+        };
+        assert!(matches!(
+            packet.diff_context,
+            ReviewPacketDiffContext::ManifestOnly(_)
+        ));
+
+        let mut narrowed_input = input("small complete diff", 2_000);
+        narrowed_input.complete_diff = Some(ReviewPacketCompleteDiff::LargeManifestOnly {
+            sha256: narrowed_input.diff_manifest.complete_diff_sha256.clone(),
+            bytes: narrowed_input.diff_manifest.complete_diff_bytes,
+        });
+        narrowed_input.token_estimates.inline_request_tokens = None;
+        let ReviewPacketComposition::Ready(packet) =
+            new_composer().compose(narrowed_input).unwrap()
+        else {
+            panic!("expected policy-narrowed manifest packet");
         };
         assert!(matches!(
             packet.diff_context,

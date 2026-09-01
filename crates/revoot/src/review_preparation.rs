@@ -41,6 +41,7 @@ pub struct ToolFirstPreparationInput<'a> {
     pub grouper: ReviewGrouperConfig,
     pub effort: ReviewEffort,
     pub diff_page_bytes: usize,
+    pub max_inline_diff_bytes: u64,
 }
 
 impl<'a> ToolFirstPreparationInput<'a> {
@@ -62,6 +63,7 @@ impl<'a> ToolFirstPreparationInput<'a> {
             grouper: ReviewGrouperConfig::new(model),
             effort: ReviewEffort::Medium,
             diff_page_bytes: DEFAULT_DIFF_PAGE_BYTES,
+            max_inline_diff_bytes: crate::diff_artifact::MAX_INLINE_GROUP_DIFF_BYTES,
         }
     }
 }
@@ -189,6 +191,7 @@ async fn finish_preparation(
                 selected_input_sha256: selected_inputs.input_sha256().clone(),
                 system_policy_id: input.bindings.system_policy_id.clone(),
                 system_policy_sha256: input.bindings.system_policy_sha256.clone(),
+                max_inline_diff_bytes: input.max_inline_diff_bytes,
             },
             input.effort,
         )
@@ -506,6 +509,7 @@ mod tests {
                 grouper: ReviewGrouperConfig::new(model),
                 effort: ReviewEffort::Medium,
                 diff_page_bytes: 8 * 1024,
+                max_inline_diff_bytes: crate::diff_artifact::MAX_INLINE_GROUP_DIFF_BYTES,
             }
         }
 

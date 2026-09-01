@@ -760,6 +760,7 @@ mod tests {
                     selected_input_sha256: input.selected_input_sha256.clone(),
                     system_policy_id: "policy-v1".to_owned(),
                     system_policy_sha256: Sha256Digest::of_bytes(b"policy"),
+                    max_inline_diff_bytes: crate::diff_artifact::MAX_INLINE_GROUP_DIFF_BYTES,
                 };
                 let packet = prepare_review_group_packet(
                     &input,

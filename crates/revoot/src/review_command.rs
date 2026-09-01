@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use revoot_core::provider::ProviderAdapter;
@@ -15,11 +16,12 @@ use revoot_core::{
     CancellationToken, CertificateAuthorityMode, ConfigValue, Diagnostic, ErrorCode,
     GitLabOriginPolicy, GitLabProjectIdentity, GitLabVerificationInput, GitLabWireLimits, GitSha,
     IpCidr, IssuedWorkUnitAnchors, MergeRequestIid, PartitionLimits, PublicationCandidate,
-    PublicationTarget, PullRequestNumber, RankedFinding, RepositoryPath, RepositoryRelativePath,
-    RepositoryToolLimits, ReviewGroupingSource, ReviewOmissionReason, ReviewOutcome,
+    PublicationTarget, PullRequestNumber, RankedFinding, RepositoryPath, RepositoryToolLimits,
+    ReviewBudgetBroker, ReviewGroupingSource, ReviewOmissionReason, ReviewOutcome,
     ReviewPartitionPlan, ReviewPreview, ReviewPreviewGroupInput, ReviewPreviewRule,
-    ReviewPreviewRuleSource, ReviewPreviewStrategy, ReviewSelectionPolicy, ReviewSnapshotIdentity,
-    ReviewValueTier, Severity, SnapshotReadiness, UnifiedDiffLimits, build_review_group_plan,
+    ReviewPreviewRuleSource, ReviewPreviewStrategy, ReviewReportPublication, ReviewReportSelection,
+    ReviewReportV3, ReviewSelectionPolicy, ReviewSnapshotIdentity, ReviewValueTier, Severity,
+    Sha256Digest, SnapshotReadiness, UnifiedDiffLimits, build_review_group_plan,
     build_review_preview, classify_gitlab_ci_environment, parse_project_response,
     validate_rank_and_render,
 };
@@ -69,6 +71,7 @@ use crate::gitlab_transport::{
     GitLabCaMode, GitLabCustomCaBundle, GitLabReadClient, GitLabReadEndpoint,
     GitLabTransportConfig, GitLabTransportLimits, GitLabWriteClient,
 };
+use crate::group_worker_engine::{GroupWorkerClock, GroupWorkerLimits};
 use crate::local_review::{
     LocalReviewContext, LocalReviewContextOptions, build_local_review_context, capture_local_git,
     local_snapshot_is_fresh,
@@ -77,21 +80,27 @@ use crate::prior_review::{acquire_github_prior_review, acquire_gitlab_prior_revi
 use crate::providers::ApiKey;
 use crate::providers::anthropic::{AnthropicAdapter, AnthropicConfig};
 use crate::providers::openai::{OpenAiAdapter, OpenAiConfig};
+use crate::review_adjudicator::ReviewAdjudicatorClock;
 use crate::review_checkpoint::{
     ReviewAttention, ReviewCheckpoint, extract_checkpoint, plan_attention,
 };
 use crate::review_engine::{
-    IndependentReviewBrief, MonotonicClock, PriorFindingDisposition, PriorFindingDispositionKind,
-    ReviewAnchor, ReviewCoverage, ReviewEngineLimits, ReviewEngineRequest, ReviewReport,
-    ReviewStrategy, run_review,
+    MonotonicClock, PriorFindingDisposition, PriorFindingDispositionKind, REVIEWER_POLICY_VERSION,
+    ReviewCoverage, ReviewStrategy, reviewer_system_policy,
 };
+use crate::review_grouper::ReviewGrouperClock;
 use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
 };
 use crate::review_strategy_config::{ReviewStrategyConfiguration, strategy_from_resolved};
+use crate::review_verifier::ReviewVerifierClock;
 use crate::rule_diagnostics::{
     RepositoryRuleMetadata, RuleDiagnosticPolicy, RulePrecedenceSource, diagnose_rules,
 };
+use crate::tool_first_engine::{
+    ToolFirstEngineLimits, ToolFirstEngineReport, ToolFirstEngineRequest, run_tool_first_engine,
+};
+use crate::tool_first_report::{ToolFirstReportInput, build_tool_first_report};
 
 const REPORT_SCHEMA_VERSION: &str = "revoot.review-report/v3";
 const MODEL_CATALOG_SCHEMA_VERSION: &str = "revoot.model-catalog/v1";
@@ -99,6 +108,7 @@ const MODEL_CATALOG: &str = include_str!("../assets/model-catalog-v1.json");
 const MAX_CODE_HOST_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const DEFERRED_PROVIDER: &str = "deferred";
 const DEFERRED_MODEL: &str = "deferred";
+const TOOL_FIRST_POLICY_ADAPTER: &str = "For this runtime, complete_group is the required final summary and coverage gate; the policy's submit_review_summary instruction refers to complete_group. Use the exact tool names exposed in the current request. A rejected complete_group call means required coverage remains and must not be bypassed.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum OutputFormat {
@@ -148,13 +158,15 @@ enum ReviewCommandResult {
     Review {
         provider: String,
         model: String,
-        report: CanonicalReviewReport,
+        report: Box<CanonicalReviewReport>,
     },
-    Preview(ReviewPreview),
+    Preview(Box<ReviewPreview>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CanonicalReviewReport {
+    #[serde(skip)]
+    stable_report: Option<ReviewReportV3>,
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     overview: Option<ReviewOverview>,
@@ -287,6 +299,7 @@ struct CanonicalPublication {
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
     actions_confirmed: u32,
+    published_findings: u32,
     mutation_attempts: u32,
     resolved_discussions: u32,
 }
@@ -301,6 +314,7 @@ impl CanonicalPublication {
             state: "pending",
             reason: None,
             actions_confirmed: 0,
+            published_findings: 0,
             mutation_attempts: 0,
             resolved_discussions: 0,
         }
@@ -311,6 +325,7 @@ impl CanonicalPublication {
             state,
             reason,
             actions_confirmed: 0,
+            published_findings: 0,
             mutation_attempts: 0,
             resolved_discussions: 0,
         }
@@ -384,14 +399,6 @@ impl PreparedReview {
             Self::GitLab(prepared) => &prepared.context.partition,
             Self::GitHub(prepared) => &prepared.context.partition,
             Self::Local(prepared) => &prepared.context.partition,
-        }
-    }
-
-    fn invocation(&self) -> Option<&revoot_core::ReviewInvocation> {
-        match self {
-            Self::GitLab(prepared) => prepared.context.invocation.as_ref(),
-            Self::GitHub(prepared) => prepared.context.invocation.as_ref(),
-            Self::Local(prepared) => prepared.context.invocation.as_ref(),
         }
     }
 
@@ -543,40 +550,6 @@ impl PreparedReview {
         omissions
     }
 
-    fn review_anchors(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, ReviewAnchor>, Diagnostic> {
-        self.anchors()
-            .iter()
-            .map(|anchor| {
-                RepositoryRelativePath::try_from(anchor.path.new_path.as_str().to_owned())
-                    .map(|path| {
-                        (
-                            anchor.id.as_str().to_owned(),
-                            ReviewAnchor {
-                                path,
-                                position: anchor.position,
-                            },
-                        )
-                    })
-                    .map_err(|_| {
-                        diagnostic(
-                            ErrorCode::ContractInvalid,
-                            "trusted anchor has no safe checkout path",
-                        )
-                    })
-            })
-            .collect()
-    }
-
-    const fn change_request_label(&self) -> &'static str {
-        match self {
-            Self::GitLab(_) => "merge-request",
-            Self::GitHub(_) => "pull-request",
-            Self::Local(_) => "local change",
-        }
-    }
-
     fn toolbox(
         &self,
         repository_policy: &RepositoryReviewPolicy,
@@ -678,6 +651,30 @@ impl ProcessClock {
 }
 
 impl MonotonicClock for ProcessClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl ReviewGrouperClock for ProcessClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl GroupWorkerClock for ProcessClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl ReviewVerifierClock for ProcessClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl ReviewAdjudicatorClock for ProcessClock {
     fn now_millis(&self) -> u64 {
         u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -824,7 +821,7 @@ async fn run_async(
         return Ok(ReviewCommandResult::Review {
             provider: "not_used".to_owned(),
             model: "not_used".to_owned(),
-            report: skipped_fork_review_report(),
+            report: Box::new(skipped_fork_review_report()),
         });
     }
     let explicit_host = ci_requested
@@ -954,6 +951,7 @@ async fn run_async(
     }
     if preview {
         return build_prepared_preview(&prepared, &resolved, &strategy)
+            .map(Box::new)
             .map(ReviewCommandResult::Preview);
     }
     let job_url = ci_job_url(&string_environment, &prepared)?;
@@ -967,7 +965,7 @@ async fn run_async(
         return Ok(ReviewCommandResult::Review {
             provider,
             model,
-            report,
+            report: Box::new(report),
         });
     }
     let credentials =
@@ -985,7 +983,7 @@ async fn run_async(
         .map(|(provider, model, report)| ReviewCommandResult::Review {
             provider,
             model,
-            report,
+            report: Box::new(report),
         })
 }
 
@@ -1011,7 +1009,7 @@ async fn run_local_review(
         return Ok(ReviewCommandResult::Review {
             provider: "not_used".to_owned(),
             model: "not_used".to_owned(),
-            report: no_changes_report(),
+            report: Box::new(no_changes_report()),
         });
     }
     let resolution = &resolved.effective;
@@ -1031,13 +1029,14 @@ async fn run_local_review(
     let mut prepared = PreparedReview::Local(Box::new(PreparedLocalReview { context }));
     if preview {
         return build_prepared_preview(&prepared, &resolved, &strategy)
+            .map(Box::new)
             .map(ReviewCommandResult::Preview);
     }
     if prepared.partition().work_units.is_empty() {
         return Ok(ReviewCommandResult::Review {
             provider: "not_used".to_owned(),
             model: "not_used".to_owned(),
-            report: no_model_review_report(&prepared),
+            report: Box::new(no_model_review_report(&prepared)),
         });
     }
     let credentials =
@@ -1055,7 +1054,7 @@ async fn run_local_review(
         .map(|(provider, model, report)| ReviewCommandResult::Review {
             provider,
             model,
-            report,
+            report: Box::new(report),
         })
 }
 
@@ -1237,11 +1236,79 @@ async fn execute_prepared_review(
     }
     let resolution = &resolved.effective;
     let strategy = typed_review_strategy(&resolved)?;
-    let guidance = resolved.repository.guidance_text();
     let attention = prepared.review_attention();
-    let review_brief = prepared_review_brief(&prepared, &attention)?;
+    let adapter: Arc<dyn ProviderAdapter> = Arc::from(build_provider(&provider, &credentials)?);
+    let minimum_confidence_percent =
+        u8::try_from(config_unsigned(resolution, "review.minimum_confidence")?)
+            .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "minimum confidence is invalid"))?;
+    let maximum_findings = usize::try_from(config_unsigned(resolution, "budget.max_findings")?)
+        .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "finding limit is invalid"))?;
+    let mut engine_report =
+        run_prepared_tool_first_engine(&prepared, &resolved, &strategy, &model, adapter).await?;
+    if !prepared.is_fresh() {
+        engine_report.result.outcome = ReviewOutcome::Stale {
+            usage: review_outcome_usage(&engine_report.result.outcome),
+        };
+    }
+    let repository_suppressions = filter_tool_first_findings(
+        &mut engine_report,
+        prepared.issued_anchors(),
+        prepared.anchors(),
+        maximum_findings,
+        minimum_confidence_percent,
+        &resolved.repository,
+    )?;
+    let mut report = canonicalize_report(
+        &engine_report,
+        prepared.issued_anchors(),
+        prepared.anchors(),
+        maximum_findings,
+        repository_suppressions,
+        strategy.effort,
+        CanonicalSelection::from_partition(prepared.partition()),
+    )?;
+    report.publication = publish_with_checkpoint(
+        &prepared,
+        &report,
+        &provider,
+        &model,
+        job_url.as_deref(),
+        attention.next_generation(),
+    )
+    .await;
+    let snapshot_sha256 = Sha256Digest::of_bytes(
+        &serde_json::to_vec(&prepared.partition().snapshot).map_err(|_| {
+            diagnostic(
+                ErrorCode::ContractInvalid,
+                "snapshot identity serialization failed",
+            )
+        })?,
+    );
+    report.stable_report = Some(
+        build_tool_first_report(ToolFirstReportInput {
+            engine: &engine_report,
+            partition: prepared.partition(),
+            anchors: prepared.anchors(),
+            snapshot_sha256,
+            selection: stable_selection(prepared.partition()),
+            publication: stable_publication(&report),
+            effort: strategy.effort,
+            phase_usage: Some(engine_report.phase_usage.clone()),
+        })
+        .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))?,
+    );
+    Ok((provider, model, report))
+}
+
+async fn run_prepared_tool_first_engine(
+    prepared: &PreparedReview,
+    resolved: &ResolvedReviewConfiguration,
+    strategy: &ReviewStrategyConfiguration,
+    model: &str,
+    provider: Arc<dyn ProviderAdapter>,
+) -> Result<ToolFirstEngineReport, Diagnostic> {
     let cancellation = CancellationToken::default();
-    let toolbox = prepared.toolbox(&resolved.repository, &cancellation)?;
+    let toolbox = Arc::new(prepared.toolbox(&resolved.repository, &cancellation)?);
     let mut initial_omissions = prepared.initial_omissions();
     let history = if let Ok(history) = GitHistoryToolbox::open(
         prepared.root(),
@@ -1255,7 +1322,7 @@ async fn execute_prepared_review(
                 AgentOmissionReason::HistoryIncomplete,
             );
         }
-        Some(history)
+        Some(Arc::new(history))
     } else {
         push_unique_omission(
             &mut initial_omissions,
@@ -1264,89 +1331,165 @@ async fn execute_prepared_review(
         );
         None
     };
-    let adapter = build_provider(&provider, &credentials)?;
-    let minimum_confidence_percent =
-        u8::try_from(config_unsigned(resolution, "review.minimum_confidence")?)
-            .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "minimum confidence is invalid"))?;
-    let mut report = run_review(
-        adapter.as_ref(),
-        ReviewEngineRequest {
-            invocation: prepared.invocation().cloned().ok_or_else(|| {
-                diagnostic(
-                    ErrorCode::ContractInvalid,
-                    "reviewable partition has no invocation",
-                )
-            })?,
-            partition: prepared.partition().clone(),
-            toolbox,
-            history,
-            prior_review: prepared.prior_review(),
-            anchors: prepared.review_anchors()?,
-            review_brief,
-            repository_guidance: guidance,
-            initial_omissions,
-            limits: ReviewEngineLimits {
-                minimum_confidence_percent,
-                max_inline_diff_bytes: strategy.max_inline_diff_bytes,
-                max_parallel_groups: strategy.max_parallel_groups,
-                effort: strategy.effort,
-                max_output_tokens_per_turn: u32::try_from(strategy.max_request_output_tokens)
-                    .map_err(|_| {
-                        diagnostic(
-                            ErrorCode::ContractInvalid,
-                            "per-request output token limit is invalid",
-                        )
-                    })?,
-                reserved_input_tokens_per_turn: strategy.target_request_input_tokens,
-                ..ReviewEngineLimits::default()
-            },
-        },
-        cancellation,
-        &ProcessClock::start(),
+    let clock = Arc::new(ProcessClock::start());
+    let budget = ReviewBudgetBroker::new(
+        strategy.aggregate_budget,
+        ReviewGrouperClock::now_millis(clock.as_ref()),
     )
-    .await
-    .map_err(|error| diagnostic(ErrorCode::ReviewFailed, error.to_string()))?;
-    if !prepared.is_fresh() {
-        report.outcome = ReviewOutcome::Stale {
-            usage: review_outcome_usage(&report.outcome),
-        };
-    }
-    let mut report = canonicalize_report(
-        report,
-        prepared.issued_anchors(),
-        prepared.anchors(),
-        usize::try_from(config_unsigned(resolution, "budget.max_findings")?)
-            .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "finding limit is invalid"))?,
-        &resolved.repository,
-        CanonicalSelection::from_partition(prepared.partition()),
-    )?;
-    report.publication = publish_with_checkpoint(
-        &prepared,
-        &report,
-        &provider,
-        &model,
-        job_url.as_deref(),
-        attention.next_generation(),
-    )
-    .await;
-    Ok((provider, model, report))
-}
-
-fn prepared_review_brief(
-    prepared: &PreparedReview,
-    attention: &ReviewAttention,
-) -> Result<IndependentReviewBrief, Diagnostic> {
-    IndependentReviewBrief::try_new(review_prompt(
-        prepared.partition(),
-        prepared.change_request_label(),
-        attention,
-    )?)
     .map_err(|_| {
         diagnostic(
             ErrorCode::ContractInvalid,
-            "independent review brief is invalid",
+            "aggregate review budget is invalid",
         )
+    })?;
+    run_tool_first_engine(ToolFirstEngineRequest {
+        provider,
+        toolbox,
+        history,
+        prior_review: prepared.prior_review(),
+        anchor_table: prepared.anchors().clone(),
+        partition: prepared.partition().clone(),
+        rule_policy: resolved.repository.clone(),
+        budget,
+        cancellation,
+        clock,
+        limits: tool_first_limits(model, strategy, &resolved.effective)?,
+        system_policy_id: format!("{REVIEWER_POLICY_VERSION}.tool-first"),
+        system_policy: format!(
+            "{}\n\n{TOOL_FIRST_POLICY_ADAPTER}",
+            reviewer_system_policy()
+        ),
+        initial_omissions,
+        lineage_authorizations: Vec::new(),
     })
+    .await
+    .map_err(|error| diagnostic(ErrorCode::ReviewFailed, error.to_string()))
+}
+
+fn tool_first_limits(
+    model: &str,
+    strategy: &ReviewStrategyConfiguration,
+    resolution: &revoot_core::ConfigurationResolution,
+) -> Result<ToolFirstEngineLimits, Diagnostic> {
+    let max_output_tokens = u32::try_from(strategy.max_request_output_tokens).map_err(|_| {
+        diagnostic(
+            ErrorCode::ContractInvalid,
+            "per-request output token limit is invalid",
+        )
+    })?;
+    let max_findings = u32_value(resolution, "budget.max_findings")?;
+    let max_group_turns = strategy.effort.max_group_turns();
+    let mut limits = ToolFirstEngineLimits::new(model);
+    limits.effort = strategy.effort;
+    limits.max_parallel_groups = usize::from(strategy.max_parallel_groups);
+    limits.max_inline_diff_bytes = strategy.max_inline_diff_bytes;
+    limits.worker = GroupWorkerLimits {
+        max_output_tokens,
+        max_input_tokens: strategy.target_request_input_tokens,
+        local_tool_budget: AgentBudgetLimits {
+            max_turns: max_group_turns,
+            max_model_requests: max_group_turns,
+            max_tool_calls: strategy.aggregate_budget.max_tool_calls,
+            max_input_tokens: strategy.aggregate_budget.max_model_tokens,
+            max_output_tokens: strategy.aggregate_budget.max_output_tokens,
+            max_cost_microusd: strategy.aggregate_budget.max_cost_microusd,
+            max_candidate_findings: max_findings,
+            max_elapsed_millis: strategy.aggregate_budget.max_elapsed_millis,
+            ..AgentBudgetLimits::default()
+        },
+        ..GroupWorkerLimits::default()
+    };
+    limits.grouper.max_output_tokens = limits.grouper.max_output_tokens.min(max_output_tokens);
+    limits.verifier.max_output_tokens = limits.verifier.max_output_tokens.min(max_output_tokens);
+    limits.adjudicator.max_output_tokens =
+        limits.adjudicator.max_output_tokens.min(max_output_tokens);
+    Ok(limits)
+}
+
+fn filter_tool_first_findings(
+    engine: &mut ToolFirstEngineReport,
+    issued: &IssuedWorkUnitAnchors,
+    anchors: &AnchorTable,
+    maximum: usize,
+    minimum_confidence_percent: u8,
+    repository_policy: &RepositoryReviewPolicy,
+) -> Result<u32, Diagnostic> {
+    let envelopes = match &mut engine.result.outcome {
+        ReviewOutcome::Complete { findings, .. } | ReviewOutcome::Partial { findings, .. } => {
+            findings
+        }
+        ReviewOutcome::NoFindings { .. }
+        | ReviewOutcome::Stale { .. }
+        | ReviewOutcome::Blocked { .. }
+        | ReviewOutcome::Failed { .. }
+        | ReviewOutcome::Cancelled { .. } => return Ok(0),
+    };
+    validate_rank_and_render(envelopes.clone(), issued, anchors, maximum).map_err(|_| {
+        diagnostic(
+            ErrorCode::ReviewFailed,
+            "tool-first findings failed anchor or capacity validation",
+        )
+    })?;
+    let mut suppressed = 0_u32;
+    for envelope in envelopes {
+        let mut retained = Vec::with_capacity(envelope.findings.len());
+        for finding in std::mem::take(&mut envelope.findings) {
+            let ranked = validate_rank_and_render(
+                [revoot_core::FindingsEnvelope {
+                    schema_version: envelope.schema_version.clone(),
+                    work_unit_id: envelope.work_unit_id.clone(),
+                    findings: vec![finding.clone()],
+                    summary: envelope.summary.clone(),
+                }],
+                issued,
+                anchors,
+                25,
+            )
+            .map_err(|_| {
+                diagnostic(
+                    ErrorCode::ReviewFailed,
+                    "tool-first finding identity derivation failed",
+                )
+            })?;
+            let ranked = ranked.findings.first().ok_or_else(|| {
+                diagnostic(
+                    ErrorCode::ReviewFailed,
+                    "tool-first finding identity is missing",
+                )
+            })?;
+            if finding.confidence_percent < minimum_confidence_percent
+                || repository_policy.suppresses(&ranked.finding_key)
+            {
+                suppressed = suppressed.saturating_add(1);
+            } else {
+                retained.push(finding);
+            }
+        }
+        envelope.findings = retained;
+    }
+    Ok(suppressed)
+}
+
+fn stable_selection(partition: &ReviewPartitionPlan) -> ReviewReportSelection {
+    ReviewReportSelection {
+        changed_files: partition.coverage.input_files,
+        selected_files: partition.coverage.included_files,
+        omitted_files: partition.coverage.omitted_files,
+        selected_diff_bytes: partition.coverage.included_bytes,
+        omission_reasons: partition.coverage.omission_reasons.clone(),
+    }
+}
+
+fn stable_publication(report: &CanonicalReviewReport) -> ReviewReportPublication {
+    let planned_findings = u32::try_from(report.findings.len()).unwrap_or(u32::MAX);
+    let published_findings = report.publication.published_findings.min(planned_findings);
+    ReviewReportPublication {
+        planned_findings,
+        published_findings,
+        suppressed_findings: 0,
+        publication_complete: published_findings == planned_findings
+            && !report.publication.failed(),
+    }
 }
 
 fn review_outcome_usage(outcome: &ReviewOutcome) -> AgentBudgetUsage {
@@ -1363,6 +1506,7 @@ fn review_outcome_usage(outcome: &ReviewOutcome) -> AgentBudgetUsage {
 
 fn no_changes_report() -> CanonicalReviewReport {
     CanonicalReviewReport {
+        stable_report: None,
         state: "no_changes",
         overview: None,
         summary: Some("No local changes to review.".to_owned()),
@@ -1385,6 +1529,7 @@ fn no_changes_report() -> CanonicalReviewReport {
 
 fn skipped_fork_review_report() -> CanonicalReviewReport {
     CanonicalReviewReport {
+        stable_report: None,
         state: "skipped",
         overview: None,
         summary: Some("Fork merge request skipped by policy.".to_owned()),
@@ -1407,6 +1552,7 @@ fn skipped_fork_review_report() -> CanonicalReviewReport {
 
 fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
     CanonicalReviewReport {
+        stable_report: None,
         state: "no_findings",
         overview: Some(ReviewOverview {
             summary: "No changed files were selected for model review.".to_owned(),
@@ -1473,52 +1619,136 @@ fn minimum_review_risk(
 }
 
 fn canonicalize_report(
-    report: ReviewReport,
+    engine: &ToolFirstEngineReport,
     issued: &IssuedWorkUnitAnchors,
     anchors: &AnchorTable,
     maximum: usize,
-    repository_policy: &RepositoryReviewPolicy,
+    deterministic_suppressions: u32,
+    effort: revoot_core::ReviewEffort,
     selection: CanonicalSelection,
 ) -> Result<CanonicalReviewReport, Diagnostic> {
-    let mut overview = report.overview.clone();
-    let (state, summary, envelopes, omissions, usage) = match report.outcome {
-        ReviewOutcome::Complete {
-            findings,
-            summary,
-            usage,
-        } => ("complete", Some(summary), findings, Vec::new(), usage),
-        ReviewOutcome::Partial {
-            findings,
-            summary,
-            omissions,
-            usage,
-        } => ("partial", Some(summary), findings, omissions, usage),
-        ReviewOutcome::NoFindings {
-            summary,
-            omissions,
-            usage,
-        } => ("no_findings", Some(summary), Vec::new(), omissions, usage),
-        ReviewOutcome::Stale { usage } => ("stale", None, Vec::new(), Vec::new(), usage),
-        ReviewOutcome::Blocked { usage, .. } => ("blocked", None, Vec::new(), Vec::new(), usage),
-        ReviewOutcome::Failed { usage, .. } => ("failed", None, Vec::new(), Vec::new(), usage),
-        ReviewOutcome::Cancelled { usage } => ("cancelled", None, Vec::new(), Vec::new(), usage),
-    };
-    let mut ranked =
-        validate_rank_and_render(envelopes, issued, anchors, maximum).map_err(|_| {
-            diagnostic(
-                ErrorCode::ReviewFailed,
-                "review findings failed anchor, ranking, or deduplication validation",
-            )
-        })?;
-    let repository_suppressions_applied =
-        apply_repository_suppressions(&mut ranked.findings, repository_policy);
+    let mut overview = engine.result.overview.clone();
+    let CanonicalOutcomeParts {
+        state,
+        summary,
+        envelopes,
+        omissions,
+        usage,
+    } = canonical_outcome_parts(&engine.result.outcome);
+    let ranked = validate_rank_and_render(envelopes, issued, anchors, maximum).map_err(|_| {
+        diagnostic(
+            ErrorCode::ReviewFailed,
+            "review findings failed anchor, ranking, or deduplication validation",
+        )
+    })?;
     let (minimum_risk, minimum_basis) = minimum_review_risk(&ranked.findings, &selection);
     if overview.overall_risk < minimum_risk {
         overview.overall_risk = minimum_risk;
         minimum_basis.clone_into(&mut overview.overall_basis);
     }
-    let finding_locations = ranked
-        .findings
+    let finding_locations = finding_locations(&ranked.findings, anchors);
+    Ok(CanonicalReviewReport {
+        stable_report: None,
+        state,
+        overview: matches!(state, "complete" | "partial" | "no_findings").then_some(overview),
+        summary,
+        findings: ranked.findings,
+        omissions,
+        prior_finding_dispositions: engine.result.prior_finding_dispositions.clone(),
+        duplicates_omitted: ranked.duplicates_omitted,
+        usage,
+        turns: engine.budget_usage.model_requests,
+        tool_calls: engine.budget_usage.tool_calls,
+        admitted_candidates: engine.verified_candidates,
+        suppressed_candidates: engine
+            .verification_suppressions
+            .saturating_add(deterministic_suppressions),
+        strategy: Some(ReviewStrategy {
+            effort,
+            grouping_source: match engine.grouping_mode {
+                crate::review_grouper::ReviewGrouperMode::DeterministicSmallSelection => {
+                    ReviewGroupingSource::Deterministic
+                }
+                crate::review_grouper::ReviewGrouperMode::Semantic => {
+                    ReviewGroupingSource::Semantic
+                }
+                crate::review_grouper::ReviewGrouperMode::DeterministicFallback(_) => {
+                    ReviewGroupingSource::DeterministicFallback
+                }
+            },
+            group_count: engine.group_count,
+            max_parallel_groups: engine.schedule.max_parallel_groups,
+        }),
+        coverage: Some(engine.result.coverage.clone()),
+        selection,
+        publication: CanonicalPublication::pending(),
+        finding_locations,
+    })
+}
+
+struct CanonicalOutcomeParts {
+    state: &'static str,
+    summary: Option<String>,
+    envelopes: Vec<revoot_core::FindingsEnvelope>,
+    omissions: Vec<AgentOmission>,
+    usage: AgentBudgetUsage,
+}
+
+fn canonical_outcome_parts(outcome: &ReviewOutcome) -> CanonicalOutcomeParts {
+    let (state, summary, envelopes, omissions, usage) = match outcome {
+        ReviewOutcome::Complete {
+            findings,
+            summary,
+            usage,
+        } => (
+            "complete",
+            Some(summary.clone()),
+            findings.clone(),
+            Vec::new(),
+            *usage,
+        ),
+        ReviewOutcome::Partial {
+            findings,
+            summary,
+            omissions,
+            usage,
+        } => (
+            "partial",
+            Some(summary.clone()),
+            findings.clone(),
+            omissions.clone(),
+            *usage,
+        ),
+        ReviewOutcome::NoFindings {
+            summary,
+            omissions,
+            usage,
+        } => (
+            "no_findings",
+            Some(summary.clone()),
+            Vec::new(),
+            omissions.clone(),
+            *usage,
+        ),
+        ReviewOutcome::Stale { usage } => ("stale", None, Vec::new(), Vec::new(), *usage),
+        ReviewOutcome::Blocked { usage, .. } => ("blocked", None, Vec::new(), Vec::new(), *usage),
+        ReviewOutcome::Failed { usage, .. } => ("failed", None, Vec::new(), Vec::new(), *usage),
+        ReviewOutcome::Cancelled { usage } => ("cancelled", None, Vec::new(), Vec::new(), *usage),
+    };
+    CanonicalOutcomeParts {
+        state,
+        summary,
+        envelopes,
+        omissions,
+        usage,
+    }
+}
+
+fn finding_locations(
+    findings: &[RankedFinding],
+    anchors: &AnchorTable,
+) -> BTreeMap<AnchorId, String> {
+    findings
         .iter()
         .filter_map(|finding| {
             anchors.resolve(finding.anchor_id.as_str()).map(|anchor| {
@@ -1534,30 +1764,10 @@ fn canonicalize_report(
                 (finding.anchor_id.clone(), format!("{path}:{line}"))
             })
         })
-        .collect();
-    Ok(CanonicalReviewReport {
-        state,
-        overview: matches!(state, "complete" | "partial" | "no_findings").then_some(overview),
-        summary,
-        findings: ranked.findings,
-        omissions,
-        prior_finding_dispositions: report.prior_finding_dispositions,
-        duplicates_omitted: ranked.duplicates_omitted,
-        usage,
-        turns: report.turns,
-        tool_calls: report.tool_calls,
-        admitted_candidates: report.admitted_candidates,
-        suppressed_candidates: report
-            .suppressed_candidates
-            .saturating_add(repository_suppressions_applied),
-        strategy: Some(report.strategy),
-        coverage: Some(report.coverage),
-        selection,
-        publication: CanonicalPublication::pending(),
-        finding_locations,
-    })
+        .collect()
 }
 
+#[cfg(test)]
 fn apply_repository_suppressions(
     findings: &mut Vec<RankedFinding>,
     repository_policy: &RepositoryReviewPolicy,
@@ -2038,46 +2248,78 @@ async fn publish_gitlab_review(
             .refs
             .head_sha,
     );
-    match controller
-        .publish(
-            authorization,
-            prepared.snapshot.evidence().identity.clone(),
-            &prepared.context.anchors,
-            bot_user_id,
-            overview,
-            candidates,
-            &report.authorized_fixed_lineages(),
-        )
-        .await
-    {
-        GitLabPublicationOutcome::Completed { journal, evidence } => CanonicalPublication {
-            state: "completed",
-            reason: None,
-            actions_confirmed: u32::try_from(journal.entries.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(evidence.overview_confirmed),
-            mutation_attempts: evidence.mutation_attempts,
-            resolved_discussions: evidence.resolved_discussions,
-        },
+    canonical_gitlab_publication(
+        controller
+            .publish(
+                authorization,
+                prepared.snapshot.evidence().identity.clone(),
+                &prepared.context.anchors,
+                bot_user_id,
+                overview,
+                candidates,
+                &report.authorized_fixed_lineages(),
+            )
+            .await,
+    )
+}
+
+fn canonical_gitlab_publication(outcome: GitLabPublicationOutcome) -> CanonicalPublication {
+    match outcome {
+        GitLabPublicationOutcome::Completed { journal, evidence } => {
+            let published_findings = confirmed_gitlab_inline_findings(&journal);
+            CanonicalPublication {
+                state: "completed",
+                reason: None,
+                actions_confirmed: u32::try_from(journal.entries.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(evidence.overview_confirmed),
+                published_findings,
+                mutation_attempts: evidence.mutation_attempts,
+                resolved_discussions: evidence.resolved_discussions,
+            }
+        }
         GitLabPublicationOutcome::GateClosed { evidence } => CanonicalPublication {
             state: "unavailable",
             reason: Some("gate_closed"),
             actions_confirmed: 0,
+            published_findings: 0,
             mutation_attempts: evidence.mutation_attempts,
             resolved_discussions: evidence.resolved_discussions,
         },
         GitLabPublicationOutcome::Stopped {
             journal, evidence, ..
-        } => CanonicalPublication {
-            state: "failed",
-            reason: Some("publication_stopped"),
-            actions_confirmed: journal.as_ref().map_or(0, |value| {
-                u32::try_from(value.entries.len()).unwrap_or(u32::MAX)
-            }),
-            mutation_attempts: evidence.mutation_attempts,
-            resolved_discussions: evidence.resolved_discussions,
-        },
+        } => {
+            let published_findings = journal.as_ref().map_or(0, confirmed_gitlab_inline_findings);
+            CanonicalPublication {
+                state: "failed",
+                reason: Some("publication_stopped"),
+                actions_confirmed: journal.as_ref().map_or(0, |value| {
+                    u32::try_from(value.entries.len()).unwrap_or(u32::MAX)
+                }),
+                published_findings,
+                mutation_attempts: evidence.mutation_attempts,
+                resolved_discussions: evidence.resolved_discussions,
+            }
+        }
     }
+}
+
+fn confirmed_gitlab_inline_findings(journal: &revoot_core::PublicationJournal) -> u32 {
+    u32::try_from(
+        journal
+            .entries
+            .iter()
+            .filter(|entry| {
+                usize::try_from(entry.action)
+                    .ok()
+                    .and_then(|index| journal.actions.get(index))
+                    .is_some_and(|action| {
+                        matches!(action.publication.target, PublicationTarget::Inline(_))
+                    })
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 async fn gitlab_discussions_unchanged(prepared: &PreparedGitLabReview, bot_user_id: u64) -> bool {
@@ -2170,7 +2412,12 @@ async fn publish_github_review(
     .await
     {
         Ok(evidence) => evidence,
-        Err(failure) => return github_publication_failure(failure),
+        Err(failure) => {
+            return github_publication_failure(
+                failure,
+                u32::try_from(report.findings.len()).unwrap_or(u32::MAX),
+            );
+        }
     };
     let overview_mutated = if let Some(overview) = overview {
         match update_github_overview(&prepared.client, &prepared.context, overview).await {
@@ -2180,6 +2427,9 @@ async fn publish_github_review(
                     state: "failed",
                     reason: Some("overview_update_failed"),
                     actions_confirmed: evidence.actions_confirmed,
+                    published_findings: u32::try_from(report.findings.len())
+                        .unwrap_or(u32::MAX)
+                        .min(evidence.actions_confirmed),
                     mutation_attempts: evidence.mutation_attempts,
                     resolved_discussions: evidence.superseded_comments,
                 };
@@ -2195,6 +2445,7 @@ async fn publish_github_review(
         actions_confirmed: evidence
             .actions_confirmed
             .saturating_add(u32::from(overview.is_some())),
+        published_findings: u32::try_from(report.findings.len()).unwrap_or(u32::MAX),
         mutation_attempts: evidence
             .mutation_attempts
             .saturating_add(u32::from(overview_mutated)),
@@ -2204,6 +2455,7 @@ async fn publish_github_review(
 
 const fn github_publication_failure(
     failure: crate::github_review::GitHubPublicationFailure,
+    planned_findings: u32,
 ) -> CanonicalPublication {
     let state = if matches!(failure.error, GitHubReviewError::PublicationStateChanged)
         && failure.evidence.mutation_attempts == 0
@@ -2216,6 +2468,11 @@ const fn github_publication_failure(
         state,
         reason: Some(github_publication_failure_reason(failure.error)),
         actions_confirmed: failure.evidence.actions_confirmed,
+        published_findings: if failure.evidence.actions_confirmed < planned_findings {
+            failure.evidence.actions_confirmed
+        } else {
+            planned_findings
+        },
         mutation_attempts: failure.evidence.mutation_attempts,
         resolved_discussions: failure.evidence.superseded_comments,
     }
@@ -2803,85 +3060,6 @@ fn diff_limits(
     })
 }
 
-fn review_prompt(
-    partition: &ReviewPartitionPlan,
-    change_request_label: &str,
-    attention: &ReviewAttention,
-) -> Result<String, Diagnostic> {
-    use std::fmt::Write as _;
-
-    let mut prompt = String::new();
-    if let ReviewAttention::Incremental {
-        previous_head,
-        delta_paths,
-        ..
-    } = attention
-    {
-        prompt.push_str("A prior complete review is available as a non-authoritative attention checkpoint. Start with code changed since that review, then trace its effects through callers and earlier pull-request changes. The entire authoritative change remains in scope; the checkpoint does not authorize omitting, trusting, or suppressing any code. Force a fresh conclusion from current evidence.\nPrior reviewed head: ");
-        prompt.push_str(previous_head.as_str());
-        prompt.push_str("\nPaths changed since that review:\n");
-        for path in delta_paths {
-            prompt.push_str("- ");
-            prompt.push_str(path.as_str());
-            prompt.push('\n');
-        }
-    }
-    write!(
-        prompt,
-        "Review the authoritative {change_request_label} snapshot. Spend attention in listed signal order. Start with high-value changed paths, then inspect unchanged checkout files, callers, dependencies, manifests, tests, or configuration needed to verify substantive improvements. Low-signal artifacts have a strict shared budget; inspect them only when a higher-value change depends on them or their local scan found a hazard.\nChanged paths:\n",
-    )
-    .expect("writing to a String cannot fail");
-    let mut selected = partition
-        .work_units
-        .iter()
-        .flat_map(|unit| unit.files.iter().map(move |file| (unit.id.as_str(), file)))
-        .collect::<Vec<_>>();
-    selected.sort_by(|left, right| {
-        right
-            .1
-            .review_value
-            .tier
-            .cmp(&left.1.review_value.tier)
-            .then_with(|| right.1.review_value.score.cmp(&left.1.review_value.score))
-            .then_with(|| left.1.path.cmp(&right.1.path))
-    });
-    for (work_unit_id, file) in selected {
-        prompt.push_str("- ");
-        prompt.push_str(file.path.new_path.as_str());
-        prompt.push_str(" (");
-        prompt.push_str(match file.review_value.tier {
-            ReviewValueTier::High => "high",
-            ReviewValueTier::Standard => "standard",
-            ReviewValueTier::Low => "low",
-        });
-        prompt.push_str(" signal, score ");
-        prompt.push_str(&file.review_value.score.to_string());
-        prompt.push_str(", work unit ");
-        prompt.push_str(work_unit_id);
-        prompt.push_str(")\n");
-    }
-    let deferred = partition
-        .omitted
-        .iter()
-        .filter(|file| file.reason == ReviewOmissionReason::LowSignalBudget)
-        .collect::<Vec<_>>();
-    if !deferred.is_empty() {
-        prompt.push_str("Deferred low-signal changed paths (context only):\n");
-        for file in deferred {
-            prompt.push_str("- ");
-            prompt.push_str(file.path.new_path.as_str());
-            prompt.push('\n');
-        }
-    }
-    if prompt.len() > 64 * 1024 {
-        return Err(diagnostic(
-            ErrorCode::ReviewFailed,
-            "review scope exceeds the automatic prompt bound",
-        ));
-    }
-    Ok(prompt)
-}
-
 struct CodeHostNetworkPolicy {
     custom_ca: Option<CustomCaMaterial>,
     private_cidrs: Vec<IpCidr>,
@@ -3162,19 +3340,37 @@ fn emit_report(
 ) -> Result<(), Diagnostic> {
     let output = match args.format {
         OutputFormat::Human => format!("{}\n", report.human_summary()),
-        OutputFormat::Json => serde_json::to_string_pretty(&ReviewOutput {
-            schema_version: REPORT_SCHEMA_VERSION,
-            provider,
-            model,
-            review: report,
-        })
-        .map(|value| format!("{value}\n"))
-        .map_err(|_| {
-            diagnostic(
-                ErrorCode::ContractInvalid,
-                "review report serialization failed",
-            )
-        })?,
+        OutputFormat::Json => {
+            if let Some(stable) = &report.stable_report {
+                String::from_utf8(stable.canonical_json().map_err(|_| {
+                    diagnostic(
+                        ErrorCode::ContractInvalid,
+                        "review report serialization failed",
+                    )
+                })?)
+                .map(|value| format!("{value}\n"))
+                .map_err(|_| {
+                    diagnostic(
+                        ErrorCode::ContractInvalid,
+                        "review report serialization failed",
+                    )
+                })?
+            } else {
+                serde_json::to_string_pretty(&ReviewOutput {
+                    schema_version: REPORT_SCHEMA_VERSION,
+                    provider,
+                    model,
+                    review: report,
+                })
+                .map(|value| format!("{value}\n"))
+                .map_err(|_| {
+                    diagnostic(
+                        ErrorCode::ContractInvalid,
+                        "review report serialization failed",
+                    )
+                })?
+            }
+        }
         OutputFormat::Sarif => render_sarif(report)?,
     };
     if let Some(path) = &args.output {
@@ -3336,11 +3532,15 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    use revoot_core::provider::{ProviderAdapter, ProviderFuture};
     use revoot_core::{
-        AgentBudgetLimits, AgentBudgetUsage, AnchorId, ErrorCode, FindingCategory, MergeRequestIid,
-        PullRequestNumber, RankedFinding, Severity, Sha256Digest,
+        AgentBudgetLimits, AgentBudgetUsage, AnchorId, CancellationToken, ErrorCode,
+        FindingCategory, MergeRequestIid, ModelContent, ModelFinishReason, ModelRequest,
+        ModelResponse, ModelUsage, PullRequestNumber, RankedFinding, ReviewOutcome,
+        ReviewReportPhase, Severity, Sha256Digest,
     };
 
     use crate::config::{
@@ -3350,37 +3550,44 @@ mod tests {
         GitHubPublicationEvidence, GitHubPublicationFailure, GitHubReviewError,
     };
     use crate::review_overview::RiskLevel;
+    use serde_json::json;
 
     use super::{
         CanonicalPublication, CanonicalReviewReport, CanonicalSelection, OutputFormat,
         REPORT_SCHEMA_VERSION, ReviewOutput, agent_limits, apply_repository_suppressions,
-        fork_behavior, github_publication_failure, minimum_review_risk, parse_args,
-        parse_private_cidr, partition_limits, select_model, typed_review_strategy,
-        validate_bound_job_url, write_report_atomically,
+        diff_limits, fork_behavior, github_publication_failure, minimum_review_risk, parse_args,
+        parse_private_cidr, partition_limits, run_prepared_tool_first_engine, select_model,
+        selection_policy, typed_review_strategy, validate_bound_job_url, write_report_atomically,
     };
 
     static LOCAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn github_review_state_change_is_non_failing_only_before_mutation() {
-        let stopped = github_publication_failure(GitHubPublicationFailure {
-            error: GitHubReviewError::PublicationStateChanged,
-            evidence: GitHubPublicationEvidence::default(),
-        });
+        let stopped = github_publication_failure(
+            GitHubPublicationFailure {
+                error: GitHubReviewError::PublicationStateChanged,
+                evidence: GitHubPublicationEvidence::default(),
+            },
+            1,
+        );
         assert_eq!(stopped.state, "stopped");
         assert_eq!(stopped.reason, Some("github_review_state_changed"));
         assert_eq!(stopped.mutation_attempts, 0);
         assert!(!stopped.failed());
 
-        let partial = github_publication_failure(GitHubPublicationFailure {
-            error: GitHubReviewError::PublicationStateChanged,
-            evidence: GitHubPublicationEvidence {
-                actions_confirmed: 1,
-                mutation_attempts: 2,
-                superseded_comments: 1,
-                ..GitHubPublicationEvidence::default()
+        let partial = github_publication_failure(
+            GitHubPublicationFailure {
+                error: GitHubReviewError::PublicationStateChanged,
+                evidence: GitHubPublicationEvidence {
+                    actions_confirmed: 1,
+                    mutation_attempts: 2,
+                    superseded_comments: 1,
+                    ..GitHubPublicationEvidence::default()
+                },
             },
-        });
+            2,
+        );
         assert_eq!(partial.state, "failed");
         assert_eq!(partial.actions_confirmed, 1);
         assert_eq!(partial.mutation_attempts, 2);
@@ -3417,6 +3624,112 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    struct CommandToolFirstProvider {
+        calls: AtomicUsize,
+    }
+
+    impl ProviderAdapter for CommandToolFirstProvider {
+        fn adapter_id(&self) -> &'static str {
+            "command-tool-first-fake"
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _request: &'a ModelRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> ProviderFuture<'a> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Ok(ModelResponse {
+                    provider_response_id: None,
+                    model: "model-v1".to_owned(),
+                    content: vec![ModelContent::ToolUse {
+                        id: "complete-1".to_owned(),
+                        name: "complete_group".to_owned(),
+                        input: json!({
+                            "checkpoint": {
+                                "hypotheses": [],
+                                "evidence_references": [],
+                                "unresolved_coverage": []
+                            },
+                            "summary": {"text": "reviewed", "assumptions": []}
+                        }),
+                    }],
+                    finish_reason: ModelFinishReason::ToolUse,
+                    usage: ModelUsage::default(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn command_boundary_dispatches_selected_local_work_to_tool_first_engine() {
+        let repository = CleanLocalRepository::new();
+        fs::write(repository.0.join("README.md"), "# changed\n").expect("changed fixture");
+        let capture =
+            crate::local_review::capture_local_git(&repository.0, None).expect("local snapshot");
+        let base_sha = capture.identity.base_sha.clone();
+        let resolved = resolve_review_configuration(
+            &capture.root,
+            Some(&base_sha),
+            None,
+            [(
+                OsString::from("REVOOT_REVIEW_EFFORT"),
+                OsString::from("low"),
+            )],
+        )
+        .expect("configuration");
+        let strategy = typed_review_strategy(&resolved).expect("strategy");
+        let context = crate::local_review::build_local_review_context(
+            capture,
+            &crate::local_review::LocalReviewContextOptions {
+                provider_adapter: "command-tool-first-fake".to_owned(),
+                model_id: "model-v1".to_owned(),
+                agent_limits: agent_limits(&resolved.effective, &strategy).expect("agent limits"),
+                diff_limits: diff_limits(&resolved.effective).expect("diff limits"),
+                selection_policy: selection_policy(&resolved.effective, &resolved.repository)
+                    .expect("selection policy"),
+                partition_limits: partition_limits(&resolved.effective).expect("partition limits"),
+            },
+        )
+        .expect("local review context");
+        let prepared =
+            super::PreparedReview::Local(Box::new(super::PreparedLocalReview { context }));
+        assert!(!prepared.partition().work_units.is_empty());
+        let provider = Arc::new(CommandToolFirstProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let report = run_prepared_tool_first_engine(
+            &prepared,
+            &resolved,
+            &strategy,
+            "model-v1",
+            provider.clone(),
+        )
+        .await
+        .expect("tool-first command execution");
+        assert_eq!(report.group_count, 1);
+        assert!(matches!(
+            report.result.outcome,
+            ReviewOutcome::NoFindings { .. }
+        ));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            report
+                .phase_usage
+                .iter()
+                .map(|usage| usage.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ReviewReportPhase::Grouping,
+                ReviewReportPhase::Planning,
+                ReviewReportPhase::Review,
+                ReviewReportPhase::Verification,
+                ReviewReportPhase::Adjudication,
+            ]
+        );
     }
 
     fn git(root: &Path, arguments: &[&str]) {
@@ -3707,6 +4020,7 @@ mod tests {
     #[test]
     fn canonical_silent_report_omits_a_findings_payload() {
         let review = CanonicalReviewReport {
+            stable_report: None,
             state: "no_findings",
             overview: None,
             summary: Some("No supported defects found.".to_owned()),
