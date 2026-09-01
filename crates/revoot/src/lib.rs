@@ -43,6 +43,7 @@ pub mod review_preparation;
 pub mod review_result_reducer;
 pub mod review_rule_bundle;
 pub mod review_rules;
+pub mod review_sarif;
 pub mod review_strategy_config;
 pub mod review_verifier;
 pub mod rule_diagnostics;
