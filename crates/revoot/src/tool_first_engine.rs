@@ -236,7 +236,7 @@ where
         selected_inputs,
         group_plan,
         grouping_mode,
-        grouping_usage,
+        grouping_usage: _,
         packets,
     } = prepared;
     let group_inputs =
@@ -368,11 +368,21 @@ where
     }
     let budget_usage = budget_snapshot.usage;
     let phase_usage = ordered_phase_usage(
-        grouping_usage,
-        execution.phase_usage.planning,
-        execution.phase_usage.review,
-        execution.phase_usage.verification,
-        adjudication.usage,
+        request
+            .budget
+            .phase_usage(revoot_core::ReviewBudgetPhase::Grouping),
+        request
+            .budget
+            .phase_usage(revoot_core::ReviewBudgetPhase::Planning),
+        request
+            .budget
+            .phase_usage(revoot_core::ReviewBudgetPhase::Review),
+        request
+            .budget
+            .phase_usage(revoot_core::ReviewBudgetPhase::Verification),
+        request
+            .budget
+            .phase_usage(revoot_core::ReviewBudgetPhase::Adjudication),
     );
     reconcile_phase_usage(&phase_usage, budget_usage)
         .map_err(|_| ToolFirstEngineError::BudgetAccounting)?;

@@ -430,8 +430,16 @@ pub async fn run_group_worker(
             output_tokens: u64::from(request.limits.max_output_tokens),
             cost_microusd: request.limits.reserved_cost_microusd,
         };
-        let Ok(permit) = aggregate_budget.reserve_model_request(reservation, clock.now_millis())
-        else {
+        let budget_phase = if matches!(state.phase(), ReviewWorkerPhase::Planning) {
+            revoot_core::ReviewBudgetPhase::Planning
+        } else {
+            revoot_core::ReviewBudgetPhase::Review
+        };
+        let Ok(permit) = aggregate_budget.reserve_model_request_for_phase(
+            budget_phase,
+            reservation,
+            clock.now_millis(),
+        ) else {
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Budget);
         };
         runtime.provider_usage.turns = runtime.provider_usage.turns.saturating_add(1);
@@ -452,9 +460,6 @@ pub async fn run_group_worker(
             };
             return partial_output(&mut state, &runtime, reason);
         };
-        if delivers_initial_inline_diff {
-            register_inline_delivery(&mut runtime, &packet)?;
-        }
         let reported = (response.usage.input_tokens != 0 || response.usage.output_tokens != 0)
             .then_some(ReviewModelUsage {
                 input_tokens: response.usage.input_tokens,
@@ -477,6 +482,10 @@ pub async fn run_group_worker(
             state.phase(),
             ReviewCallUsage::settled(settlement),
         );
+        if delivers_initial_inline_diff && register_inline_delivery(&mut runtime, &packet).is_err()
+        {
+            return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Context);
+        }
         let Ok(tool_calls) = validate_provider_response(&response, &request.model) else {
             return partial_output(
                 &mut state,
@@ -514,7 +523,7 @@ pub async fn run_group_worker(
                 );
             }
             if aggregate_budget
-                .charge_tool_calls(1, clock.now_millis())
+                .charge_tool_calls_for_phase(budget_phase, 1, clock.now_millis())
                 .is_err()
             {
                 return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Budget);

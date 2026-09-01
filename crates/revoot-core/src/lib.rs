@@ -173,9 +173,9 @@ pub use repository::{
 };
 pub use review_budget::{
     ConservativeChargeReason, OutstandingReviewReservations, ReviewBudgetBroker,
-    ReviewBudgetDimension, ReviewBudgetError, ReviewBudgetLimits, ReviewBudgetSnapshot,
-    ReviewBudgetUsage, ReviewBudgetValidationError, ReviewCallUsage, ReviewModelPermit,
-    ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
+    ReviewBudgetDimension, ReviewBudgetError, ReviewBudgetLimits, ReviewBudgetPhase,
+    ReviewBudgetSnapshot, ReviewBudgetUsage, ReviewBudgetValidationError, ReviewCallUsage,
+    ReviewModelPermit, ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
 };
 pub use review_group::{
     CoverageError, CoverageRequirement, CoverageRequirementKind, FileCoverageLedger,

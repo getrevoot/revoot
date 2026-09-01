@@ -99,6 +99,17 @@ pub enum ReviewBudgetDimension {
     ElapsedTime,
 }
 
+/// Stable review phase used for authoritative aggregate accounting.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewBudgetPhase {
+    Grouping,
+    Planning,
+    Review,
+    Verification,
+    Adjudication,
+}
+
 /// A conservative reservation made before one provider call.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -226,11 +237,13 @@ pub enum ReviewBudgetError {
 #[derive(Clone, Copy, Debug)]
 struct OutstandingReservation {
     reservation: ReviewModelReservation,
+    phase: Option<ReviewBudgetPhase>,
 }
 
 #[derive(Debug)]
 struct ReviewBudgetState {
     usage: ReviewBudgetUsage,
+    phase_usage: BTreeMap<ReviewBudgetPhase, ReviewBudgetUsage>,
     outstanding_usage: OutstandingReviewReservations,
     outstanding: BTreeMap<u64, OutstandingReservation>,
     next_reservation_id: u64,
@@ -268,6 +281,7 @@ impl ReviewBudgetBroker {
                 started_at_millis,
                 state: Mutex::new(ReviewBudgetState {
                     usage: ReviewBudgetUsage::default(),
+                    phase_usage: BTreeMap::new(),
                     outstanding_usage: OutstandingReviewReservations::default(),
                     outstanding: BTreeMap::new(),
                     next_reservation_id: 1,
@@ -321,6 +335,29 @@ impl ReviewBudgetBroker {
         &self,
         reservation: ReviewModelReservation,
         now_millis: u64,
+    ) -> Result<ReviewModelPermit, ReviewBudgetError> {
+        self.reserve_model_request_inner(reservation, now_millis, None)
+    }
+
+    /// Atomically reserve provider capacity and bind its eventual charge to a phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::reserve_model_request`].
+    pub fn reserve_model_request_for_phase(
+        &self,
+        phase: ReviewBudgetPhase,
+        reservation: ReviewModelReservation,
+        now_millis: u64,
+    ) -> Result<ReviewModelPermit, ReviewBudgetError> {
+        self.reserve_model_request_inner(reservation, now_millis, Some(phase))
+    }
+
+    fn reserve_model_request_inner(
+        &self,
+        reservation: ReviewModelReservation,
+        now_millis: u64,
+        phase: Option<ReviewBudgetPhase>,
     ) -> Result<ReviewModelPermit, ReviewBudgetError> {
         let model_tokens = reservation
             .input_tokens
@@ -393,6 +430,10 @@ impl ReviewBudgetBroker {
                     ReviewBudgetDimension::ModelRequests,
                 ))?;
         state.usage.model_requests = state.usage.model_requests.saturating_add(1);
+        if let Some(phase) = phase {
+            let phase_usage = state.phase_usage.entry(phase).or_default();
+            phase_usage.model_requests = phase_usage.model_requests.saturating_add(1);
+        }
         state.outstanding_usage.model_requests =
             state.outstanding_usage.model_requests.saturating_add(1);
         state.outstanding_usage.input_tokens = state
@@ -409,7 +450,7 @@ impl ReviewBudgetBroker {
             .saturating_add(reservation.cost_microusd);
         state
             .outstanding
-            .insert(id, OutstandingReservation { reservation });
+            .insert(id, OutstandingReservation { reservation, phase });
         drop(state);
 
         Ok(ReviewModelPermit {
@@ -428,6 +469,29 @@ impl ReviewBudgetBroker {
     /// Returns an error without charging calls when the amount is zero, time
     /// regresses, the deadline has passed, or capacity is exhausted.
     pub fn charge_tool_calls(&self, calls: u32, now_millis: u64) -> Result<(), ReviewBudgetError> {
+        self.charge_tool_calls_inner(calls, now_millis, None)
+    }
+
+    /// Charge tool calls and bind them to a stable review phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::charge_tool_calls`].
+    pub fn charge_tool_calls_for_phase(
+        &self,
+        phase: ReviewBudgetPhase,
+        calls: u32,
+        now_millis: u64,
+    ) -> Result<(), ReviewBudgetError> {
+        self.charge_tool_calls_inner(calls, now_millis, Some(phase))
+    }
+
+    fn charge_tool_calls_inner(
+        &self,
+        calls: u32,
+        now_millis: u64,
+        phase: Option<ReviewBudgetPhase>,
+    ) -> Result<(), ReviewBudgetError> {
         if calls == 0 {
             return Err(ReviewBudgetError::InvalidReservation);
         }
@@ -440,7 +504,21 @@ impl ReviewBudgetBroker {
             ReviewBudgetDimension::ToolCalls,
         )?;
         state.usage.tool_calls = state.usage.tool_calls.saturating_add(calls);
+        if let Some(phase) = phase {
+            let phase_usage = state.phase_usage.entry(phase).or_default();
+            phase_usage.tool_calls = phase_usage.tool_calls.saturating_add(calls);
+        }
         Ok(())
+    }
+
+    /// Return authoritative settled usage for one phase.
+    #[must_use]
+    pub fn phase_usage(&self, phase: ReviewBudgetPhase) -> ReviewBudgetUsage {
+        lock_state(&self.inner)
+            .phase_usage
+            .get(&phase)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -501,32 +579,28 @@ fn settle_reservation(
 ) -> Result<ReviewModelSettlement, ReviewBudgetError> {
     let mut state = lock_state(inner);
     observe_for_settlement(inner, &mut state, now_millis)?;
-    let reservation = state
+    let entry = state
         .outstanding
         .get(&reservation_id)
         .copied()
-        .ok_or(ReviewBudgetError::ReservationNotFound)?
-        .reservation;
+        .ok_or(ReviewBudgetError::ReservationNotFound)?;
+    let reservation = entry.reservation;
     let settlement = classify_settlement(reservation, reported);
-    apply_settlement(&mut state, reservation_id, reservation, settlement);
+    apply_settlement(&mut state, reservation_id, entry, settlement);
     Ok(settlement)
 }
 
 fn settle_dropped_reservation(inner: &ReviewBudgetInner, reservation_id: u64) {
     let mut state = lock_state(inner);
-    let Some(reservation) = state
-        .outstanding
-        .get(&reservation_id)
-        .copied()
-        .map(|entry| entry.reservation)
-    else {
+    let Some(entry) = state.outstanding.get(&reservation_id).copied() else {
         return;
     };
+    let reservation = entry.reservation;
     let charged = reservation.into();
     apply_settlement(
         &mut state,
         reservation_id,
-        reservation,
+        entry,
         ReviewModelSettlement::Conservative {
             charged,
             reason: ConservativeChargeReason::PermitDropped,
@@ -564,9 +638,10 @@ fn classify_settlement(
 fn apply_settlement(
     state: &mut ReviewBudgetState,
     reservation_id: u64,
-    reservation: ReviewModelReservation,
+    entry: OutstandingReservation,
     settlement: ReviewModelSettlement,
 ) {
+    let reservation = entry.reservation;
     let charged = match settlement {
         ReviewModelSettlement::Reported(usage)
         | ReviewModelSettlement::Conservative { charged: usage, .. } => usage,
@@ -598,6 +673,18 @@ fn apply_settlement(
         .usage
         .cost_microusd
         .saturating_add(charged.cost_microusd);
+    if let Some(phase) = entry.phase {
+        let phase_usage = state.phase_usage.entry(phase).or_default();
+        phase_usage.input_tokens = phase_usage
+            .input_tokens
+            .saturating_add(charged.input_tokens);
+        phase_usage.output_tokens = phase_usage
+            .output_tokens
+            .saturating_add(charged.output_tokens);
+        phase_usage.cost_microusd = phase_usage
+            .cost_microusd
+            .saturating_add(charged.cost_microusd);
+    }
 }
 
 fn observe_for_dispatch(
@@ -1145,5 +1232,75 @@ mod tests {
         ));
         assert_eq!(broker.snapshot().usage.model_requests, 0);
         assert_eq!(broker.snapshot().outstanding.model_requests, 0);
+    }
+
+    #[test]
+    fn phase_usage_is_atomic_for_settled_dropped_and_tool_charges() {
+        let broker = ReviewBudgetBroker::new(limits(), 0).expect("valid broker");
+        let settled = broker
+            .reserve_model_request_for_phase(ReviewBudgetPhase::Grouping, reservation(), 1)
+            .expect("grouping reservation");
+        settled
+            .commit(
+                Some(ReviewModelUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    cost_microusd: 2,
+                }),
+                2,
+            )
+            .expect("settled grouping call");
+        let dropped = broker
+            .reserve_model_request_for_phase(ReviewBudgetPhase::Review, reservation(), 3)
+            .expect("review reservation");
+        drop(dropped);
+        broker
+            .charge_tool_calls_for_phase(ReviewBudgetPhase::Review, 2, 4)
+            .expect("review tools");
+
+        assert_eq!(
+            broker.phase_usage(ReviewBudgetPhase::Grouping),
+            ReviewBudgetUsage {
+                model_requests: 1,
+                input_tokens: 7,
+                output_tokens: 3,
+                cost_microusd: 2,
+                ..ReviewBudgetUsage::default()
+            }
+        );
+        assert_eq!(
+            broker.phase_usage(ReviewBudgetPhase::Review),
+            ReviewBudgetUsage {
+                model_requests: 1,
+                input_tokens: 80,
+                output_tokens: 20,
+                tool_calls: 2,
+                cost_microusd: 10,
+                ..ReviewBudgetUsage::default()
+            }
+        );
+        let aggregate = broker.snapshot().usage;
+        let grouping = broker.phase_usage(ReviewBudgetPhase::Grouping);
+        let review = broker.phase_usage(ReviewBudgetPhase::Review);
+        assert_eq!(
+            aggregate.model_requests,
+            grouping.model_requests + review.model_requests
+        );
+        assert_eq!(
+            aggregate.input_tokens,
+            grouping.input_tokens + review.input_tokens
+        );
+        assert_eq!(
+            aggregate.output_tokens,
+            grouping.output_tokens + review.output_tokens
+        );
+        assert_eq!(
+            aggregate.tool_calls,
+            grouping.tool_calls + review.tool_calls
+        );
+        assert_eq!(
+            aggregate.cost_microusd,
+            grouping.cost_microusd + review.cost_microusd
+        );
     }
 }

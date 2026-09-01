@@ -170,7 +170,11 @@ pub async fn run_review_grouper(
         output_tokens: u64::from(config.max_output_tokens),
         cost_microusd: config.reserved_cost_microusd,
     };
-    let Ok(permit) = aggregate_budget.reserve_model_request(reservation, clock.now_millis()) else {
+    let Ok(permit) = aggregate_budget.reserve_model_request_for_phase(
+        revoot_core::ReviewBudgetPhase::Grouping,
+        reservation,
+        clock.now_millis(),
+    ) else {
         return Ok(fallback_outcome(
             fallback,
             ReviewGrouperFallbackReason::BudgetUnavailable,
