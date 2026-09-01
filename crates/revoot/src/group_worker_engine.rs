@@ -39,7 +39,7 @@ use revoot_core::review_packet::{ReviewPacketAnchorBrief, ReviewPacketCompleteDi
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 32;
 const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
-const WORKER_PAGE_BYTES: u32 = 30 * 1024;
+const WORKER_PAGE_BYTES: u32 = 8 * 1024;
 const DEFAULT_SEARCH_RESULTS: u32 = 200;
 const MAX_SEARCH_RESULTS: u32 = 500;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024;
@@ -510,6 +510,7 @@ pub async fn run_group_worker(
 
         let mut exchange_calls = Vec::with_capacity(tool_calls.len());
         let mut exchange_results = Vec::with_capacity(tool_calls.len());
+        let mut payload_tool_executed = false;
         let phase_before = state.phase();
         for (id, name, input) in tool_calls {
             if cancellation.is_cancelled() {
@@ -530,16 +531,21 @@ pub async fn run_group_worker(
             }
             runtime.tool_calls = runtime.tool_calls.saturating_add(1);
             record_phase_tool_call(&mut runtime, phase_before);
-            let body = match execute_tool(
-                &name,
-                input.clone(),
-                &mut state,
-                &request.plan,
-                &mut runtime,
-            ) {
-                Ok(body) | Err(ToolExecutionError::Recoverable(body)) => body,
-                Err(ToolExecutionError::Partial(reason)) => {
-                    return partial_output(&mut state, &runtime, reason);
+            let body = if is_payload_tool(&name) && payload_tool_executed {
+                tool_error("batch_result_budget")
+            } else {
+                payload_tool_executed |= is_payload_tool(&name);
+                match execute_tool(
+                    &name,
+                    input.clone(),
+                    &mut state,
+                    &request.plan,
+                    &mut runtime,
+                ) {
+                    Ok(body) | Err(ToolExecutionError::Recoverable(body)) => body,
+                    Err(ToolExecutionError::Partial(reason)) => {
+                        return partial_output(&mut state, &runtime, reason);
+                    }
                 }
             };
             exchange_calls.push(ReviewPacketToolCall {
@@ -1152,6 +1158,13 @@ fn terminal_tool_is_not_last(calls: &[(String, String, Value)]) -> bool {
     calls.iter().enumerate().any(|(index, (_, name, _))| {
         matches!(name.as_str(), "checkpoint_review" | "complete_group") && index + 1 != calls.len()
     })
+}
+
+fn is_payload_tool(name: &str) -> bool {
+    !matches!(
+        name,
+        "checkpoint_review" | "submit_candidate_finding" | "complete_group"
+    )
 }
 
 enum ToolExecutionError {
@@ -2982,6 +2995,7 @@ mod tests {
         assert!(!rendered[0].contains("call-2"));
         assert!(rendered[1].contains("call-1"));
         assert!(rendered[1].contains("call-2"));
+        assert!(rendered[1].contains("batch_result_budget"));
         assert!(!rendered[1].contains("call-3"));
         assert!(!rendered[2].contains("call-1"));
         assert!(!rendered[2].contains("call-2"));
