@@ -24,7 +24,7 @@ complete -c revoot -n '__fish_seen_subcommand_from scan' -l path -r -F -d 'Limit
 complete -c revoot -n '__fish_seen_subcommand_from scan' -l include-untracked -d 'Include local untracked files'
 complete -c revoot -n '__fish_seen_subcommand_from scan' -l preview -d 'Show provider-free scan plan'
 complete -c revoot -n '__fish_seen_subcommand_from scan' -l format -r -a 'human json sarif' -d 'Output format'
-complete -c revoot -n '__fish_seen_subcommand_from delegate' -a 'preview rule'
+complete -c revoot -n '__fish_seen_subcommand_from delegate' -a 'manifest preview rule'
 complete -c revoot -n '__fish_seen_subcommand_from rules' -a check
 complete -c revoot -n '__fish_seen_subcommand_from rules' -l json -d 'Emit JSON'
 complete -c revoot -n '__fish_seen_subcommand_from mcp' -a serve

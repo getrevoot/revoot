@@ -13,7 +13,7 @@ _revoot() {
   case " ${COMP_WORDS[*]} " in
     *" review "*) COMPREPLY=( $(compgen -W "--base --ci --mr --pr --repo --preview --effort --max-parallel-groups --format --output --help" -- "$current") ) ;;
     *" scan "*) COMPREPLY=( $(compgen -W "--path --include-untracked --preview --format --help" -- "$current") ) ;;
-    *" delegate "*) COMPREPLY=( $(compgen -W "preview rule --help" -- "$current") ) ;;
+    *" delegate "*) COMPREPLY=( $(compgen -W "manifest preview rule --help" -- "$current") ) ;;
     *" rules "*) COMPREPLY=( $(compgen -W "check --json --help" -- "$current") ) ;;
     *" mcp "*) COMPREPLY=( $(compgen -W "serve" -- "$current") ) ;;
     *" doctor "*) COMPREPLY=( $(compgen -W "--json --help" -- "$current") ) ;;

@@ -16,6 +16,7 @@ const RULE_DIAGNOSTICS_SCHEMA: &str = "revoot.rule-diagnostics/v1";
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentCliWorkflowId {
+    IntegrationManifest,
     DelegationPreview,
     DelegationRule,
     RuleDiagnostics,
@@ -168,6 +169,11 @@ pub fn build_agent_integration_manifest() -> AgentIntegrationManifest {
         executable: EXECUTABLE.to_owned(),
         cli_workflows: vec![
             AgentCliWorkflow {
+                id: AgentCliWorkflowId::IntegrationManifest,
+                arguments: strings(&["delegate", "manifest"]),
+                output_schema: AgentIntegrationManifest::SCHEMA_VERSION.to_owned(),
+            },
+            AgentCliWorkflow {
                 id: AgentCliWorkflowId::DelegationPreview,
                 arguments: strings(&["delegate", "preview"]),
                 output_schema: DELEGATION_SCHEMA.to_owned(),
@@ -253,7 +259,7 @@ mod tests {
         assert_eq!(value["mcp"]["launch_arguments"], json!(["mcp", "serve"]));
         assert_eq!(
             value["cli_workflows"].as_array().expect("workflows").len(),
-            3
+            4
         );
     }
 
@@ -300,18 +306,23 @@ mod tests {
                 .map(|workflow| workflow.id)
                 .collect::<Vec<_>>(),
             [
+                AgentCliWorkflowId::IntegrationManifest,
                 AgentCliWorkflowId::DelegationPreview,
                 AgentCliWorkflowId::DelegationRule,
                 AgentCliWorkflowId::RuleDiagnostics,
             ]
         );
-        assert_eq!(manifest.cli_workflows[0].arguments, ["delegate", "preview"]);
         assert_eq!(
-            manifest.cli_workflows[1].arguments,
+            manifest.cli_workflows[0].arguments,
+            ["delegate", "manifest"]
+        );
+        assert_eq!(manifest.cli_workflows[1].arguments, ["delegate", "preview"]);
+        assert_eq!(
+            manifest.cli_workflows[2].arguments,
             ["delegate", "rule", "<path...>"]
         );
         assert_eq!(
-            manifest.cli_workflows[2].arguments,
+            manifest.cli_workflows[3].arguments,
             ["rules", "check", "<path...>", "--json"]
         );
     }

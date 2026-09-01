@@ -34,6 +34,7 @@ enum DelegateScope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ParsedDelegateArgs {
     Help,
+    Manifest,
     Execute(DelegateScope),
 }
 
@@ -55,6 +56,17 @@ pub fn run(
             print_help();
             Ok(0)
         }
+        ParsedDelegateArgs::Manifest => {
+            let output = revoot_core::build_agent_integration_manifest()
+                .canonical_json()
+                .map_err(|error| contract_error(error.to_string()))?;
+            println!(
+                "{}",
+                String::from_utf8(output)
+                    .map_err(|_| contract_error("agent manifest serialization was not UTF-8"))?
+            );
+            Ok(0)
+        }
         ParsedDelegateArgs::Execute(scope) => {
             let output = build_output(scope, environment, current_directory)?;
             println!(
@@ -72,13 +84,22 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedDelegateArgs, 
     let mut args = args;
     let Some(subcommand) = args.next() else {
         return Err(cli_error(
-            "delegate requires the `preview` or `rule` subcommand",
+            "delegate requires the `manifest`, `preview`, or `rule` subcommand",
         ));
     };
     if matches!(subcommand.as_str(), "help" | "--help" | "-h") {
         return Ok(ParsedDelegateArgs::Help);
     }
     match subcommand.as_str() {
+        "manifest" => {
+            if let Some(argument) = args.next() {
+                if matches!(argument.as_str(), "help" | "--help" | "-h") && args.next().is_none() {
+                    return Ok(ParsedDelegateArgs::Help);
+                }
+                return Err(cli_error("usage: revoot delegate manifest"));
+            }
+            Ok(ParsedDelegateArgs::Manifest)
+        }
         "preview" => {
             if let Some(argument) = args.next() {
                 if matches!(argument.as_str(), "help" | "--help" | "-h") && args.next().is_none() {
@@ -417,7 +438,9 @@ fn contract_error(message: impl Into<String>) -> Diagnostic {
 }
 
 fn print_help() {
-    println!("USAGE:\n  revoot delegate preview\n  revoot delegate rule <path...>");
+    println!(
+        "USAGE:\n  revoot delegate manifest\n  revoot delegate preview\n  revoot delegate rule <path...>"
+    );
 }
 
 #[cfg(test)]
@@ -426,6 +449,10 @@ mod tests {
 
     #[test]
     fn parser_accepts_only_fixed_provider_free_surface() {
+        assert_eq!(
+            parse_args(["manifest".to_owned()].into_iter()).expect("manifest"),
+            ParsedDelegateArgs::Manifest
+        );
         assert_eq!(
             parse_args(["preview".to_owned()].into_iter()).expect("preview"),
             ParsedDelegateArgs::Execute(DelegateScope::Preview)
@@ -436,6 +463,7 @@ mod tests {
         );
         assert!(parse_args(["rule".to_owned()].into_iter()).is_err());
         assert!(parse_args(["preview".to_owned(), "extra".to_owned()].into_iter()).is_err());
+        assert!(parse_args(["manifest".to_owned(), "extra".to_owned()].into_iter()).is_err());
         assert!(parse_args(["provider".to_owned()].into_iter()).is_err());
     }
 
@@ -491,6 +519,7 @@ mod tests {
             .iter()
             .map(|workflow| workflow.arguments.as_slice())
             .collect::<Vec<_>>();
+        assert!(workflows.contains(&["delegate".to_owned(), "manifest".to_owned()].as_slice()));
         assert!(workflows.contains(&["delegate".to_owned(), "preview".to_owned()].as_slice()));
         assert!(
             workflows.contains(
@@ -502,6 +531,21 @@ mod tests {
                 .as_slice()
             )
         );
+    }
+
+    #[test]
+    fn canonical_agent_manifest_is_provider_free_and_denies_external_authority() {
+        let output = revoot_core::build_agent_integration_manifest()
+            .canonical_json()
+            .expect("canonical agent manifest");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("manifest JSON");
+        assert_eq!(value["schema_version"], "revoot.agent-integration/v1");
+        let authority = value["authority"].as_object().expect("authority");
+        assert!(authority.values().all(|state| state == "denied"));
+        let text = String::from_utf8(output).expect("UTF-8 manifest");
+        for forbidden in ["install_command", "code_edit", "api_key", "provider_key"] {
+            assert!(!text.contains(forbidden));
+        }
     }
 
     #[test]

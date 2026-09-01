@@ -64,6 +64,7 @@ mod tests {
                 assert!(completion.contains(command));
             }
             assert!(completion.contains("preview"));
+            assert!(completion.contains("manifest"));
             assert!(completion.contains("effort"));
             assert!(completion.contains("sarif"));
             assert!(completion.contains("--mr") || completion.contains("-l mr"));

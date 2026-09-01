@@ -66,6 +66,10 @@ run = "cargo test --locked -p revoot --test live_provider_conformance -- --ignor
 description = "Optionally run one provider through the review scenario corpus"
 run = "cargo test --locked -p revoot --test live_review_quality live_full_checkout_quality -- --ignored --exact --nocapture"
 
+[tasks."test:live-quality"]
+description = "Backward-compatible alias for the credentialed live review quality task"
+run = [{ task = "test:quality:live" }]
+
 [tasks."release:version"]
 description = "Require the release tag, Cargo package version, and changelog to agree"
 run = "bash scripts/check-release-version.sh"

@@ -22,7 +22,7 @@ _revoot() {
   case $words[2] in
     review) _arguments '--base[Local comparison base]:git ref:' '--ci[Use code-host CI context]' '--mr[GitLab merge request IID]:iid:' '--pr[GitHub pull request number]:number:' '--repo[GitHub target repository]:owner/repository:' '--preview[Show provider-free preparation]' '--effort[Review effort]:effort:(low medium high)' '--max-parallel-groups[Concurrent groups]:count:(1 2 3 4 5 6 7 8)' '--format[Report format]:format:(human json sarif)' '--output[Write report]:path:_files' '--help[Show help]' ;;
     scan) _arguments '*--path[Limit scan to path]:path:_files' '--include-untracked[Include local untracked files]' '--preview[Show provider-free scan plan]' '--format[Output format]:format:(human json sarif)' '--help[Show help]' ;;
-    delegate) _arguments '1:operation:(preview rule)' '*:repository path:_files' '--help[Show help]' ;;
+    delegate) _arguments '1:operation:(manifest preview rule)' '*:repository path:_files' '--help[Show help]' ;;
     rules) _arguments '1:operation:(check)' '*:repository path:_files' '--json[Emit JSON]' '--help[Show help]' ;;
     mcp) _arguments '1:operation:(serve)' ;;
     doctor) _arguments '--json[Emit JSON]' '--help[Show help]' ;;
