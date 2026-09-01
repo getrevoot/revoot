@@ -535,6 +535,7 @@ struct TomlRepository {
 #[serde(deny_unknown_fields)]
 struct TomlModelContext {
     exclude: Option<Vec<String>>,
+    max_inline_diff_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -551,6 +552,8 @@ struct TomlReviewBudget {
     max_files: Option<u64>,
     max_input_bytes: Option<u64>,
     max_model_requests: Option<u64>,
+    max_model_tokens: Option<u64>,
+    max_tool_calls: Option<u64>,
     deadline_seconds: Option<u64>,
 }
 
@@ -652,10 +655,21 @@ fn adapt_document(
             }
             adapted.repository.guidance = repository.guidance;
         }
-        if let Some(model_context) = document.model_context
-            && let Some(exclude) = model_context.exclude
-        {
-            adapted.repository.model_context.exclude = exclude;
+        if let Some(model_context) = document.model_context {
+            if let Some(exclude) = model_context.exclude {
+                adapted.repository.model_context.exclude = exclude;
+            }
+            if let Some(value) = model_context.max_inline_diff_bytes {
+                if value > 16_384 {
+                    return Err(contract_error(
+                        "repository model_context.max_inline_diff_bytes may only lower the default",
+                    ));
+                }
+                push(
+                    "model_context.max_inline_diff_bytes",
+                    ConfigValue::Unsigned(value),
+                );
+            }
         }
         if let Some(execution) = document.execution {
             if let Some(value) = execution.context_lines {
@@ -669,10 +683,20 @@ fn adapt_document(
             }
         }
         if let Some(budget) = document.budget {
+            if budget.max_model_requests.is_some_and(|value| value > 64)
+                || budget.max_model_tokens.is_some_and(|value| value > 300_000)
+                || budget.max_tool_calls.is_some_and(|value| value > 256)
+            {
+                return Err(contract_error(
+                    "repository budget values may only lower their defaults",
+                ));
+            }
             for (key, value) in [
                 ("budget.max_files", budget.max_files),
                 ("budget.max_input_bytes", budget.max_input_bytes),
                 ("budget.max_model_requests", budget.max_model_requests),
+                ("budget.max_model_tokens", budget.max_model_tokens),
+                ("budget.max_tool_calls", budget.max_tool_calls),
                 ("budget.deadline_seconds", budget.deadline_seconds),
             ] {
                 if let Some(value) = value {
@@ -1067,6 +1091,18 @@ fn environment_mapping(name: &str) -> Option<(&'static str, EnvironmentValueKind
         "REVOOT_MAX_MODEL_REQUESTS" => {
             Some(("budget.max_model_requests", EnvironmentValueKind::Unsigned))
         }
+        "REVOOT_MAX_MODEL_TOKENS" => {
+            Some(("budget.max_model_tokens", EnvironmentValueKind::Unsigned))
+        }
+        "REVOOT_MAX_TOOL_CALLS" => Some(("budget.max_tool_calls", EnvironmentValueKind::Unsigned)),
+        "REVOOT_MAX_INLINE_DIFF_BYTES" => Some((
+            "model_context.max_inline_diff_bytes",
+            EnvironmentValueKind::Unsigned,
+        )),
+        "REVOOT_REVIEW_EFFORT" => Some(("review.effort", EnvironmentValueKind::String)),
+        "REVOOT_MAX_PARALLEL_GROUPS" => {
+            Some(("review.max_parallel_groups", EnvironmentValueKind::Unsigned))
+        }
         "REVOOT_DEADLINE_SECONDS" => {
             Some(("budget.deadline_seconds", EnvironmentValueKind::Unsigned))
         }
@@ -1108,10 +1144,47 @@ fn product_schema() -> Result<ConfigurationSchema, Diagnostic> {
         ),
         unsigned_field(
             "budget.max_model_requests",
-            20,
+            64,
             AssignmentScope::RepositoryAndTrusted,
             1,
-            1_000,
+            256,
+        ),
+        unsigned_field(
+            "budget.max_model_tokens",
+            300_000,
+            AssignmentScope::RepositoryAndTrusted,
+            1,
+            2_000_000,
+        ),
+        unsigned_field(
+            "budget.max_tool_calls",
+            256,
+            AssignmentScope::RepositoryAndTrusted,
+            1,
+            2_048,
+        ),
+        unsigned_field(
+            "model_context.max_inline_diff_bytes",
+            16_384,
+            AssignmentScope::RepositoryAndTrusted,
+            1,
+            65_536,
+        ),
+        unsigned_field(
+            "review.max_parallel_groups",
+            4,
+            AssignmentScope::TrustedOnly,
+            1,
+            8,
+        ),
+        ConfigField::new(
+            key("review.effort"),
+            ConfigValue::String("medium".to_owned()),
+            AssignmentScope::TrustedOnly,
+            ValueConstraint::String {
+                allow_empty: false,
+                max_bytes: 6,
+            },
         ),
         ConfigField::new(
             key("publication.enabled"),
@@ -1217,7 +1290,11 @@ fn product_policy() -> Vec<PolicyRule> {
         ("budget.max_files", 1, 100),
         ("budget.max_findings", 1, 25),
         ("budget.max_input_bytes", 1, 1_000_000),
-        ("budget.max_model_requests", 1, 20),
+        ("budget.max_model_requests", 1, 256),
+        ("budget.max_model_tokens", 1, 2_000_000),
+        ("budget.max_tool_calls", 1, 2_048),
+        ("model_context.max_inline_diff_bytes", 1, 65_536),
+        ("review.max_parallel_groups", 1, 8),
         ("review.context_lines", 0, 200),
         ("review.minimum_confidence", 70, 100),
     ]

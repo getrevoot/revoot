@@ -20,6 +20,12 @@ guidance = "All externally retried writes must be idempotent."
 
 [model_context]
 exclude = ["internal/**", "**/*.vault"]
+max_inline_diff_bytes = 16384
+
+[budget]
+max_model_requests = 48
+max_model_tokens = 250000
+max_tool_calls = 192
 
 [[rules]]
 paths = ["crates/payments/**"]
@@ -75,7 +81,12 @@ values must be unsigned decimal numbers, booleans must be exactly `true` or
 | `REVOOT_MAX_FILES` | `100` | Unsigned selected-file limit; effective range `1` through `100`. |
 | `REVOOT_MAX_INPUT_BYTES` | `1000000` | Unsigned selected-diff byte limit; effective range `1` through `1000000`. |
 | `REVOOT_MAX_FINDINGS` | `25` | Unsigned candidate-finding limit; effective range `1` through `25`. |
-| `REVOOT_MAX_MODEL_REQUESTS` | `20` | Unsigned provider-request limit; effective range `1` through `20`. |
+| `REVOOT_MAX_MODEL_REQUESTS` | `64` | Unsigned provider-request limit; effective range `1` through `256`. |
+| `REVOOT_MAX_MODEL_TOKENS` | `300000` | Combined review token budget; effective range `1` through `2000000`. |
+| `REVOOT_MAX_TOOL_CALLS` | `256` | Local read/search call budget; effective range `1` through `2048`. |
+| `REVOOT_MAX_INLINE_DIFF_BYTES` | `16384` | Inline complete diffs only below this byte threshold; larger groups start from hunk manifests. |
+| `REVOOT_REVIEW_EFFORT` | `medium` | Review depth: `low`, `medium`, or `high`. |
+| `REVOOT_MAX_PARALLEL_GROUPS` | `4` | Maximum isolated review groups in flight; effective range `1` through `8`. |
 | `REVOOT_DEADLINE_SECONDS` | `600` | Unsigned review deadline; effective range `1` through `600` seconds. |
 | `REVOOT_PUBLICATION_ENABLED` | `false` | Whether a host-backed review may publish comments. Generated CI sets this to `true`. |
 | `REVOOT_FORK_BEHAVIOR` | `skip` | GitLab fork behavior: `skip` or `report-only`. GitHub fork behavior is encoded in the generated workflow. |
@@ -165,6 +176,8 @@ Repository-owned resource fields may only lower hard ceilings:
 max_files = 80
 max_input_bytes = 750000
 max_model_requests = 12
+max_model_tokens = 240000
+max_tool_calls = 192
 deadline_seconds = 480
 ```
 

@@ -23,6 +23,7 @@ use revoot_core::{
 };
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::config::{
@@ -79,13 +80,14 @@ use crate::review_checkpoint::{
 };
 use crate::review_engine::{
     IndependentReviewBrief, MonotonicClock, PriorFindingDisposition, PriorFindingDispositionKind,
-    ReviewAnchor, ReviewEngineLimits, ReviewEngineRequest, ReviewReport, run_review,
+    ReviewAnchor, ReviewCoverage, ReviewEngineLimits, ReviewEngineRequest, ReviewReport,
+    ReviewStrategy, run_review,
 };
 use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
 };
 
-const REPORT_SCHEMA_VERSION: &str = "revoot.review-report/v2";
+const REPORT_SCHEMA_VERSION: &str = "revoot.review-report/v3";
 const MODEL_CATALOG_SCHEMA_VERSION: &str = "revoot.model-catalog/v1";
 const MODEL_CATALOG: &str = include_str!("../assets/model-catalog-v1.json");
 const MAX_CODE_HOST_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
@@ -97,11 +99,15 @@ enum OutputFormat {
     #[default]
     Human,
     Json,
+    Sarif,
 }
 
 #[derive(Debug, Default)]
 struct ReviewArgs {
     ci: bool,
+    preview: bool,
+    effort: Option<revoot_core::ReviewEffort>,
+    max_parallel_groups: Option<u8>,
     format: OutputFormat,
     output: Option<PathBuf>,
     base_ref: Option<String>,
@@ -151,6 +157,10 @@ struct CanonicalReviewReport {
     tool_calls: u32,
     admitted_candidates: u32,
     suppressed_candidates: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strategy: Option<ReviewStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<ReviewCoverage>,
     selection: CanonicalSelection,
     publication: CanonicalPublication,
     #[serde(skip)]
@@ -673,7 +683,28 @@ pub fn run(
         print_help();
         return Ok(0);
     };
-    let environment: Vec<_> = environment.into_iter().collect();
+    let mut environment: Vec<_> = environment.into_iter().collect();
+    if let Some(effort) = args.effort {
+        set_operator_environment(
+            &mut environment,
+            "REVOOT_REVIEW_EFFORT",
+            match effort {
+                revoot_core::ReviewEffort::Low => "low",
+                revoot_core::ReviewEffort::Medium => "medium",
+                revoot_core::ReviewEffort::High => "high",
+            },
+        );
+    }
+    if let Some(maximum) = args.max_parallel_groups {
+        set_operator_environment(
+            &mut environment,
+            "REVOOT_MAX_PARALLEL_GROUPS",
+            &maximum.to_string(),
+        );
+    }
+    if args.preview {
+        set_operator_environment(&mut environment, "REVOOT_PUBLICATION_ENABLED", "false");
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -705,6 +736,11 @@ pub fn run(
         return Ok(3);
     }
     Ok(0)
+}
+
+fn set_operator_environment(environment: &mut Vec<(OsString, OsString)>, name: &str, value: &str) {
+    environment.retain(|(existing, _)| existing != name);
+    environment.push((OsString::from(name), OsString::from(value)));
 }
 
 #[allow(clippy::too_many_lines)]
@@ -965,6 +1001,7 @@ async fn run_local_review(
     execute_prepared_review(provider, model, credentials, resolved, prepared, None).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_prepared_review(
     provider: String,
     model: String,
@@ -1008,6 +1045,17 @@ async fn execute_prepared_review(
     let minimum_confidence_percent =
         u8::try_from(config_unsigned(resolution, "review.minimum_confidence")?)
             .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "minimum confidence is invalid"))?;
+    let effort = match config_string(resolution, "review.effort")? {
+        "low" => revoot_core::ReviewEffort::Low,
+        "medium" => revoot_core::ReviewEffort::Medium,
+        "high" => revoot_core::ReviewEffort::High,
+        _ => {
+            return Err(diagnostic(
+                ErrorCode::ContractInvalid,
+                "review effort is invalid",
+            ));
+        }
+    };
     let mut report = run_review(
         adapter.as_ref(),
         ReviewEngineRequest {
@@ -1017,6 +1065,7 @@ async fn execute_prepared_review(
                     "reviewable partition has no invocation",
                 )
             })?,
+            partition: prepared.partition().clone(),
             toolbox,
             history,
             prior_review: prepared.prior_review(),
@@ -1026,6 +1075,21 @@ async fn execute_prepared_review(
             initial_omissions,
             limits: ReviewEngineLimits {
                 minimum_confidence_percent,
+                max_inline_diff_bytes: config_unsigned(
+                    resolution,
+                    "model_context.max_inline_diff_bytes",
+                )?,
+                max_parallel_groups: u8::try_from(config_unsigned(
+                    resolution,
+                    "review.max_parallel_groups",
+                )?)
+                .map_err(|_| {
+                    diagnostic(
+                        ErrorCode::ContractInvalid,
+                        "parallel group limit is invalid",
+                    )
+                })?,
+                effort,
                 ..ReviewEngineLimits::default()
             },
         },
@@ -1103,6 +1167,8 @@ fn no_changes_report() -> CanonicalReviewReport {
         tool_calls: 0,
         admitted_candidates: 0,
         suppressed_candidates: 0,
+        strategy: None,
+        coverage: None,
         selection: CanonicalSelection::default(),
         publication: CanonicalPublication::terminal("not_needed", Some("no_changes")),
         finding_locations: BTreeMap::new(),
@@ -1123,6 +1189,8 @@ fn skipped_fork_review_report() -> CanonicalReviewReport {
         tool_calls: 0,
         admitted_candidates: 0,
         suppressed_candidates: 0,
+        strategy: None,
+        coverage: None,
         selection: CanonicalSelection::default(),
         publication: CanonicalPublication::terminal("skipped", Some("fork_policy")),
         finding_locations: BTreeMap::new(),
@@ -1150,6 +1218,8 @@ fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
         tool_calls: 0,
         admitted_candidates: 0,
         suppressed_candidates: 0,
+        strategy: None,
+        coverage: None,
         selection: CanonicalSelection::from_partition(prepared.partition()),
         publication: CanonicalPublication::terminal("not_needed", Some("no_model_work")),
         finding_locations: BTreeMap::new(),
@@ -1272,6 +1342,8 @@ fn canonicalize_report(
         suppressed_candidates: report
             .suppressed_candidates
             .saturating_add(repository_suppressions_applied),
+        strategy: Some(report.strategy),
+        coverage: Some(report.coverage),
         selection,
         publication: CanonicalPublication::pending(),
         finding_locations,
@@ -2050,6 +2122,59 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<ReviewArgs>, 
                 }
                 parsed.ci = true;
             }
+            "--preview" => {
+                if parsed.preview {
+                    return Err(diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--preview may be supplied only once",
+                    ));
+                }
+                parsed.preview = true;
+            }
+            "--effort" => {
+                let value = args.next().ok_or_else(|| {
+                    diagnostic(ErrorCode::CliInvalidArgument, "--effort requires a value")
+                })?;
+                let effort = match value.as_str() {
+                    "low" => revoot_core::ReviewEffort::Low,
+                    "medium" => revoot_core::ReviewEffort::Medium,
+                    "high" => revoot_core::ReviewEffort::High,
+                    _ => {
+                        return Err(diagnostic(
+                            ErrorCode::CliInvalidArgument,
+                            "--effort must be low, medium, or high",
+                        ));
+                    }
+                };
+                if parsed.effort.replace(effort).is_some() {
+                    return Err(diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--effort may be supplied only once",
+                    ));
+                }
+            }
+            "--max-parallel-groups" => {
+                let value = args.next().ok_or_else(|| {
+                    diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--max-parallel-groups requires a value",
+                    )
+                })?;
+                let maximum = value.parse::<u8>().map_err(|_| {
+                    diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--max-parallel-groups must be between 1 and 8",
+                    )
+                })?;
+                if !(1..=8).contains(&maximum)
+                    || parsed.max_parallel_groups.replace(maximum).is_some()
+                {
+                    return Err(diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--max-parallel-groups must be supplied once with a value from 1 to 8",
+                    ));
+                }
+            }
             "--base" => {
                 let value = args.next().ok_or_else(|| {
                     diagnostic(ErrorCode::CliInvalidArgument, "--base requires a Git ref")
@@ -2068,10 +2193,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<ReviewArgs>, 
                 parsed.format = match value.as_str() {
                     "human" => OutputFormat::Human,
                     "json" => OutputFormat::Json,
+                    "sarif" => OutputFormat::Sarif,
                     _ => {
                         return Err(diagnostic(
                             ErrorCode::CliInvalidArgument,
-                            "--format must be human or json",
+                            "--format must be human, json, or sarif",
                         ));
                     }
                 };
@@ -2336,15 +2462,17 @@ fn agent_limits(
     let engine_limits = ReviewEngineLimits::default();
     let request_count = u64::from(max_model_requests);
     let max_findings = u32_value(resolution, "budget.max_findings")?;
+    let max_model_tokens = config_unsigned(resolution, "budget.max_model_tokens")?;
+    let max_tool_calls = u32_value(resolution, "budget.max_tool_calls")?;
     let deadline_seconds = config_unsigned(resolution, "budget.deadline_seconds")?;
     Ok(AgentBudgetLimits {
         max_turns: max_model_requests,
         max_model_requests,
         max_candidate_findings: max_findings,
         max_elapsed_millis: deadline_seconds.saturating_mul(1_000),
-        max_input_tokens: request_count.saturating_mul(engine_limits.max_conversation_bytes),
-        max_output_tokens: request_count
-            .saturating_mul(u64::from(engine_limits.max_output_tokens_per_turn)),
+        max_input_tokens: max_model_tokens,
+        max_output_tokens: max_model_tokens,
+        max_tool_calls,
         max_cost_microusd: request_count
             .saturating_mul(engine_limits.reserved_cost_microusd_per_turn),
         ..AgentBudgetLimits::default()
@@ -2829,6 +2957,7 @@ fn emit_report(
                 "review report serialization failed",
             )
         })?,
+        OutputFormat::Sarif => render_sarif(report)?,
     };
     if let Some(path) = &args.output {
         write_report_atomically(path, output.as_bytes()).map_err(|_| {
@@ -2841,6 +2970,61 @@ fn emit_report(
         print!("{output}");
     }
     Ok(())
+}
+
+fn render_sarif(report: &CanonicalReviewReport) -> Result<String, Diagnostic> {
+    let results = report
+        .findings
+        .iter()
+        .map(|finding| {
+            let (path, line) = report
+                .finding_locations
+                .get(&finding.anchor_id)
+                .and_then(|location| location.rsplit_once(':'))
+                .and_then(|(path, line)| line.parse::<u32>().ok().map(|line| (path, line)))
+                .unwrap_or(("unknown", 1));
+            let category = serde_json::to_value(finding.category)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "review".to_owned());
+            json!({
+                "ruleId": format!("revoot.{category}"),
+                "level": match finding.severity {
+                    Severity::Critical | Severity::High => "error",
+                    Severity::Medium => "warning",
+                    Severity::Low | Severity::Info => "note",
+                },
+                "message": {"text": finding.rendered_body},
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": path},
+                        "region": {"startLine": line}
+                    }
+                }],
+                "partialFingerprints": {
+                    "revootFindingKey": finding.finding_key.as_str()
+                },
+                "properties": {
+                    "confidencePercent": finding.confidence_percent,
+                    "anchorId": finding.anchor_id.as_str()
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "Revoot"}},
+            "results": results,
+            "properties": {
+                "reviewState": report.state,
+                "coverage": report.coverage
+            }
+        }]
+    }))
+    .map(|value| format!("{value}\n"))
+    .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "SARIF serialization failed"))
 }
 
 fn write_report_atomically(path: &Path, output: &[u8]) -> Result<(), std::io::Error> {
@@ -2887,7 +3071,7 @@ fn diagnostic(code: ErrorCode, message: impl Into<String>) -> Diagnostic {
 
 fn print_help() {
     println!(
-        "USAGE:\n  revoot review [--base REF] [--format human|json] [--output PATH]\n  revoot review --ci [--format human|json] [--output PATH]\n  revoot review --mr IID | --pr NUMBER [--repo OWNER/REPOSITORY]"
+        "USAGE:\n  revoot review [--base REF] [--preview] [--effort low|medium|high] [--max-parallel-groups 1-8] [--format human|json|sarif] [--output PATH]\n  revoot review --ci [--preview] [--format human|json|sarif] [--output PATH]\n  revoot review --mr IID | --pr NUMBER [--repo OWNER/REPOSITORY]"
     );
 }
 
@@ -3054,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_exposes_output_controls_but_no_review_strategy() {
+    fn parser_exposes_output_and_bounded_review_strategy() {
         let parsed = parse_args(
             [
                 "--ci",
@@ -3064,6 +3248,11 @@ mod tests {
                 "json",
                 "--output",
                 "report.json",
+                "--preview",
+                "--effort",
+                "high",
+                "--max-parallel-groups",
+                "8",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -3072,6 +3261,9 @@ mod tests {
         .expect("not help");
         assert_eq!(parsed.format, OutputFormat::Json);
         assert!(parsed.output.is_some());
+        assert!(parsed.preview);
+        assert_eq!(parsed.effort, Some(revoot_core::ReviewEffort::High));
+        assert_eq!(parsed.max_parallel_groups, Some(8));
         assert_eq!(parsed.merge_request_iid.map(MergeRequestIid::get), Some(17));
         assert!(parsed.pull_request_number.is_none());
         let github = parse_args(["--pr", "9"].into_iter().map(str::to_owned))
@@ -3093,6 +3285,15 @@ mod tests {
             "getrevoot/revoot"
         );
         assert!(parse_args(["--depth".to_owned()].into_iter()).is_err());
+        assert!(parse_args(["--effort", "extreme"].into_iter().map(str::to_owned)).is_err());
+        assert!(
+            parse_args(
+                ["--max-parallel-groups", "9"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
         let local = parse_args(["--base", "origin/release"].into_iter().map(str::to_owned))
             .expect("local arguments")
             .expect("not help");
@@ -3213,6 +3414,8 @@ mod tests {
             tool_calls: 3,
             admitted_candidates: 0,
             suppressed_candidates: 0,
+            strategy: None,
+            coverage: None,
             selection: CanonicalSelection::default(),
             publication: CanonicalPublication::terminal("not_needed", Some("no_findings")),
             finding_locations: BTreeMap::new(),

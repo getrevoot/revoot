@@ -80,6 +80,28 @@ fn run() -> Result<i32, Diagnostic> {
                 )
             })?,
         ),
+        "mcp" => {
+            let Some(subcommand) = args.next() else {
+                return Err(Diagnostic::new(
+                    ErrorCode::CliInvalidArgument,
+                    "mcp requires the `serve` subcommand",
+                ));
+            };
+            if subcommand != "serve" || args.next().is_some() {
+                return Err(Diagnostic::new(
+                    ErrorCode::CliInvalidArgument,
+                    "usage: revoot mcp serve",
+                ));
+            }
+            revoot::mcp_server::serve_stdio(&env::current_dir().map_err(|_| {
+                Diagnostic::new(
+                    ErrorCode::RepositoryUnavailable,
+                    "current directory is unavailable",
+                )
+            })?)
+            .map(|()| 0)
+            .map_err(|message| Diagnostic::new(ErrorCode::ReviewFailed, message))
+        }
         "version" | "--version" | "-V" => {
             println!("revoot {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
@@ -282,7 +304,7 @@ fn run_doctor(args: &DoctorArgs) -> Result<i32, Diagnostic> {
 
 fn print_help() {
     println!(
-        "revoot — independent review for agent-written code\n\nUSAGE:\n  revoot review\n  revoot config explain [OPTIONS]\n  revoot init gitlab [OPTIONS]\n  revoot init github [OPTIONS]\n  revoot doctor [--json]\n  revoot completions bash|zsh|fish\n  revoot version"
+        "revoot — independent review for agent-written code\n\nUSAGE:\n  revoot review [OPTIONS]\n  revoot mcp serve\n  revoot config explain [OPTIONS]\n  revoot init gitlab [OPTIONS]\n  revoot init github [OPTIONS]\n  revoot doctor [--json]\n  revoot completions bash|zsh|fish\n  revoot version"
     );
 }
 

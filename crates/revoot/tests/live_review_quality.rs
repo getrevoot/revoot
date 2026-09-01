@@ -19,9 +19,11 @@ use revoot_core::{
     AgentBudgetLimits, AgentBudgetUsage, AgentTool, AnchorPosition, AnchorTable, CancellationToken,
     ChangedPath, DiffRefs, DiffVersionId, DiffVersionRecord, EvaluationCase, EvaluationThresholds,
     ExpectedDefect, FileChangeKind, Finding, FindingCategory, GitLabDiffVersionIdentity, GitSha,
-    MergeRequestIid, ProjectId, ProviderAdapter, RepositoryDiff, RepositoryPath,
-    RepositoryRelativePath, RepositoryToolLimits, RepositoryToolbox, ReviewInvocation,
-    ReviewOutcome, Sha256Digest, SnapshotScope, UnifiedDiffLimits, evaluate_corpus,
+    MergeRequestIid, PartitionLimits, ProjectId, ProviderAdapter, RepositoryDiff, RepositoryPath,
+    RepositoryRelativePath, RepositoryToolLimits, RepositoryToolbox, ReviewFileClass,
+    ReviewFileInput, ReviewInvocation, ReviewObject, ReviewObjectRole, ReviewOutcome,
+    ReviewSelectionPolicy, ReviewValue, ReviewValueReason, ReviewValueTier, Sha256Digest,
+    SnapshotScope, UnifiedDiffLimits, build_partition_plan, evaluate_corpus,
     parse_gitlab_file_diff,
 };
 use serde::{Deserialize, Serialize};
@@ -165,6 +167,7 @@ fn tools() -> BTreeSet<AgentTool> {
     ])
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_case(
     scenario: &EvaluationScenario,
     adapter: &dyn ProviderAdapter,
@@ -231,13 +234,52 @@ fn prepare_case(
     let request = ReviewEngineRequest {
         invocation: ReviewInvocation {
             review_id: format!("live-evaluation-{}", scenario.case_id.replace('/', "-")),
-            snapshot: snapshot.into(),
+            snapshot: snapshot.clone().into(),
             work_unit_ids: BTreeSet::from(["evaluation".to_owned()]),
             provider_adapter: adapter.adapter_id().to_owned(),
             model_id: model.to_owned(),
             allowed_tools: tools(),
             limits: AgentBudgetLimits::default(),
         },
+        partition: build_partition_plan(
+            snapshot,
+            &ReviewSelectionPolicy {
+                version: "selection-v1".to_owned(),
+                included_paths: BTreeSet::new(),
+                included_prefixes: Vec::new(),
+                included_suffixes: Vec::new(),
+                excluded_paths: BTreeSet::new(),
+                excluded_prefixes: Vec::new(),
+                excluded_suffixes: Vec::new(),
+                excluded_basename_prefixes: Vec::new(),
+                include_generated: false,
+                max_file_bytes: 2 * 1024 * 1024,
+            },
+            PartitionLimits {
+                max_files: 10,
+                max_total_bytes: 2 * 1024 * 1024,
+                max_work_units: 10,
+                max_files_per_work_unit: 10,
+                max_bytes_per_work_unit: 2 * 1024 * 1024,
+                max_anchors_per_work_unit: 10_000,
+            },
+            [ReviewFileInput {
+                path: changed_path,
+                class: ReviewFileClass::Text,
+                review_value: ReviewValue {
+                    tier: ReviewValueTier::Standard,
+                    score: 100,
+                    reasons: BTreeSet::from([ReviewValueReason::SourceCode]),
+                },
+                objects: vec![ReviewObject {
+                    role: ReviewObjectRole::ExactDiff,
+                    content_sha256: Sha256Digest::of_bytes(scenario.exact_diff.as_bytes()),
+                    size_bytes: u64::try_from(scenario.exact_diff.len()).unwrap_or(u64::MAX),
+                }],
+                anchor_ids: anchors.iter().map(|anchor| anchor.id.clone()).collect(),
+            }],
+        )
+        .expect("valid evaluation partition"),
         toolbox,
         history: None,
         prior_review: revoot_core::PriorReviewContext::default(),

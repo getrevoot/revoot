@@ -17,19 +17,27 @@ use revoot_core::{
     ExecutionNodeKind, ExecutionNodeSpec, FindingsEnvelope, InventoryCoverage, LineRange,
     ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestReservation,
     ModelRole, ModelTool, PriorReviewContext, PriorReviewSource, PriorReviewState, ProviderAdapter,
-    RepositoryRelativePath, RepositoryToolError, RepositoryToolbox, ReviewInvocation,
-    ReviewOutcome, SearchRequest, Sha256Digest,
+    RepositoryRelativePath, RepositoryToolError, RepositoryToolbox, ReviewEffort,
+    ReviewGroupingSource, ReviewInvocation, ReviewOutcome, ReviewPartitionPlan, ReviewValueTier,
+    SearchRequest, Sha256Digest, build_review_group_plan,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::diff_artifact::{
+    DEFAULT_DIFF_PAGE_BYTES, DiffArtifactStore, DiffFileManifest, DiffSearchKind,
+    DiffSearchRequest, MAX_INLINE_GROUP_DIFF_BYTES,
+};
 use crate::git_history::{GitHistoryError, GitHistoryToolbox};
 use crate::review_overview::{ReviewOverview, ReviewRisk, RiskLevel};
+use crate::review_rules::resolve_embedded_rule;
 
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
+const MAX_SYNTHESIS_RESERVE_BYTES: u64 = 64 * 1024;
+const TOOL_RESULT_ENVELOPE_RESERVE_BYTES: u64 = 1024;
 
 /// Version of the trusted reviewer policy used in quality evidence.
-pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v11";
+pub const REVIEWER_POLICY_VERSION: &str = "revoot.reviewer-policy/v13";
 
 const SYSTEM_PROMPT: &str = r"You are Revoot, one automatic code reviewer.
 Implementation and review are separate jobs, even when agents perform both.
@@ -83,11 +91,15 @@ and evidence as complementary parts of one published comment: explanation states
 the impact and improvement, while evidence supplies concrete repository-specific
 proof without restating the explanation. Challenge each
 hypothesis before calling submit_candidate_finding. Before submitting, call
-show_diff for every changed path that anchors a finding and inspect relevant
+read_diff (or the compatibility show_diff tool) for every changed path that
+anchors a finding and inspect relevant
 repository context with read_file or search. Use only an exact anchor ID
-returned by show_diff; never invent or derive one. If a candidate is suppressed
+returned by a diff read; never invent or derive one. Follow hunk pagination
+until the relevant hunks and their anchors have been inspected. If a candidate is suppressed
 because evidence is missing, obtain that evidence and resubmit it once; do not
 merely repeat the candidate.
+If a tool reports conversation_budget_low, stop exploration and submit the
+review summary using the evidence already gathered.
 Silence is correct when no well-supported improvement remains. Risk describes
 the change surface, not the number or severity of findings. The final overview
 must summarize implementation consequences without retelling the author's
@@ -167,6 +179,9 @@ pub struct ReviewEngineLimits {
     pub max_conversation_bytes: u64,
     pub max_tool_result_bytes: u64,
     pub minimum_confidence_percent: u8,
+    pub max_inline_diff_bytes: u64,
+    pub max_parallel_groups: u8,
+    pub effort: ReviewEffort,
 }
 
 impl Default for ReviewEngineLimits {
@@ -178,6 +193,9 @@ impl Default for ReviewEngineLimits {
             max_conversation_bytes: 512 * 1024,
             max_tool_result_bytes: 64 * 1024,
             minimum_confidence_percent: 85,
+            max_inline_diff_bytes: MAX_INLINE_GROUP_DIFF_BYTES,
+            max_parallel_groups: 4,
+            effort: ReviewEffort::Medium,
         }
     }
 }
@@ -185,6 +203,7 @@ impl Default for ReviewEngineLimits {
 /// Complete input to the single automatic review operation.
 pub struct ReviewEngineRequest {
     pub invocation: ReviewInvocation,
+    pub partition: ReviewPartitionPlan,
     pub toolbox: RepositoryToolbox,
     /// Optional embedded, snapshot-bound Git history. Commit messages are
     /// untrusted repository data and never reviewer instructions.
@@ -229,10 +248,37 @@ pub struct ReviewReport {
     pub tool_calls: u32,
     pub admitted_candidates: u32,
     pub suppressed_candidates: u32,
+    pub strategy: ReviewStrategy,
+    pub coverage: ReviewCoverage,
     /// Internal graph evidence is intentionally absent from the stable review
     /// JSON surface until its schema is versioned independently.
     #[serde(skip_serializing)]
     pub execution: ExecutionGraphSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewStrategy {
+    pub effort: ReviewEffort,
+    pub grouping_source: ReviewGroupingSource,
+    pub group_count: u32,
+    pub max_parallel_groups: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewCoverage {
+    pub policy_version: &'static str,
+    pub high_risk_files: u32,
+    pub standard_risk_files: u32,
+    pub low_risk_files: u32,
+    pub fully_read_files: u32,
+    pub sampled_files: u32,
+    pub manifest_only_files: u32,
+    pub delivered_high_risk_hunks: u32,
+    pub required_high_risk_hunks: u32,
+    pub explicit_deferrals: u32,
+    pub failed_groups: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -440,6 +486,7 @@ struct EngineEvidence {
     admitted_candidates: u32,
     suppressed_candidates: u32,
     inspected_diff_paths: BTreeSet<RepositoryRelativePath>,
+    delivered_diff_pages: BTreeMap<RepositoryRelativePath, BTreeMap<String, BTreeSet<u32>>>,
     inspected_repository_context: bool,
     prior_review_cursor: usize,
     admitted_lineages: BTreeSet<Sha256Digest>,
@@ -509,6 +556,18 @@ pub async fn run_review(
     clock: &dyn MonotonicClock,
 ) -> Result<ReviewReport, ReviewEngineError> {
     validate_request(&request)?;
+    let group_plan = build_review_group_plan(
+        &request.partition,
+        None,
+        ReviewGroupingSource::Deterministic,
+    )
+    .map_err(|_| ReviewEngineError::new(ReviewEngineErrorKind::InvalidRequest))?;
+    let strategy = ReviewStrategy {
+        effort: request.limits.effort,
+        grouping_source: group_plan.source,
+        group_count: u32::try_from(group_plan.groups.len()).unwrap_or(u32::MAX),
+        max_parallel_groups: request.limits.max_parallel_groups,
+    };
     let started_at = clock.now_millis();
     let prepare_node = execution_node_id("prepare")?;
     let investigate_node = execution_node_id("investigate")?;
@@ -522,6 +581,14 @@ pub async fn run_review(
         .map_err(map_graph_error)?;
     let mut run = AgentRun::new(request.invocation, cancellation.clone(), started_at)
         .map_err(map_agent_error)?;
+    let diff_paths = request
+        .toolbox
+        .exact_diffs()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let diff_store =
+        DiffArtifactStore::create(request.toolbox.exact_diffs(), DEFAULT_DIFF_PAGE_BYTES)
+            .map_err(|_| internal())?;
     let mut initial_prompt = request.review_brief.into_string();
     if let Some(history) = request.history.as_ref() {
         initial_prompt.push_str("\n\n<untrusted_change_history>\n");
@@ -544,6 +611,49 @@ pub async fn run_review(
             request.prior_review.discussions().len()
         );
     }
+    let manifest = diff_store.manifest(&diff_paths).map_err(|_| internal())?;
+    initial_prompt.push_str("\n\n<diff_manifest>\n");
+    initial_prompt.push_str(&serde_json::to_string(&manifest).map_err(|_| internal())?);
+    initial_prompt.push_str("\n</diff_manifest>");
+    let mut included_rule_ids = BTreeSet::new();
+    let mut rule_context_bytes = 0_usize;
+    initial_prompt.push_str("\n\n<embedded_review_rules priority=\"lowest\">\n");
+    for path in &diff_paths {
+        let rule = resolve_embedded_rule(path.as_str()).map_err(|_| internal())?;
+        if included_rule_ids.insert(rule.id) {
+            let required = rule
+                .id
+                .len()
+                .saturating_add(rule.guidance.len())
+                .saturating_add(64);
+            if rule_context_bytes.saturating_add(required) <= 16 * 1024 {
+                let _ = writeln!(initial_prompt, "<rule id=\"{}\">", rule.id);
+                initial_prompt.push_str(rule.guidance);
+                initial_prompt.push_str("\n</rule>\n");
+                rule_context_bytes = rule_context_bytes.saturating_add(required);
+            } else {
+                let _ = writeln!(
+                    initial_prompt,
+                    "<rule id=\"{}\" state=\"available_via_get_rules\" />",
+                    rule.id
+                );
+            }
+        }
+    }
+    initial_prompt.push_str("</embedded_review_rules>");
+    let inline_diff = diff_store
+        .inline_group_diff(&diff_paths, request.limits.max_inline_diff_bytes)
+        .map_err(|_| internal())?;
+    if let Some(inline_diff) = inline_diff.as_ref() {
+        initial_prompt.push_str("\n\n<untrusted_inline_diff>\n");
+        initial_prompt.push_str(inline_diff);
+        initial_prompt.push_str("\n</untrusted_inline_diff>");
+    } else {
+        initial_prompt.push_str(
+            "\n\n<inline_diff state=\"omitted_large_group\" action=\"use read_diff or search_diff\" />",
+        );
+    }
+    let immutable_group_brief = initial_prompt.clone();
     let mut messages = vec![ModelMessage {
         role: ModelRole::User,
         content: vec![ModelContent::Text {
@@ -556,6 +666,32 @@ pub async fn run_review(
     let prior_review = request.prior_review;
     let mut evidence = EngineEvidence {
         omissions: request.initial_omissions.clone(),
+        inspected_diff_paths: if inline_diff.is_some() {
+            diff_paths.iter().cloned().collect()
+        } else {
+            BTreeSet::new()
+        },
+        delivered_diff_pages: if inline_diff.is_some() {
+            manifest
+                .iter()
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        file.hunks
+                            .iter()
+                            .map(|hunk| {
+                                (
+                                    hunk.hunk_id.clone(),
+                                    (1..=hunk.pages).collect::<BTreeSet<_>>(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        },
         ..EngineEvidence::default()
     };
     if matches!(
@@ -664,6 +800,14 @@ pub async fn run_review(
         if finish_reason == ModelFinishReason::Stop {
             let overview = summary
                 .ok_or_else(|| ReviewEngineError::new(ReviewEngineErrorKind::MissingSummary))?;
+            let coverage = review_coverage(&request.partition, &manifest, &evidence);
+            if coverage.failed_groups > 0 {
+                push_omission(
+                    &mut evidence,
+                    "group-coverage",
+                    AgentOmissionReason::CoverageIncomplete,
+                );
+            }
             let agent_usage = run.budget_mut().usage();
             graph
                 .complete(
@@ -703,10 +847,13 @@ pub async fn run_review(
                 tool_calls: evidence.tool_calls,
                 admitted_candidates: evidence.admitted_candidates,
                 suppressed_candidates: evidence.suppressed_candidates,
+                strategy,
+                coverage,
                 execution: graph.summary(),
             });
         }
 
+        let latest_response_content = response_content.clone();
         let mut results = Vec::with_capacity(tool_call_count);
         for content in response_content {
             let ModelContent::ToolUse { id, name, input } = content else {
@@ -715,20 +862,36 @@ pub async fn run_review(
             if !seen_tool_ids.insert(id.clone()) {
                 return Err(ReviewEngineError::new(ReviewEngineErrorKind::ToolContract));
             }
-            let execution = execute_tool(
-                &name,
-                input,
-                &mut run,
-                &toolbox,
-                history.as_ref(),
-                &prior_review,
-                &cancellation,
-                clock.now_millis(),
-                &request.anchors,
-                request.limits,
-                &mut summary,
-                &mut evidence,
-            );
+            let available_result_bytes = available_tool_result_bytes(
+                &messages,
+                &tools,
+                &results,
+                request.limits.max_conversation_bytes,
+                name != "submit_review_summary",
+            )?;
+            let execution = if available_result_bytes == 0 {
+                Err(conversation_budget_low())
+            } else {
+                let mut tool_limits = request.limits;
+                tool_limits.max_tool_result_bytes = tool_limits
+                    .max_tool_result_bytes
+                    .min(available_result_bytes);
+                execute_tool(
+                    &name,
+                    input,
+                    &mut run,
+                    &toolbox,
+                    &diff_store,
+                    history.as_ref(),
+                    &prior_review,
+                    &cancellation,
+                    clock.now_millis(),
+                    &request.anchors,
+                    tool_limits,
+                    &mut summary,
+                    &mut evidence,
+                )
+            };
             let (result, is_error) = match execution {
                 Ok(result) => (result, false),
                 Err(error)
@@ -748,10 +911,32 @@ pub async fn run_review(
                 is_error,
             });
         }
-        messages.push(ModelMessage {
-            role: ModelRole::User,
-            content: results,
+        let checkpoint = json!({
+            "schema_version": "revoot.review-checkpoint/v1",
+            "admitted_candidates": evidence.admitted_candidates,
+            "suppressed_candidates": evidence.suppressed_candidates,
+            "inspected_diff_paths": evidence.inspected_diff_paths,
+            "repository_context_inspected": evidence.inspected_repository_context,
+            "prior_review_cursor": evidence.prior_review_cursor,
         });
+        messages = vec![
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: format!(
+                        "{immutable_group_brief}\n\n<review_checkpoint>\n{checkpoint}\n</review_checkpoint>"
+                    ),
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: latest_response_content,
+            },
+            ModelMessage {
+                role: ModelRole::User,
+                content: results,
+            },
+        ];
     }
 }
 
@@ -835,11 +1020,112 @@ fn investigation_contribution(
     }
 }
 
+fn review_coverage(
+    partition: &ReviewPartitionPlan,
+    manifest: &[DiffFileManifest],
+    evidence: &EngineEvidence,
+) -> ReviewCoverage {
+    let tiers = partition
+        .work_units
+        .iter()
+        .flat_map(|unit| unit.files.iter())
+        .filter_map(|file| {
+            RepositoryRelativePath::try_from(file.path.new_path.as_str().to_owned())
+                .ok()
+                .map(|path| (path, file.review_value.tier))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut coverage = ReviewCoverage {
+        policy_version: "revoot.risk-adaptive-coverage/v1",
+        high_risk_files: 0,
+        standard_risk_files: 0,
+        low_risk_files: 0,
+        fully_read_files: 0,
+        sampled_files: 0,
+        manifest_only_files: 0,
+        delivered_high_risk_hunks: 0,
+        required_high_risk_hunks: 0,
+        explicit_deferrals: 0,
+        failed_groups: 0,
+    };
+    let mut required_file_missing = false;
+    for file in manifest {
+        let tier = tiers
+            .get(&file.path)
+            .copied()
+            .unwrap_or(ReviewValueTier::Standard);
+        match tier {
+            ReviewValueTier::High => coverage.high_risk_files += 1,
+            ReviewValueTier::Standard => coverage.standard_risk_files += 1,
+            ReviewValueTier::Low => coverage.low_risk_files += 1,
+        }
+        let delivered = evidence.delivered_diff_pages.get(&file.path);
+        let fully_read = file.hunks.iter().all(|hunk| {
+            delivered
+                .and_then(|hunks| hunks.get(&hunk.hunk_id))
+                .is_some_and(|pages| {
+                    pages.len() == usize::try_from(hunk.pages).unwrap_or(usize::MAX)
+                        && (1..=hunk.pages).all(|page| pages.contains(&page))
+                })
+        });
+        let sampled = delivered.is_some_and(|hunks| hunks.values().any(|pages| !pages.is_empty()))
+            || evidence.inspected_diff_paths.contains(&file.path);
+        if fully_read {
+            coverage.fully_read_files += 1;
+        } else if sampled {
+            coverage.sampled_files += 1;
+        } else {
+            coverage.manifest_only_files += 1;
+        }
+        if tier == ReviewValueTier::High {
+            coverage.required_high_risk_hunks = coverage
+                .required_high_risk_hunks
+                .saturating_add(u32::try_from(file.hunks.len()).unwrap_or(u32::MAX));
+            coverage.delivered_high_risk_hunks = coverage.delivered_high_risk_hunks.saturating_add(
+                u32::try_from(
+                    file.hunks
+                        .iter()
+                        .filter(|hunk| {
+                            delivered
+                                .and_then(|hunks| hunks.get(&hunk.hunk_id))
+                                .is_some_and(|pages| {
+                                    (1..=hunk.pages).all(|page| pages.contains(&page))
+                                })
+                        })
+                        .count(),
+                )
+                .unwrap_or(u32::MAX),
+            );
+            required_file_missing |= !fully_read;
+        } else if tier == ReviewValueTier::Standard {
+            let hazardous_complete = file.hunks.iter().filter(|hunk| hunk.hazardous).all(|hunk| {
+                delivered
+                    .and_then(|hunks| hunks.get(&hunk.hunk_id))
+                    .is_some_and(|pages| (1..=hunk.pages).all(|page| pages.contains(&page)))
+            });
+            required_file_missing |= !sampled || !hazardous_complete;
+        } else if !sampled {
+            coverage.explicit_deferrals = coverage.explicit_deferrals.saturating_add(1);
+        }
+    }
+    coverage.failed_groups = u32::from(required_file_missing);
+    coverage
+}
+
 fn validate_request(request: &ReviewEngineRequest) -> Result<(), ReviewEngineError> {
     request
         .invocation
         .validate()
         .map_err(|_| ReviewEngineError::new(ReviewEngineErrorKind::InvalidRequest))?;
+    request
+        .partition
+        .validate_replay()
+        .map_err(|_| ReviewEngineError::new(ReviewEngineErrorKind::InvalidRequest))?;
+    if request.partition.snapshot != request.invocation.snapshot {
+        return Err(ReviewEngineError::new(
+            ReviewEngineErrorKind::InvalidRequest,
+        ));
+    }
     let (snapshot_base, snapshot_head) = match &request.invocation.snapshot {
         revoot_core::ReviewSnapshotIdentity::GitLab(identity) => (
             &identity.version.diff_version.refs.base_sha,
@@ -873,6 +1159,9 @@ fn validate_request(request: &ReviewEngineRequest) -> Result<(), ReviewEngineErr
         || request.limits.reserved_input_tokens_per_turn == 0
         || request.limits.max_conversation_bytes == 0
         || request.limits.max_tool_result_bytes == 0
+        || request.limits.max_inline_diff_bytes == 0
+        || request.limits.max_inline_diff_bytes > 65_536
+        || !(1..=8).contains(&request.limits.max_parallel_groups)
         || !(1..=100).contains(&request.limits.minimum_confidence_percent)
         || request.anchors.is_empty()
     {
@@ -901,6 +1190,7 @@ fn required_tools() -> [AgentTool; 6] {
     ]
 }
 
+#[allow(clippy::too_many_lines)]
 fn model_tools(history_available: bool, prior_review_available: bool) -> Vec<ModelTool> {
     let mut tools = vec![
         model_tool(
@@ -945,9 +1235,88 @@ fn model_tools(history_available: bool, prior_review_available: bool) -> Vec<Mod
             }),
         ),
         model_tool(
+            "diff_manifest",
+            "List changed files and stable hunk identifiers without returning diff bodies.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {},
+                "required": []
+            }),
+        ),
+        model_tool(
+            "read_diff",
+            "Read exact pages from one or more diff hunks. Batch independent page reads in one call.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "reads": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "path": {"type": "string"},
+                                "hunk_id": {"type": "string"},
+                                "page": {"type": "integer", "minimum": 1}
+                            },
+                            "required": ["path", "hunk_id", "page"]
+                        }
+                    }
+                },
+                "required": ["reads"]
+            }),
+        ),
+        model_tool(
+            "search_diff",
+            "Search exact diff artifacts using a literal or bounded Rust regular expression.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "query": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "kind": {"enum": ["any", "added", "deleted", "context"]},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 500}
+                },
+                "required": ["query", "regex", "case_sensitive", "paths", "kind", "max_results"]
+            }),
+        ),
+        model_tool(
+            "get_rules",
+            "Return the embedded lowest-priority review guidance matching one or more paths.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["paths"]
+            }),
+        ),
+        model_tool(
             "show_diff",
-            "Show the exact changed-file diff and the trusted anchor IDs for its changed lines. Use an exact returned anchor_id for candidate findings.",
-            object_schema(&["path"]),
+            "Compatibility view of a changed-file diff. Prefer diff_manifest, read_diff, and search_diff for bounded exploration.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"]
+            }),
         ),
     ];
     if history_available {
@@ -1130,8 +1499,45 @@ struct SearchArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PathArgs {
+struct EmptyArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadDiffArgs {
+    reads: Vec<ReadDiffPageArgs>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadDiffPageArgs {
     path: String,
+    hunk_id: String,
+    page: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchDiffArgs {
+    query: String,
+    regex: bool,
+    case_sensitive: bool,
+    paths: Vec<String>,
+    kind: String,
+    max_results: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetRulesArgs {
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShowDiffArgs {
+    path: String,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1189,6 +1595,7 @@ fn execute_tool(
     input: Value,
     run: &mut AgentRun,
     toolbox: &RepositoryToolbox,
+    diff_store: &DiffArtifactStore,
     history: Option<&GitHistoryToolbox>,
     prior_review: &PriorReviewContext,
     cancellation: &CancellationToken,
@@ -1225,6 +1632,9 @@ fn execute_tool(
         "read_file" => {
             ensure_allowed(run, AgentTool::ReadFile)?;
             let args: ReadFileArgs = strict_input(input)?;
+            if args.end_line.saturating_sub(args.start_line) >= 500 {
+                return Err(tool_contract());
+            }
             let path = RepositoryRelativePath::try_from(args.path).map_err(|_| tool_contract())?;
             let result = toolbox
                 .read_file(
@@ -1272,32 +1682,167 @@ fn execute_tool(
             }
             serde_json::to_value(result).map_err(|_| internal())?
         }
+        "diff_manifest" => {
+            ensure_allowed(run, AgentTool::ShowDiff)?;
+            let _: EmptyArgs = strict_input(input)?;
+            run.budget_mut()
+                .charge_tool(1, 0, 0, now_millis)
+                .map_err(map_budget_error)?;
+            let paths = toolbox
+                .exact_diffs()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            let result = diff_store.manifest(&paths).map_err(|_| tool_contract())?;
+            serde_json::to_value(result).map_err(|_| internal())?
+        }
+        "read_diff" => {
+            ensure_allowed(run, AgentTool::ShowDiff)?;
+            let args: ReadDiffArgs = strict_input(input)?;
+            if args.reads.is_empty() || args.reads.len() > 32 {
+                return Err(tool_contract());
+            }
+            let mut pages = Vec::with_capacity(args.reads.len());
+            for read in args.reads {
+                let path =
+                    RepositoryRelativePath::try_from(read.path).map_err(|_| tool_contract())?;
+                let page = diff_store
+                    .read_hunk_page(&path, &read.hunk_id, read.page)
+                    .map_err(|_| tool_contract())?;
+                evidence.inspected_diff_paths.insert(path.clone());
+                evidence
+                    .delivered_diff_pages
+                    .entry(path.clone())
+                    .or_default()
+                    .entry(page.hunk_id.clone())
+                    .or_default()
+                    .insert(page.page);
+                let changed_line_anchors = anchors
+                    .iter()
+                    .filter(|(_, anchor)| anchor.path == path)
+                    .map(|(anchor_id, anchor)| {
+                        json!({
+                            "anchor_id": anchor_id,
+                            "position": anchor.position,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                pages.push(json!({
+                    "path": page.path,
+                    "hunk_id": page.hunk_id,
+                    "page": page.page,
+                    "total_pages": page.total_pages,
+                    "content": page.content,
+                    "changed_line_anchors": changed_line_anchors,
+                }));
+            }
+            let returned_bytes = pages.iter().fold(0_u64, |total, page| {
+                total.saturating_add(u64::try_from(page.to_string().len()).unwrap_or(u64::MAX))
+            });
+            run.budget_mut()
+                .charge_tool(
+                    1,
+                    u64::try_from(pages.len()).unwrap_or(u64::MAX),
+                    returned_bytes,
+                    now_millis,
+                )
+                .map_err(map_budget_error)?;
+            json!({"pages": pages})
+        }
+        "search_diff" => {
+            ensure_allowed(run, AgentTool::Search)?;
+            let args: SearchDiffArgs = strict_input(input)?;
+            let paths = args
+                .paths
+                .into_iter()
+                .map(RepositoryRelativePath::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| tool_contract())?;
+            let kind = match args.kind.as_str() {
+                "any" => DiffSearchKind::Any,
+                "added" => DiffSearchKind::Added,
+                "deleted" => DiffSearchKind::Deleted,
+                "context" => DiffSearchKind::Context,
+                _ => return Err(tool_contract()),
+            };
+            let result = diff_store
+                .search(&DiffSearchRequest {
+                    query: args.query,
+                    regex: args.regex,
+                    case_sensitive: args.case_sensitive,
+                    paths,
+                    kind,
+                    max_results: args.max_results,
+                })
+                .map_err(|_| tool_contract())?;
+            let returned_bytes =
+                u64::try_from(serde_json::to_vec(&result).map_err(|_| internal())?.len())
+                    .unwrap_or(u64::MAX);
+            run.budget_mut()
+                .charge_tool(
+                    1,
+                    u64::from(result.scanned_files),
+                    returned_bytes,
+                    now_millis,
+                )
+                .map_err(map_budget_error)?;
+            serde_json::to_value(result).map_err(|_| internal())?
+        }
+        "get_rules" => {
+            ensure_allowed(run, AgentTool::ReadFile)?;
+            let args: GetRulesArgs = strict_input(input)?;
+            if args.paths.is_empty() || args.paths.len() > 32 {
+                return Err(tool_contract());
+            }
+            let mut rules = BTreeMap::new();
+            for path in args.paths {
+                let path = RepositoryRelativePath::try_from(path).map_err(|_| tool_contract())?;
+                let rule = resolve_embedded_rule(path.as_str()).map_err(|_| tool_contract())?;
+                rules.entry(rule.id).or_insert(rule.guidance);
+            }
+            run.budget_mut()
+                .charge_tool(
+                    1,
+                    u64::try_from(rules.len()).unwrap_or(u64::MAX),
+                    rules.values().fold(0_u64, |total, guidance| {
+                        total.saturating_add(u64::try_from(guidance.len()).unwrap_or(u64::MAX))
+                    }),
+                    now_millis,
+                )
+                .map_err(map_budget_error)?;
+            serde_json::to_value(rules).map_err(|_| internal())?
+        }
         "show_diff" => {
             ensure_allowed(run, AgentTool::ShowDiff)?;
-            let args: PathArgs = strict_input(input)?;
+            let args: ShowDiffArgs = strict_input(input)?;
             let path = RepositoryRelativePath::try_from(args.path).map_err(|_| tool_contract())?;
             let result = toolbox
                 .show_diff(&path, run.budget_mut(), cancellation, now_millis)
                 .map_err(map_repository_error)?;
             evidence.inspected_diff_paths.insert(path.clone());
-            let changed_line_anchors = anchors
-                .iter()
-                .filter(|(_, anchor)| {
-                    anchor.path == path
-                        && !matches!(anchor.position, AnchorPosition::Context { .. })
-                })
-                .map(|(anchor_id, anchor)| {
-                    json!({
-                        "anchor_id": anchor_id,
-                        "position": anchor.position,
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "path": result.path,
-                "content": result.content,
-                "changed_line_anchors": changed_line_anchors,
-            })
+            let page = bounded_show_diff_page(
+                &result.path,
+                &result.content,
+                anchors,
+                args.start_line,
+                args.end_line,
+                limits.max_tool_result_bytes,
+            )?;
+            if page.get("truncated").and_then(Value::as_bool) == Some(false) {
+                let file_manifest = diff_store
+                    .manifest(std::slice::from_ref(&path))
+                    .map_err(|_| tool_contract())?
+                    .pop()
+                    .ok_or_else(tool_contract)?;
+                evidence.delivered_diff_pages.insert(
+                    path,
+                    file_manifest
+                        .hunks
+                        .into_iter()
+                        .map(|hunk| (hunk.hunk_id, (1..=hunk.pages).collect()))
+                        .collect(),
+                );
+            }
+            page
         }
         "list_change_commits" => {
             ensure_allowed(run, AgentTool::ListChangeCommits)?;
@@ -1437,6 +1982,165 @@ fn execute_tool(
     encode_tool_result(&value, limits.max_tool_result_bytes)
 }
 
+fn bounded_show_diff_page(
+    path: &RepositoryRelativePath,
+    content: &str,
+    anchors: &BTreeMap<String, ReviewAnchor>,
+    requested_start: Option<u32>,
+    requested_end: Option<u32>,
+    maximum_bytes: u64,
+) -> Result<Value, ReviewEngineError> {
+    let lines = content.split_inclusive('\n').collect::<Vec<_>>();
+    let total_lines = u32::try_from(lines.len()).map_err(|_| tool_contract())?;
+    if total_lines == 0 {
+        return Ok(json!({
+            "path": path,
+            "start_line": 0,
+            "end_line": 0,
+            "total_lines": 0,
+            "next_start_line": null,
+            "truncated": false,
+            "content": "",
+            "changed_line_anchors": [],
+        }));
+    }
+
+    let start = requested_start.unwrap_or(1);
+    let requested_end = requested_end.unwrap_or(total_lines);
+    if start == 0 || start > total_lines || requested_end < start {
+        return Err(tool_contract());
+    }
+    let last = requested_end.min(total_lines);
+    let positions = diff_line_positions(&lines);
+
+    let mut lower = start;
+    let mut upper = last;
+    let first = show_diff_page_value(path, &lines, &positions, anchors, start, start, total_lines);
+    if encoded_len(&first)? > maximum_bytes {
+        return Err(tool_result_too_large());
+    }
+    while lower < upper {
+        let middle = lower + (upper - lower).div_ceil(2);
+        let candidate = show_diff_page_value(
+            path,
+            &lines,
+            &positions,
+            anchors,
+            start,
+            middle,
+            total_lines,
+        );
+        if encoded_len(&candidate)? <= maximum_bytes {
+            lower = middle;
+        } else {
+            upper = middle - 1;
+        }
+    }
+    Ok(show_diff_page_value(
+        path,
+        &lines,
+        &positions,
+        anchors,
+        start,
+        lower,
+        total_lines,
+    ))
+}
+
+fn show_diff_page_value(
+    path: &RepositoryRelativePath,
+    lines: &[&str],
+    positions: &[Option<AnchorPosition>],
+    anchors: &BTreeMap<String, ReviewAnchor>,
+    start: u32,
+    end: u32,
+    total_lines: u32,
+) -> Value {
+    let start_index = usize::try_from(start - 1).unwrap_or(usize::MAX);
+    let end_index = usize::try_from(end).unwrap_or(usize::MAX);
+    let page_positions = positions[start_index..end_index]
+        .iter()
+        .flatten()
+        .filter(|position| !matches!(position, AnchorPosition::Context { .. }))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let changed_line_anchors = anchors
+        .iter()
+        .filter(|(_, anchor)| anchor.path == *path && page_positions.contains(&anchor.position))
+        .map(|(anchor_id, anchor)| {
+            json!({
+                "anchor_id": anchor_id,
+                "position": anchor.position,
+            })
+        })
+        .collect::<Vec<_>>();
+    let content = lines[start_index..end_index].concat();
+    let next_start_line = (end < total_lines).then_some(end + 1);
+    json!({
+        "path": path,
+        "start_line": start,
+        "end_line": end,
+        "total_lines": total_lines,
+        "next_start_line": next_start_line,
+        "truncated": next_start_line.is_some(),
+        "content": content,
+        "changed_line_anchors": changed_line_anchors,
+    })
+}
+
+fn diff_line_positions(lines: &[&str]) -> Vec<Option<AnchorPosition>> {
+    let mut old_line = None;
+    let mut new_line = None;
+    lines
+        .iter()
+        .map(|line| {
+            if let Some((old_start, new_start)) = parse_hunk_starts(line) {
+                old_line = Some(old_start);
+                new_line = Some(new_start);
+                return None;
+            }
+            let (Some(old), Some(new)) = (old_line, new_line) else {
+                return None;
+            };
+            match line.as_bytes().first() {
+                Some(b'+') => {
+                    new_line = Some(new.saturating_add(1));
+                    AnchorPosition::addition(new).ok()
+                }
+                Some(b'-') => {
+                    old_line = Some(old.saturating_add(1));
+                    AnchorPosition::deletion(old).ok()
+                }
+                Some(b' ') => {
+                    old_line = Some(old.saturating_add(1));
+                    new_line = Some(new.saturating_add(1));
+                    AnchorPosition::context(old, new).ok()
+                }
+                Some(b'\\') => None,
+                _ => {
+                    old_line = None;
+                    new_line = None;
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
+    let ranges = line.strip_prefix("@@ -")?;
+    let (old_range, new_and_suffix) = ranges.split_once(" +")?;
+    let (new_range, _) = new_and_suffix.split_once(" @@")?;
+    let old_start = old_range.split(',').next()?.parse().ok()?;
+    let new_start = new_range.split(',').next()?.parse().ok()?;
+    Some((old_start, new_start))
+}
+
+fn encoded_len(value: &Value) -> Result<u64, ReviewEngineError> {
+    let length = serde_json::to_vec(value).map_err(|_| internal())?.len();
+    Ok(u64::try_from(length).unwrap_or(u64::MAX))
+}
+
 fn ensure_allowed(run: &AgentRun, tool: AgentTool) -> Result<(), ReviewEngineError> {
     if run.invocation().allows(tool) {
         Ok(())
@@ -1457,6 +2161,55 @@ fn encode_tool_result(value: &Value, maximum: u64) -> Result<String, ReviewEngin
         ));
     }
     Ok(encoded)
+}
+
+fn tool_result_too_large() -> ReviewEngineError {
+    ReviewEngineError {
+        kind: ReviewEngineErrorKind::ToolContract,
+        provider_kind: None,
+        provider_status: None,
+        budget_dimension: Some(ReviewBudgetDimension::ToolResultBytes),
+    }
+}
+
+fn conversation_budget_low() -> ReviewEngineError {
+    ReviewEngineError {
+        kind: ReviewEngineErrorKind::ToolContract,
+        provider_kind: None,
+        provider_status: None,
+        budget_dimension: Some(ReviewBudgetDimension::ConversationBytes),
+    }
+}
+
+fn available_tool_result_bytes(
+    messages: &[ModelMessage],
+    tools: &[ModelTool],
+    pending_results: &[ModelContent],
+    maximum: u64,
+    preserve_synthesis_headroom: bool,
+) -> Result<u64, ReviewEngineError> {
+    let mut projected_messages = messages.to_vec();
+    if !pending_results.is_empty() {
+        projected_messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: pending_results.to_vec(),
+        });
+    }
+    let occupied = serialized_len(&projected_messages)?.saturating_add(serialized_len(tools)?);
+    let synthesis_reserve = if preserve_synthesis_headroom {
+        MAX_SYNTHESIS_RESERVE_BYTES.min(maximum / 4)
+    } else {
+        0
+    };
+    Ok(maximum
+        .saturating_sub(occupied)
+        .saturating_sub(synthesis_reserve)
+        .saturating_sub(TOOL_RESULT_ENVELOPE_RESERVE_BYTES))
+}
+
+fn serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<u64, ReviewEngineError> {
+    let length = serde_json::to_vec(value).map_err(|_| internal())?.len();
+    Ok(u64::try_from(length).unwrap_or(u64::MAX))
 }
 
 fn enforce_conversation_bound(
@@ -1663,9 +2416,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use revoot_core::{
-        AgentBudgetLimits, GitLabSnapshotIdentity, ModelResponse, ModelUsage,
-        ProviderCancellationReason, ProviderError, ProviderFuture, RepositoryDiff,
-        RepositoryToolLimits,
+        AgentBudgetLimits, AnchorId, ChangedPath, FileChangeKind, GitLabSnapshotIdentity,
+        ModelResponse, ModelUsage, PartitionLimits, ProviderCancellationReason, ProviderError,
+        ProviderFuture, RepositoryDiff, RepositoryPath, RepositoryToolLimits, ReviewFileClass,
+        ReviewFileInput, ReviewObject, ReviewObjectRole, ReviewSelectionPolicy, ReviewValue,
+        ReviewValueReason, build_partition_plan,
     };
 
     use super::*;
@@ -1789,6 +2544,56 @@ mod tests {
         }
     }
 
+    fn partition() -> ReviewPartitionPlan {
+        let repository_path =
+            RepositoryPath::try_from("src/changed.rs".to_owned()).expect("valid path");
+        build_partition_plan(
+            snapshot(),
+            &ReviewSelectionPolicy {
+                version: "selection-v1".to_owned(),
+                included_paths: BTreeSet::new(),
+                included_prefixes: Vec::new(),
+                included_suffixes: Vec::new(),
+                excluded_paths: BTreeSet::new(),
+                excluded_prefixes: Vec::new(),
+                excluded_suffixes: Vec::new(),
+                excluded_basename_prefixes: Vec::new(),
+                include_generated: false,
+                max_file_bytes: 1_000_000,
+            },
+            PartitionLimits {
+                max_files: 10,
+                max_total_bytes: 1_000_000,
+                max_work_units: 10,
+                max_files_per_work_unit: 10,
+                max_bytes_per_work_unit: 1_000_000,
+                max_anchors_per_work_unit: 100,
+            },
+            [ReviewFileInput {
+                path: ChangedPath {
+                    old_path: repository_path.clone(),
+                    new_path: repository_path,
+                    kind: FileChangeKind::Modified,
+                },
+                class: ReviewFileClass::Text,
+                review_value: ReviewValue {
+                    tier: ReviewValueTier::Standard,
+                    score: 100,
+                    reasons: BTreeSet::from([ReviewValueReason::SourceCode]),
+                },
+                objects: vec![ReviewObject {
+                    role: ReviewObjectRole::ExactDiff,
+                    content_sha256: Sha256Digest::of_bytes(b"fixture-diff"),
+                    size_bytes: 140,
+                }],
+                anchor_ids: vec![
+                    AnchorId::try_from(format!("ga1_{}", "1".repeat(64))).expect("valid anchor"),
+                ],
+            }],
+        )
+        .expect("valid partition")
+    }
+
     fn request(
         fixture: &Fixture,
         cancellation: &CancellationToken,
@@ -1806,6 +2611,7 @@ mod tests {
         .expect("fixture toolbox");
         ReviewEngineRequest {
             invocation: invocation(limits),
+            partition: partition(),
             toolbox,
             history: None,
             prior_review: PriorReviewContext::default(),
@@ -1991,6 +2797,17 @@ mod tests {
         let serialized = serde_json::to_value(&report).expect("report serialization");
         assert!(serialized.get("execution").is_none());
         let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(
+            requests.first().map(|request| request.messages.len()),
+            Some(1)
+        );
+        assert!(
+            requests
+                .iter()
+                .skip(1)
+                .all(|request| request.messages.len() <= 3),
+            "rebased turns must not resend the full tool transcript"
+        );
         assert!(requests.iter().any(|request| {
             request.messages.iter().any(|message| {
                 message.content.iter().any(|content| {
@@ -2063,7 +2880,9 @@ mod tests {
         assert!(matches!(
             first.messages[0].content.as_slice(),
             [ModelContent::Text { text }]
-                if text == "Review unit-1 at anchor ga1_fixture.\n\n<change_history state=\"unavailable\" />\n\n<prior_review_discussions state=\"none\" />"
+                if text.starts_with("Review unit-1 at anchor ga1_fixture.\n\n<change_history state=\"unavailable\" />\n\n<prior_review_discussions state=\"none\" />")
+                    && text.contains("<diff_manifest>")
+                    && text.contains("<untrusted_inline_diff>")
         ));
         let tool_names = first
             .tools
@@ -2074,8 +2893,12 @@ mod tests {
             tool_names,
             BTreeSet::from([
                 "list_files",
+                "diff_manifest",
+                "get_rules",
+                "read_diff",
                 "read_file",
                 "search",
+                "search_diff",
                 "show_diff",
                 "submit_candidate_finding",
                 "submit_review_summary",
@@ -2185,11 +3008,15 @@ mod tests {
         assert_eq!(
             names,
             BTreeSet::from([
+                "diff_manifest",
+                "get_rules",
                 "get_existing_revoot_findings",
                 "list_change_commits",
                 "list_files",
+                "read_diff",
                 "read_file",
                 "search",
+                "search_diff",
                 "show_commit_context",
                 "show_diff",
                 "submit_candidate_finding",

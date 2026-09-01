@@ -87,6 +87,7 @@ max_findings = 12
 
 [model_context]
 exclude = ["internal/**", "fixtures/private/**"]
+max_inline_diff_bytes = 16384
 
 [[rules]]
 paths = ["src/payments/**"]
@@ -96,8 +97,9 @@ focus = ["authorization", "idempotency"]
 The [configuration reference](docs/configuration.md) also covers repository
 fields, guidance, budgets, and finding suppressions.
 
-Use `revoot review --help` for command options and `--format json` for
-machine-readable output.
+Use `revoot review --help` for command options, `--format json` for the v3
+machine-readable report, or `--format sarif` for SARIF 2.1.0. Host agents can
+start the read-only stdio integration with `revoot mcp serve`.
 
 ## Running Revoot locally
 
