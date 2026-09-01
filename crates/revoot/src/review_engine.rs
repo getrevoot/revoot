@@ -11,15 +11,19 @@ use revoot_core::{
     AgentBudgetDimension, AgentBudgetError, AgentOmission, AgentOmissionReason,
     AgentProviderTurnError, AgentRun, AgentRunError, AgentTool, AgentTurnPurpose, AnchorPosition,
     CancellationToken, CandidateAdmission, CandidateAdmissionError, CandidateAdmissionHook,
-    CandidateSubmission, CandidateSuppressionReason, DirectProviderErrorKind as ProviderErrorKind,
-    ExecutionFact, ExecutionGraph, ExecutionGraphError, ExecutionGraphLimits, ExecutionGraphPlan,
-    ExecutionGraphSummary, ExecutionGraphUsage, ExecutionNodeContribution, ExecutionNodeId,
-    ExecutionNodeKind, ExecutionNodeSpec, FindingsEnvelope, InventoryCoverage, LineRange,
-    ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRequestReservation,
-    ModelRole, ModelTool, PriorReviewContext, PriorReviewSource, PriorReviewState, ProviderAdapter,
-    RepositoryRelativePath, RepositoryToolError, RepositoryToolbox, ReviewEffort,
-    ReviewGroupingSource, ReviewInvocation, ReviewOutcome, ReviewPartitionPlan, ReviewValueTier,
-    SearchRequest, Sha256Digest, build_review_group_plan,
+    CandidateSubmission, CandidateSuppressionReason, CodeSearchRequest,
+    DirectProviderErrorKind as ProviderErrorKind, ExecutionFact, ExecutionGraph,
+    ExecutionGraphError, ExecutionGraphLimits, ExecutionGraphPlan, ExecutionGraphSummary,
+    ExecutionGraphUsage, ExecutionNodeContribution, ExecutionNodeId, ExecutionNodeKind,
+    ExecutionNodeSpec, FindingsEnvelope, InventoryCoverage, LineRange, ModelContent,
+    ModelFinishReason, ModelMessage, ModelRequest, ModelRequestReservation, ModelRole, ModelTool,
+    PriorReviewContext, PriorReviewSource, PriorReviewState, ProviderAdapter,
+    RepositoryRelativePath, RepositoryToolError, RepositoryToolbox, ReviewBudgetBroker,
+    ReviewBudgetDimension as AggregateReviewBudgetDimension,
+    ReviewBudgetError as AggregateReviewBudgetError,
+    ReviewBudgetLimits as AggregateReviewBudgetLimits, ReviewEffort, ReviewGroupingSource,
+    ReviewInvocation, ReviewModelReservation, ReviewModelUsage, ReviewOutcome, ReviewPartitionPlan,
+    ReviewValueTier, Sha256Digest, build_review_group_plan,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -569,6 +573,22 @@ pub async fn run_review(
         max_parallel_groups: request.limits.max_parallel_groups,
     };
     let started_at = clock.now_millis();
+    let aggregate_budget = ReviewBudgetBroker::new(
+        AggregateReviewBudgetLimits {
+            max_model_requests: request.invocation.limits.max_model_requests,
+            max_model_tokens: request.invocation.limits.max_input_tokens,
+            max_output_tokens: request
+                .invocation
+                .limits
+                .max_output_tokens
+                .min(request.invocation.limits.max_input_tokens),
+            max_tool_calls: request.invocation.limits.max_tool_calls,
+            max_cost_microusd: request.invocation.limits.max_cost_microusd,
+            max_elapsed_millis: request.invocation.limits.max_elapsed_millis,
+        },
+        started_at,
+    )
+    .map_err(map_aggregate_budget_error)?;
     let prepare_node = execution_node_id("prepare")?;
     let investigate_node = execution_node_id("investigate")?;
     let adjudicate_node = execution_node_id("adjudicate")?;
@@ -762,10 +782,30 @@ pub async fn run_review(
         } else {
             AgentTurnPurpose::ContinueInvestigation
         };
+        let aggregate_permit = aggregate_budget
+            .reserve_model_request(
+                ReviewModelReservation {
+                    input_tokens: reservation.input_tokens,
+                    output_tokens: reservation.output_tokens,
+                    cost_microusd: reservation.cost_microusd,
+                },
+                clock.now_millis(),
+            )
+            .map_err(map_aggregate_budget_error)?;
         let response = run
             .complete_provider_turn(adapter, &model_request, purpose, reservation, &now)
             .await
             .map_err(map_provider_turn_error)?;
+        aggregate_permit
+            .commit(
+                Some(ReviewModelUsage {
+                    input_tokens: response.usage.input_tokens,
+                    output_tokens: response.usage.output_tokens,
+                    cost_microusd: reservation.cost_microusd,
+                }),
+                clock.now_millis(),
+            )
+            .map_err(map_aggregate_budget_error)?;
         let finish_reason = response.finish_reason;
         let response_content = response.content;
         let tool_call_count = response_content
@@ -862,6 +902,9 @@ pub async fn run_review(
             if !seen_tool_ids.insert(id.clone()) {
                 return Err(ReviewEngineError::new(ReviewEngineErrorKind::ToolContract));
             }
+            aggregate_budget
+                .charge_tool_calls(1, clock.now_millis())
+                .map_err(map_aggregate_budget_error)?;
             let available_result_bytes = available_tool_result_bytes(
                 &messages,
                 &tools,
@@ -1222,12 +1265,14 @@ fn model_tools(history_available: bool, prior_review_available: bool) -> Vec<Mod
         ),
         model_tool(
             "search",
-            "Search exact text across the policy-approved checkout inventory or an explicit file set.",
+            "Search literal text or a bounded Rust regex across the policy-approved checkout inventory or an explicit file set.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "query": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
                     "paths": {"type": "array", "items": {"type": "string"}},
                     "max_results": {"type": "integer", "minimum": 1}
                 },
@@ -1493,8 +1538,16 @@ struct ReadFileArgs {
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
     query: String,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default = "default_true")]
+    case_sensitive: bool,
     paths: Vec<String>,
     max_results: u32,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -1661,9 +1714,11 @@ fn execute_tool(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| tool_contract())?;
             let result = toolbox
-                .search(
-                    &SearchRequest {
+                .search_code(
+                    &CodeSearchRequest {
                         query: args.query,
+                        regex: args.regex,
+                        case_sensitive: args.case_sensitive,
                         paths,
                         max_results: args.max_results,
                     },
@@ -2301,6 +2356,29 @@ fn map_budget_error(error: AgentBudgetError) -> ReviewEngineError {
         | AgentBudgetError::ModelRequestMismatch => {
             ReviewEngineError::new(ReviewEngineErrorKind::Internal)
         }
+    }
+}
+
+fn map_aggregate_budget_error(error: AggregateReviewBudgetError) -> ReviewEngineError {
+    match error {
+        AggregateReviewBudgetError::Exhausted(dimension) => {
+            ReviewEngineError::budget(match dimension {
+                AggregateReviewBudgetDimension::ModelRequests => {
+                    ReviewBudgetDimension::ModelRequests
+                }
+                AggregateReviewBudgetDimension::ModelTokens => ReviewBudgetDimension::InputTokens,
+                AggregateReviewBudgetDimension::OutputTokens => ReviewBudgetDimension::OutputTokens,
+                AggregateReviewBudgetDimension::ToolCalls => ReviewBudgetDimension::ToolCalls,
+                AggregateReviewBudgetDimension::Cost => ReviewBudgetDimension::Cost,
+                AggregateReviewBudgetDimension::ElapsedTime => ReviewBudgetDimension::ElapsedTime,
+            })
+        }
+        AggregateReviewBudgetError::InvalidLimits(_)
+        | AggregateReviewBudgetError::InvalidReservation => {
+            ReviewEngineError::new(ReviewEngineErrorKind::InvalidRequest)
+        }
+        AggregateReviewBudgetError::ClockRegression
+        | AggregateReviewBudgetError::ReservationNotFound => internal(),
     }
 }
 

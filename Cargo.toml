@@ -21,6 +21,7 @@ revoot-core = { version = "0.2.0", path = "crates/revoot-core" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 httpdate = "1"
 globset = "0.4"
+getrandom = "0.3"
 regex = "1"
 rmcp = { version = "3", default-features = false, features = ["server", "transport-io"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

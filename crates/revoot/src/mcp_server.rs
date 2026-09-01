@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use revoot_core::{
-    AgentBudget, AgentBudgetLimits, CancellationToken, FindingsEnvelope, LineRange,
-    LocalSnapshotIdentity, PartitionLimits, RepositoryRelativePath, RepositoryToolLimits,
-    RepositoryToolbox, ReviewSelectionPolicy, SearchRequest, UnifiedDiffLimits,
+    AgentBudget, AgentBudgetLimits, CancellationToken, CodeSearchRequest, CursorTool,
+    FindingsEnvelope, LineRange, LocalSnapshotIdentity, PartitionLimits, RepositoryRelativePath,
+    RepositoryToolLimits, RepositoryToolbox, ReviewSelectionPolicy, Sha256Digest,
+    ToolCursorBinding, ToolCursorStore, ToolPageRequest, ToolResultLimits, UnifiedDiffLimits,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
@@ -27,6 +28,9 @@ use crate::local_review::{
 use crate::review_rules::resolve_embedded_rule;
 
 static HANDLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MCP_RESULT_BYTES: usize = 32 * 1024;
+const MCP_PAGE_BYTES: u32 = 30 * 1024;
+const MCP_SOURCE_SLICE_BYTES: u64 = 24 * 1024;
 
 struct OpenReview {
     root: PathBuf,
@@ -39,12 +43,29 @@ struct OpenReview {
     snapshot_digest: String,
 }
 
-#[derive(Default)]
 pub struct RevootMcpServer {
     reviews: Mutex<BTreeMap<String, Arc<OpenReview>>>,
+    cursors: ToolCursorStore,
 }
 
 impl RevootMcpServer {
+    fn new() -> Result<Self, &'static str> {
+        let mut secret = [0_u8; 32];
+        getrandom::fill(&mut secret).map_err(|_| "cursor initialization failed")?;
+        let cursors = ToolCursorStore::new(
+            secret,
+            ToolResultLimits {
+                max_result_bytes: MCP_PAGE_BYTES,
+                ..ToolResultLimits::default()
+            },
+        )
+        .map_err(|_| "cursor initialization failed")?;
+        Ok(Self {
+            reviews: Mutex::new(BTreeMap::new()),
+            cursors,
+        })
+    }
+
     fn open_review(&self, arguments: &JsonObject) -> Result<Value, &'static str> {
         let root = match arguments.get("repository_root").and_then(Value::as_str) {
             Some(root) => PathBuf::from(root),
@@ -85,7 +106,10 @@ impl RevootMcpServer {
         let cancellation = CancellationToken::default();
         let toolbox = RepositoryToolbox::open_selected(
             &context.root,
-            RepositoryToolLimits::default(),
+            RepositoryToolLimits {
+                max_read_bytes: MCP_SOURCE_SLICE_BYTES,
+                ..RepositoryToolLimits::default()
+            },
             context.repository_diffs.clone(),
             context.repository_paths.iter().cloned(),
             &cancellation,
@@ -95,8 +119,11 @@ impl RevootMcpServer {
             .exact_diffs()
             .map(|(path, _)| path.clone())
             .collect();
-        let diffs = DiffArtifactStore::create(toolbox.exact_diffs(), DEFAULT_DIFF_PAGE_BYTES)
-            .map_err(|_| "diff artifacts unavailable")?;
+        let diffs = DiffArtifactStore::create(
+            toolbox.exact_diffs(),
+            usize::try_from(MCP_SOURCE_SLICE_BYTES).unwrap_or(DEFAULT_DIFF_PAGE_BYTES),
+        )
+        .map_err(|_| "diff artifacts unavailable")?;
         let root = std::fs::canonicalize(&context.root).map_err(|_| "repository unavailable")?;
         let inferred_base = context.inferred_base.clone();
         let identity = context.identity.clone();
@@ -163,46 +190,66 @@ impl RevootMcpServer {
         }
         let review = self.review(arguments)?;
         match name {
-            "revoot_list_changed_files" => Ok(json!({
-                "snapshot": review.snapshot_digest,
-                "files": review.diffs.manifest(&review.changed_paths).map_err(|_| "manifest unavailable")?
-            })),
+            "revoot_list_changed_files" => {
+                let items = review
+                    .diffs
+                    .manifest(&review.changed_paths)
+                    .map_err(|_| "manifest unavailable")?
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).map_err(|_| "serialization failed"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.paginate(&review, arguments, CursorTool::ListChangedFiles, &items)
+            }
             "revoot_read_diff" => {
-                let path = path_argument(arguments)?;
-                let hunk = string_argument(arguments, "hunk_id")?;
-                let page = u32_argument(arguments, "page")?;
-                serde_json::to_value(
-                    review
-                        .diffs
-                        .read_hunk_page(&path, hunk, page)
-                        .map_err(|_| "diff page unavailable")?,
-                )
-                .map_err(|_| "serialization failed")
+                let items = diff_read_arguments(arguments)?
+                    .into_iter()
+                    .map(|(path, hunk, page)| {
+                        review
+                            .diffs
+                            .read_hunk_page(&path, &hunk, page)
+                            .map_err(|_| "diff page unavailable")
+                            .and_then(|value| {
+                                serde_json::to_value(value).map_err(|_| "serialization failed")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.paginate(&review, arguments, CursorTool::ReadDiff, &items)
             }
             "revoot_read_file" => {
-                let path = path_argument(arguments)?;
-                let start = u32_argument(arguments, "start_line")?;
-                let end = u32_argument(arguments, "end_line")?;
-                if end.saturating_sub(start) >= 500 {
-                    return Err("line range exceeds 500 lines");
-                }
                 let mut budget = local_budget()?;
-                serde_json::to_value(
-                    review
-                        .toolbox
-                        .read_file(
-                            &path,
-                            LineRange { start, end },
-                            &mut budget,
-                            &CancellationToken::default(),
-                            0,
-                        )
-                        .map_err(|_| "file read unavailable")?,
-                )
-                .map_err(|_| "serialization failed")
+                let items = file_read_arguments(arguments)?
+                    .into_iter()
+                    .map(|(path, start, end)| {
+                        review
+                            .toolbox
+                            .read_file(
+                                &path,
+                                LineRange { start, end },
+                                &mut budget,
+                                &CancellationToken::default(),
+                                0,
+                            )
+                            .map_err(|_| "file read unavailable")
+                            .and_then(|value| {
+                                serde_json::to_value(value).map_err(|_| "serialization failed")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.paginate(&review, arguments, CursorTool::ReadFile, &items)
             }
             "revoot_find_files" => {
                 let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+                let glob = arguments
+                    .get("glob")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let glob_matcher = glob
+                    .then(|| {
+                        globset::Glob::new(query)
+                            .map(|pattern| pattern.compile_matcher())
+                            .map_err(|_| "invalid file glob")
+                    })
+                    .transpose()?;
                 let maximum = arguments
                     .get("max_results")
                     .and_then(Value::as_u64)
@@ -213,34 +260,58 @@ impl RevootMcpServer {
                     .inventory()
                     .files
                     .iter()
-                    .filter(|file| file.path.as_str().contains(query))
+                    .filter(|file| {
+                        glob_matcher.as_ref().map_or_else(
+                            || file.path.as_str().contains(query),
+                            |matcher| matcher.is_match(file.path.as_str()),
+                        )
+                    })
                     .take(usize::try_from(maximum).unwrap_or(500))
                     .map(|file| &file.path)
                     .collect::<Vec<_>>();
-                Ok(
-                    json!({"files": files, "truncated": files.len() == usize::try_from(maximum).unwrap_or(500)}),
-                )
+                let items = files
+                    .into_iter()
+                    .map(|path| serde_json::to_value(path).map_err(|_| "serialization failed"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.paginate(&review, arguments, CursorTool::FindFiles, &items)
             }
             "revoot_search_code" => {
                 let query = string_argument(arguments, "query")?.to_owned();
                 let maximum = u32_argument(arguments, "max_results")?.min(500);
                 let mut budget = local_budget()?;
-                serde_json::to_value(
-                    review
-                        .toolbox
-                        .search(
-                            &SearchRequest {
-                                query,
-                                paths: Vec::new(),
-                                max_results: maximum,
-                            },
-                            &mut budget,
-                            &CancellationToken::default(),
-                            0,
-                        )
-                        .map_err(|_| "code search unavailable")?,
-                )
-                .map_err(|_| "serialization failed")
+                let result = review
+                    .toolbox
+                    .search_code(
+                        &CodeSearchRequest {
+                            query,
+                            regex: arguments
+                                .get("regex")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            case_sensitive: arguments
+                                .get("case_sensitive")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true),
+                            paths: path_arguments(arguments, "paths")?,
+                            max_results: maximum,
+                        },
+                        &mut budget,
+                        &CancellationToken::default(),
+                        0,
+                    )
+                    .map_err(|_| "code search unavailable")?;
+                let metadata = json!({
+                    "scanned_files": result.scanned_files,
+                    "skipped_files": result.skipped_files,
+                    "search_truncated": result.truncated,
+                });
+                let items = result
+                    .matches
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).map_err(|_| "serialization failed"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let page = self.paginate(&review, arguments, CursorTool::SearchCode, &items)?;
+                Ok(json!({"metadata": metadata, "page": page}))
             }
             "revoot_search_diff" => {
                 let kind = match arguments
@@ -254,26 +325,34 @@ impl RevootMcpServer {
                     "context" => DiffSearchKind::Context,
                     _ => return Err("invalid diff search kind"),
                 };
-                serde_json::to_value(
-                    review
-                        .diffs
-                        .search(&DiffSearchRequest {
-                            query: string_argument(arguments, "query")?.to_owned(),
-                            regex: arguments
-                                .get("regex")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                            case_sensitive: arguments
-                                .get("case_sensitive")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(true),
-                            paths: Vec::new(),
-                            kind,
-                            max_results: u32_argument(arguments, "max_results")?.min(500),
-                        })
-                        .map_err(|_| "diff search unavailable")?,
-                )
-                .map_err(|_| "serialization failed")
+                let result = review
+                    .diffs
+                    .search(&DiffSearchRequest {
+                        query: string_argument(arguments, "query")?.to_owned(),
+                        regex: arguments
+                            .get("regex")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        case_sensitive: arguments
+                            .get("case_sensitive")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                        paths: path_arguments(arguments, "paths")?,
+                        kind,
+                        max_results: u32_argument(arguments, "max_results")?.min(500),
+                    })
+                    .map_err(|_| "diff search unavailable")?;
+                let metadata = json!({
+                    "scanned_files": result.scanned_files,
+                    "search_truncated": result.truncated,
+                });
+                let items = result
+                    .matches
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).map_err(|_| "serialization failed"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let page = self.paginate(&review, arguments, CursorTool::SearchDiff, &items)?;
+                Ok(json!({"metadata": metadata, "page": page}))
             }
             "revoot_get_rules" => {
                 let path = path_argument(arguments)?;
@@ -298,6 +377,45 @@ impl RevootMcpServer {
             }
             _ => Err("unknown tool"),
         }
+    }
+
+    fn paginate(
+        &self,
+        review: &OpenReview,
+        arguments: &JsonObject,
+        tool: CursorTool,
+        items: &[Value],
+    ) -> Result<Value, &'static str> {
+        let handle = string_argument(arguments, "handle")?;
+        let mut query = arguments.clone();
+        query.remove("handle");
+        query.remove("cursor");
+        query.remove("max_result_bytes");
+        query.remove("max_matches");
+        let query_bytes = serde_json::to_vec(&query).map_err(|_| "cursor unavailable")?;
+        let binding = ToolCursorBinding {
+            handle_digest: Sha256Digest::of_bytes(handle.as_bytes()),
+            snapshot_digest: Sha256Digest::of_bytes(review.snapshot_digest.as_bytes()),
+            tool,
+            query_digest: Sha256Digest::of_bytes(&query_bytes),
+        };
+        let cursor = arguments.get("cursor").and_then(Value::as_str);
+        let request = ToolPageRequest {
+            max_result_bytes: arguments
+                .get("max_result_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok()),
+            max_matches: arguments
+                .get("max_matches")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok()),
+        };
+        serde_json::to_value(
+            self.cursors
+                .paginate(&binding, items, cursor, request)
+                .map_err(|_| "invalid or stale cursor")?,
+        )
+        .map_err(|_| "serialization failed")
     }
 }
 
@@ -324,12 +442,13 @@ impl ServerHandler for RevootMcpServer {
     ) -> Result<CallToolResponse, ErrorData> {
         let arguments = request.arguments.unwrap_or_default();
         let result = match self.execute(request.name.as_ref(), &arguments) {
-            Ok(value) => {
+            Ok(value) if encoded_value_len(&value) <= MCP_RESULT_BYTES => {
                 let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
                 result.structured_content = Some(value);
                 result
             }
+            Ok(_) => CallToolResult::error(vec![ContentBlock::text("tool result exceeds limit")]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         };
         Ok(result.into())
@@ -339,17 +458,43 @@ impl ServerHandler for RevootMcpServer {
 fn tool_definitions() -> Vec<Tool> {
     [
         ("revoot_open_review", "Open an immutable local review snapshot", json!({"repository_root":{"type":["string","null"]},"base":{"type":["string","null"]}})),
-        ("revoot_list_changed_files", "List changed-file and hunk metadata", json!({"handle":{"type":"string"}})),
-        ("revoot_read_diff", "Read one exact diff hunk page", json!({"handle":{"type":"string"},"path":{"type":"string"},"hunk_id":{"type":"string"},"page":{"type":"integer","minimum":1}})),
-        ("revoot_read_file", "Read bounded post-change file lines", json!({"handle":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}})),
-        ("revoot_find_files", "Find tracked allowlisted files", json!({"handle":{"type":"string"},"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":500}})),
-        ("revoot_search_code", "Search allowlisted snapshot code", json!({"handle":{"type":"string"},"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":500}})),
-        ("revoot_search_diff", "Search exact diff artifacts", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"kind":{"enum":["any","added","deleted","context"]},"max_results":{"type":"integer","minimum":1,"maximum":500}})),
+        ("revoot_list_changed_files", "List changed-file and hunk metadata", json!({"handle":{"type":"string"},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
+        ("revoot_read_diff", "Read one or more exact diff hunk pages", json!({"handle":{"type":"string"},"path":{"type":"string"},"hunk_id":{"type":"string"},"page":{"type":"integer","minimum":1},"reads":{"type":"array","maxItems":32,"items":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string"},"hunk_id":{"type":"string"},"page":{"type":"integer","minimum":1}},"required":["path","hunk_id","page"]}},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":32}})),
+        ("revoot_read_file", "Read one or more bounded post-change file ranges", json!({"handle":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"ranges":{"type":"array","maxItems":32,"items":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path","start_line","end_line"]}},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":32}})),
+        ("revoot_find_files", "Find tracked allowlisted files", json!({"handle":{"type":"string"},"query":{"type":"string"},"glob":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
+        ("revoot_search_code", "Search allowlisted snapshot code", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
+        ("revoot_search_diff", "Search exact diff artifacts", json!({"handle":{"type":"string"},"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"},"kind":{"enum":["any","added","deleted","context"]},"paths":{"type":"array","maxItems":32,"items":{"type":"string"}},"max_results":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":["string","null"]},"max_result_bytes":{"type":["integer","null"],"minimum":1,"maximum":32768},"max_matches":{"type":["integer","null"],"minimum":1,"maximum":500}})),
         ("revoot_get_rules", "Get embedded guidance for a path", json!({"handle":{"type":"string"},"path":{"type":"string"}})),
         ("revoot_validate_findings", "Validate findings against issued anchors", json!({"handle":{"type":"string"},"findings":{"type":"object"}})),
     ].into_iter().map(|(name, description, properties)| {
-        let schema = json!({"type":"object","additionalProperties":false,"properties":properties});
-        Tool::new(name, description, Arc::new(schema.as_object().cloned().unwrap_or_default()))
+        let required: &[&str] = match name {
+            "revoot_list_changed_files"
+            | "revoot_read_diff"
+            | "revoot_read_file"
+            | "revoot_find_files" => &["handle"],
+            "revoot_search_code" => &["handle", "query", "max_results"],
+            "revoot_search_diff" => &["handle", "query", "kind", "max_results"],
+            "revoot_get_rules" => &["handle", "path"],
+            "revoot_validate_findings" => &["handle", "findings"],
+            _ => &[],
+        };
+        let mut schema = json!({"type":"object","additionalProperties":false,"properties":properties,"required":required});
+        if name == "revoot_read_diff" {
+            schema["oneOf"] = json!([
+                {"required":["path", "hunk_id", "page"]},
+                {"required":["reads"]}
+            ]);
+        } else if name == "revoot_read_file" {
+            schema["oneOf"] = json!([
+                {"required":["path", "start_line", "end_line"]},
+                {"required":["ranges"]}
+            ]);
+        }
+        Tool::new(
+            name,
+            description,
+            Arc::new(schema.as_object().cloned().unwrap_or_default()),
+        )
     }).collect()
 }
 
@@ -368,9 +513,103 @@ fn u32_argument(arguments: &JsonObject, name: &str) -> Result<u32, &'static str>
         .ok_or("missing integer argument")
 }
 
+fn diff_read_arguments(
+    arguments: &JsonObject,
+) -> Result<Vec<(RepositoryRelativePath, String, u32)>, &'static str> {
+    let Some(reads) = arguments.get("reads") else {
+        return Ok(vec![(
+            path_argument(arguments)?,
+            string_argument(arguments, "hunk_id")?.to_owned(),
+            u32_argument(arguments, "page")?,
+        )]);
+    };
+    if ["path", "hunk_id", "page"]
+        .iter()
+        .any(|name| arguments.contains_key(*name))
+    {
+        return Err("ambiguous diff read arguments");
+    }
+    let reads = reads.as_array().ok_or("invalid diff reads")?;
+    if reads.is_empty() || reads.len() > 32 {
+        return Err("invalid diff read count");
+    }
+    reads
+        .iter()
+        .map(|value| {
+            let item = value.as_object().ok_or("invalid diff read")?;
+            Ok((
+                path_argument(item)?,
+                string_argument(item, "hunk_id")?.to_owned(),
+                u32_argument(item, "page")?,
+            ))
+        })
+        .collect()
+}
+
+fn file_read_arguments(
+    arguments: &JsonObject,
+) -> Result<Vec<(RepositoryRelativePath, u32, u32)>, &'static str> {
+    if arguments.contains_key("ranges")
+        && ["path", "start_line", "end_line"]
+            .iter()
+            .any(|name| arguments.contains_key(*name))
+    {
+        return Err("ambiguous file read arguments");
+    }
+    let values = arguments.get("ranges").map_or_else(
+        || Ok(vec![Value::Object(arguments.clone())]),
+        |ranges| ranges.as_array().cloned().ok_or("invalid file ranges"),
+    )?;
+    if values.is_empty() || values.len() > 32 {
+        return Err("invalid file range count");
+    }
+    values
+        .iter()
+        .map(|value| {
+            let item = value.as_object().ok_or("invalid file range")?;
+            let path = path_argument(item)?;
+            let start = u32_argument(item, "start_line")?;
+            let end = u32_argument(item, "end_line")?;
+            if end < start || end.saturating_sub(start) >= 500 {
+                return Err("line range exceeds 500 lines");
+            }
+            Ok((path, start, end))
+        })
+        .collect()
+}
+
 fn path_argument(arguments: &JsonObject) -> Result<RepositoryRelativePath, &'static str> {
     RepositoryRelativePath::try_from(string_argument(arguments, "path")?.to_owned())
         .map_err(|_| "invalid repository path")
+}
+
+fn path_arguments(
+    arguments: &JsonObject,
+    name: &str,
+) -> Result<Vec<RepositoryRelativePath>, &'static str> {
+    let Some(values) = arguments.get(name) else {
+        return Ok(Vec::new());
+    };
+    let values = values.as_array().ok_or("invalid repository paths")?;
+    if values.len() > 32 {
+        return Err("too many repository paths");
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or("invalid repository path")
+                .and_then(|path| {
+                    RepositoryRelativePath::try_from(path.to_owned())
+                        .map_err(|_| "invalid repository path")
+                })
+        })
+        .collect()
+}
+
+fn encoded_value_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 fn local_budget() -> Result<AgentBudget, &'static str> {
@@ -388,7 +627,7 @@ pub fn serve_stdio(_root: &Path) -> Result<(), &'static str> {
         .build()
         .map_err(|_| "MCP runtime unavailable")?;
     runtime.block_on(async {
-        let service = RevootMcpServer::default()
+        let service = RevootMcpServer::new()?
             .serve(rmcp::transport::stdio())
             .await
             .map_err(|_| "MCP startup failed")?;
@@ -403,9 +642,10 @@ mod tests {
 
     #[test]
     fn exposes_only_the_closed_read_only_surface() {
-        let names = tool_definitions()
-            .into_iter()
-            .map(|tool| tool.name.into_owned())
+        let tools = tool_definitions();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.to_string())
             .collect::<BTreeSet<_>>();
         assert_eq!(names.len(), 9);
         for required in [
@@ -421,5 +661,95 @@ mod tests {
         assert!(names.iter().all(|name| {
             !name.contains("publish") && !name.contains("write") && !name.contains("exec")
         }));
+        for name in [
+            "revoot_list_changed_files",
+            "revoot_read_diff",
+            "revoot_read_file",
+            "revoot_find_files",
+            "revoot_search_code",
+            "revoot_search_diff",
+        ] {
+            let schema = &tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .expect("paginated tool")
+                .input_schema;
+            let properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("tool properties");
+            assert!(properties.contains_key("cursor"));
+            assert_eq!(properties["max_result_bytes"]["maximum"], MCP_RESULT_BYTES);
+        }
+        assert_eq!(
+            tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == "revoot_read_diff")
+                .expect("read diff")
+                .input_schema["properties"]["reads"]["maxItems"],
+            32
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == "revoot_read_file")
+                .expect("read file")
+                .input_schema["properties"]["ranges"]["maxItems"],
+            32
+        );
+    }
+
+    #[test]
+    fn read_tools_accept_bounded_batches_and_reject_broad_ranges() {
+        let diff = json!({
+            "reads": [
+                {"path": "src/lib.rs", "hunk_id": "h1", "page": 1},
+                {"path": "src/main.rs", "hunk_id": "h2", "page": 2}
+            ]
+        });
+        assert_eq!(
+            diff_read_arguments(diff.as_object().expect("diff arguments"))
+                .expect("diff reads")
+                .len(),
+            2
+        );
+        let ambiguous_diff = json!({
+            "path": "src/lib.rs",
+            "hunk_id": "h1",
+            "page": 1,
+            "reads": [{"path": "src/lib.rs", "hunk_id": "h1", "page": 1}]
+        });
+        assert_eq!(
+            diff_read_arguments(ambiguous_diff.as_object().expect("diff arguments")),
+            Err("ambiguous diff read arguments")
+        );
+
+        let files = json!({
+            "ranges": [
+                {"path": "src/lib.rs", "start_line": 1, "end_line": 500},
+                {"path": "src/main.rs", "start_line": 20, "end_line": 25}
+            ]
+        });
+        assert_eq!(
+            file_read_arguments(files.as_object().expect("file arguments"))
+                .expect("file ranges")
+                .len(),
+            2
+        );
+        let broad = json!({"path": "src/lib.rs", "start_line": 1, "end_line": 501});
+        assert_eq!(
+            file_read_arguments(broad.as_object().expect("broad arguments")),
+            Err("line range exceeds 500 lines")
+        );
+        let ambiguous_file = json!({
+            "path": "src/lib.rs",
+            "start_line": 1,
+            "end_line": 2,
+            "ranges": [{"path": "src/lib.rs", "start_line": 1, "end_line": 2}]
+        });
+        assert_eq!(
+            file_read_arguments(ambiguous_file.as_object().expect("file arguments")),
+            Err("ambiguous file read arguments")
+        );
     }
 }

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 gix.workspace = true
+getrandom.workspace = true
 globset.workspace = true
 similar.workspace = true
 libc.workspace = true
