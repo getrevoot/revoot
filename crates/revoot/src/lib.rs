@@ -5,6 +5,7 @@
 pub mod completion;
 pub mod config;
 pub mod credentials;
+pub mod delegate_command;
 pub mod diff_artifact;
 pub mod egress_setup;
 mod embedded_git;
