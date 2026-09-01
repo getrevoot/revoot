@@ -5,16 +5,17 @@
 //! emits prompts, responses, source slices, diff bodies, tool payloads, or
 //! temporary artifact locations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
 use revoot_core::{
-    AgentBudgetUsage, AnchorTable, IssuedWorkUnitAnchors, ReviewEffort, ReviewGroupingSource,
-    ReviewOutcome, ReviewPartitionPlan, ReviewReportCoverage, ReviewReportError,
-    ReviewReportFinding, ReviewReportLineage, ReviewReportLineageDisposition, ReviewReportOverview,
-    ReviewReportPhase, ReviewReportPhaseUsage, ReviewReportPublication, ReviewReportSelection,
-    ReviewReportState, ReviewReportStrategy, ReviewReportUsage, ReviewReportUsageTotals,
-    ReviewReportV3, Sha256Digest, validate_rank_and_render,
+    AgentBudgetUsage, AnchorId, AnchorPosition, AnchorTable, Finding, FindingsEnvelope,
+    IssuedWorkUnitAnchors, ReviewEffort, ReviewGroupingSource, ReviewOutcome, ReviewPartitionPlan,
+    ReviewReportCoverage, ReviewReportError, ReviewReportFinding, ReviewReportFindingCoordinate,
+    ReviewReportFindingSide, ReviewReportLineage, ReviewReportLineageDisposition,
+    ReviewReportOverview, ReviewReportPhase, ReviewReportPhaseUsage, ReviewReportPublication,
+    ReviewReportSelection, ReviewReportState, ReviewReportStrategy, ReviewReportUsage,
+    ReviewReportUsageTotals, ReviewReportV3, Sha256Digest, validate_rank_and_render,
 };
 
 use crate::group_scheduler::GroupScheduleStatus;
@@ -116,23 +117,12 @@ pub fn build_tool_first_report(
     if input.selection != expected_selection {
         return Err(ToolFirstReportError::Selection);
     }
-    let envelopes = outcome_findings(&input.engine.result.outcome).to_vec();
     let issued = issued_anchors(input.partition);
-    let ranked = validate_rank_and_render(envelopes, &issued, input.anchors, MAX_FINDINGS)
-        .map_err(|_| ToolFirstReportError::Findings)?;
-    let findings = ranked
-        .findings
-        .into_iter()
-        .map(|finding| ReviewReportFinding {
-            anchor_id: finding.anchor_id,
-            finding_key: finding.finding_key,
-            content_sha256: finding.content_digest,
-            severity: finding.severity,
-            confidence_percent: finding.confidence_percent,
-            category: finding.category,
-            lineage_id: finding.lineage_id,
-        })
-        .collect();
+    let findings = project_findings(
+        outcome_findings(&input.engine.result.outcome),
+        &issued,
+        input.anchors,
+    )?;
     let overview_text = render_overview(&input.engine.result.overview)?;
     let overview = ReviewReportOverview {
         content_sha256: Sha256Digest::of_bytes(overview_text.as_bytes()),
@@ -184,9 +174,113 @@ pub fn build_tool_first_report(
     .map_err(ToolFirstReportError::Report)?;
     report.validate().map_err(ToolFirstReportError::Report)?;
     report
+        .validate_against_anchors(input.anchors)
+        .map_err(ToolFirstReportError::Report)?;
+    report
         .canonical_json()
         .map_err(ToolFirstReportError::Report)?;
     Ok(report)
+}
+
+type FindingSourceKey = (String, AnchorId, Sha256Digest, Sha256Digest);
+
+fn project_findings(
+    envelopes: &[FindingsEnvelope],
+    issued: &IssuedWorkUnitAnchors,
+    anchors: &AnchorTable,
+) -> Result<Vec<ReviewReportFinding>, ToolFirstReportError> {
+    let ranked = validate_rank_and_render(envelopes.to_vec(), issued, anchors, MAX_FINDINGS)
+        .map_err(|_| ToolFirstReportError::Findings)?;
+    let sources = finding_sources(envelopes, issued, anchors)?;
+    ranked
+        .findings
+        .into_iter()
+        .map(|ranked| {
+            let key = (
+                ranked.work_unit_id.clone(),
+                ranked.anchor_id.clone(),
+                ranked.finding_key.clone(),
+                ranked.content_digest.clone(),
+            );
+            let source = sources.get(&key).ok_or(ToolFirstReportError::Findings)?;
+            let anchor = anchors
+                .resolve(ranked.anchor_id.as_str())
+                .ok_or(ToolFirstReportError::Findings)?;
+            Ok(ReviewReportFinding {
+                work_unit_id: ranked.work_unit_id,
+                anchor_id: ranked.anchor_id,
+                coordinate: report_coordinate(&anchor.path, anchor.position),
+                finding_key: ranked.finding_key,
+                content_sha256: ranked.content_digest,
+                severity: ranked.severity,
+                confidence_percent: ranked.confidence_percent,
+                category: ranked.category,
+                title: source.title.clone(),
+                explanation: source.explanation.clone(),
+                evidence: source.evidence.clone(),
+                suggested_replacement: source.suggested_replacement.clone(),
+                rendered_body: ranked.rendered_body,
+                lineage_id: ranked.lineage_id,
+            })
+        })
+        .collect()
+}
+
+fn finding_sources(
+    envelopes: &[FindingsEnvelope],
+    issued: &IssuedWorkUnitAnchors,
+    anchors: &AnchorTable,
+) -> Result<BTreeMap<FindingSourceKey, Finding>, ToolFirstReportError> {
+    let mut sources = BTreeMap::new();
+    for envelope in envelopes {
+        for finding in &envelope.findings {
+            let singleton = FindingsEnvelope {
+                schema_version: envelope.schema_version.clone(),
+                work_unit_id: envelope.work_unit_id.clone(),
+                findings: vec![finding.clone()],
+                summary: envelope.summary.clone(),
+            };
+            let ranked = validate_rank_and_render([singleton], issued, anchors, 1)
+                .map_err(|_| ToolFirstReportError::Findings)?
+                .findings
+                .into_iter()
+                .next()
+                .ok_or(ToolFirstReportError::Findings)?;
+            let key = (
+                ranked.work_unit_id,
+                ranked.anchor_id,
+                ranked.finding_key,
+                ranked.content_digest,
+            );
+            if sources
+                .insert(key, finding.clone())
+                .is_some_and(|existing| existing != *finding)
+            {
+                return Err(ToolFirstReportError::Findings);
+            }
+        }
+    }
+    Ok(sources)
+}
+
+fn report_coordinate(
+    path: &revoot_core::ChangedPath,
+    position: AnchorPosition,
+) -> ReviewReportFindingCoordinate {
+    match position {
+        AnchorPosition::Deletion { old_line } => ReviewReportFindingCoordinate {
+            path: path.old_path.clone(),
+            side: ReviewReportFindingSide::Old,
+            line: old_line,
+        },
+        AnchorPosition::Addition { new_line } | AnchorPosition::Context { new_line, .. } => {
+            ReviewReportFindingCoordinate {
+                path: path.new_path.clone(),
+                side: ReviewReportFindingSide::New,
+                line: new_line,
+            }
+        }
+    }
 }
 
 fn validate_engine(

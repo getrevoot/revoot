@@ -533,7 +533,7 @@ fn ranked_preference(left: &RankedFinding, right: &RankedFinding) -> Ordering {
         .then_with(|| left.anchor_id.cmp(&right.anchor_id))
 }
 
-fn render_finding(finding: &Finding) -> String {
+pub(crate) fn render_finding(finding: &Finding) -> String {
     let title = render_safe_markdown(&finding.title);
     let explanation = render_safe_markdown(&finding.explanation);
     let evidence = render_safe_markdown(&finding.evidence);

@@ -9,13 +9,15 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AnchorId, FindingCategory, ReviewEffort, ReviewGroupingSource, ReviewOmissionReason, Severity,
+    AnchorId, AnchorPosition, AnchorTable, ChangedPath, Finding, FindingCategory, FindingsEnvelope,
+    RepositoryPath, ReviewEffort, ReviewGroupingSource, ReviewOmissionReason, Severity,
     Sha256Digest,
 };
 
 const MAX_FINDINGS: usize = 25;
 const MAX_OVERVIEW_BYTES: usize = 8 * 1024;
 const MAX_POLICY_VERSION_BYTES: usize = 128;
+const MAX_RENDERED_FINDING_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,17 +30,41 @@ pub enum ReviewReportState {
     Cancelled,
 }
 
-/// Stable reference to one verified finding; prose stays in the existing
-/// findings/publication contract rather than being copied into this report.
+/// Changed side used by an exact report coordinate.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewReportFindingSide {
+    Old,
+    New,
+}
+
+/// Stable repository coordinate resolved from the finding's trusted anchor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewReportFindingCoordinate {
+    pub path: RepositoryPath,
+    pub side: ReviewReportFindingSide,
+    pub line: u32,
+}
+
+/// One verified finding with bounded consumer-facing content.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewReportFinding {
+    pub work_unit_id: String,
     pub anchor_id: AnchorId,
+    pub coordinate: ReviewReportFindingCoordinate,
     pub finding_key: Sha256Digest,
     pub content_sha256: Sha256Digest,
     pub severity: Severity,
     pub confidence_percent: u8,
     pub category: FindingCategory,
+    pub title: String,
+    pub explanation: String,
+    pub evidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_replacement: Option<String>,
+    pub rendered_body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineage_id: Option<Sha256Digest>,
 }
@@ -252,12 +278,38 @@ impl ReviewReportV3 {
         self.validate()?;
         serde_json::to_vec(self).map_err(|_| ReviewReportError::Serialization)
     }
+
+    /// Revalidate snapshot identity and every finding coordinate against the
+    /// trusted anchor table used for publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an anchor-binding failure when the table belongs to another
+    /// snapshot, an anchor is absent, or its exact path/side/line differs.
+    pub fn validate_against_anchors(&self, anchors: &AnchorTable) -> Result<(), ReviewReportError> {
+        self.validate()?;
+        let identity =
+            serde_json::to_vec(anchors.identity()).map_err(|_| ReviewReportError::Serialization)?;
+        if Sha256Digest::of_bytes(&identity) != self.snapshot_sha256 {
+            return Err(ReviewReportError::AnchorBinding);
+        }
+        for finding in &self.findings {
+            let anchor = anchors
+                .resolve(finding.anchor_id.as_str())
+                .ok_or(ReviewReportError::AnchorBinding)?;
+            if finding.coordinate != coordinate_from_anchor(&anchor.path, anchor.position) {
+                return Err(ReviewReportError::AnchorBinding);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReviewReportError {
     SchemaVersion,
     Findings,
+    AnchorBinding,
     Overview,
     Lineage,
     Publication,
@@ -276,6 +328,7 @@ impl fmt::Display for ReviewReportError {
         formatter.write_str(match self {
             Self::SchemaVersion => "the review report schema version is invalid",
             Self::Findings => "the review report findings are invalid",
+            Self::AnchorBinding => "review report finding coordinates do not match trusted anchors",
             Self::Overview => "the review report overview is invalid",
             Self::Lineage => "the review report lineage records are invalid",
             Self::Publication => "the review report publication metadata is invalid",
@@ -307,9 +360,7 @@ fn canonicalize(report: &mut ReviewReportV3) {
 
 fn validate_findings(findings: &[ReviewReportFinding]) -> Result<(), ReviewReportError> {
     if findings.len() > MAX_FINDINGS
-        || findings
-            .iter()
-            .any(|finding| finding.confidence_percent > 100)
+        || findings.iter().any(|finding| !valid_finding(finding))
         || findings.windows(2).any(|pair| {
             (&pair[0].finding_key, &pair[0].anchor_id) >= (&pair[1].finding_key, &pair[1].anchor_id)
         })
@@ -323,6 +374,52 @@ fn validate_findings(findings: &[ReviewReportFinding]) -> Result<(), ReviewRepor
         return Err(ReviewReportError::Findings);
     }
     Ok(())
+}
+
+fn valid_finding(finding: &ReviewReportFinding) -> bool {
+    if finding.coordinate.line == 0 || finding.rendered_body.len() > MAX_RENDERED_FINDING_BYTES {
+        return false;
+    }
+    let source = Finding {
+        anchor_id: finding.anchor_id.as_str().to_owned(),
+        severity: finding.severity,
+        confidence_percent: finding.confidence_percent,
+        category: finding.category,
+        title: finding.title.clone(),
+        explanation: finding.explanation.clone(),
+        evidence: finding.evidence.clone(),
+        lineage_id: finding.lineage_id.clone(),
+        suggested_replacement: finding.suggested_replacement.clone(),
+    };
+    let envelope = FindingsEnvelope {
+        schema_version: FindingsEnvelope::SCHEMA_VERSION.to_owned(),
+        work_unit_id: finding.work_unit_id.clone(),
+        findings: vec![source.clone()],
+        summary: "report finding".to_owned(),
+    };
+    envelope.validate().is_ok()
+        && crate::findings::render_finding(&source) == finding.rendered_body
+        && Sha256Digest::of_bytes(finding.rendered_body.as_bytes()) == finding.content_sha256
+}
+
+fn coordinate_from_anchor(
+    path: &ChangedPath,
+    position: AnchorPosition,
+) -> ReviewReportFindingCoordinate {
+    match position {
+        AnchorPosition::Deletion { old_line } => ReviewReportFindingCoordinate {
+            path: path.old_path.clone(),
+            side: ReviewReportFindingSide::Old,
+            line: old_line,
+        },
+        AnchorPosition::Addition { new_line } | AnchorPosition::Context { new_line, .. } => {
+            ReviewReportFindingCoordinate {
+                path: path.new_path.clone(),
+                side: ReviewReportFindingSide::New,
+                line: new_line,
+            }
+        }
+    }
 }
 
 fn validate_overview(overview: &ReviewReportOverview) -> Result<(), ReviewReportError> {
@@ -547,17 +644,40 @@ mod tests {
 
     fn report() -> ReviewReportV3 {
         let overview_text = "Review completed with one verified finding.".to_owned();
+        let source = Finding {
+            anchor_id: anchor('1').as_str().to_owned(),
+            severity: Severity::High,
+            confidence_percent: 95,
+            category: FindingCategory::Correctness,
+            title: "Incorrect state transition".to_owned(),
+            explanation: "The transition can leave state inconsistent.".to_owned(),
+            evidence: "The changed line performs the transition without a guard.".to_owned(),
+            lineage_id: None,
+            suggested_replacement: Some("guard_transition();".to_owned()),
+        };
+        let rendered_body = crate::findings::render_finding(&source);
         ReviewReportV3::new(
             ReviewReportState::Complete,
             digest('a'),
             digest('b'),
             vec![ReviewReportFinding {
-                anchor_id: anchor('1'),
+                work_unit_id: "work-unit-1".to_owned(),
+                anchor_id: AnchorId::try_from(source.anchor_id.clone()).unwrap(),
+                coordinate: ReviewReportFindingCoordinate {
+                    path: RepositoryPath::try_from("src/lib.rs".to_owned()).unwrap(),
+                    side: ReviewReportFindingSide::New,
+                    line: 10,
+                },
                 finding_key: digest('1'),
-                content_sha256: digest('2'),
-                severity: Severity::High,
-                confidence_percent: 95,
-                category: FindingCategory::Correctness,
+                content_sha256: Sha256Digest::of_bytes(rendered_body.as_bytes()),
+                severity: source.severity,
+                confidence_percent: source.confidence_percent,
+                category: source.category,
+                title: source.title,
+                explanation: source.explanation,
+                evidence: source.evidence,
+                suggested_replacement: source.suggested_replacement,
+                rendered_body,
                 lineage_id: None,
             }],
             ReviewReportOverview {
@@ -628,6 +748,26 @@ mod tests {
         assert_eq!(
             order_tampered.validate(),
             Err(ReviewReportError::PhaseOrder)
+        );
+    }
+
+    #[test]
+    fn finding_content_and_coordinate_tampering_fail_closed() {
+        let mut title_tampered = report();
+        title_tampered.findings[0].title.push_str(" changed");
+        assert_eq!(title_tampered.validate(), Err(ReviewReportError::Findings));
+
+        let mut body_tampered = report();
+        body_tampered.findings[0].rendered_body.push_str("\nextra");
+        body_tampered.findings[0].content_sha256 =
+            Sha256Digest::of_bytes(body_tampered.findings[0].rendered_body.as_bytes());
+        assert_eq!(body_tampered.validate(), Err(ReviewReportError::Findings));
+
+        let mut coordinate_tampered = report();
+        coordinate_tampered.findings[0].coordinate.line = 0;
+        assert_eq!(
+            coordinate_tampered.validate(),
+            Err(ReviewReportError::Findings)
         );
     }
 

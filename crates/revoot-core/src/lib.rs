@@ -194,10 +194,11 @@ pub use review_preview::{
     ReviewPreviewRuleSource, ReviewPreviewStrategy, build_review_preview,
 };
 pub use review_report::{
-    ReviewReportCoverage, ReviewReportError, ReviewReportFinding, ReviewReportLineage,
-    ReviewReportLineageDisposition, ReviewReportOverview, ReviewReportPhase,
-    ReviewReportPhaseUsage, ReviewReportPublication, ReviewReportSelection, ReviewReportState,
-    ReviewReportStrategy, ReviewReportUsage, ReviewReportUsageTotals, ReviewReportV3,
+    ReviewReportCoverage, ReviewReportError, ReviewReportFinding, ReviewReportFindingCoordinate,
+    ReviewReportFindingSide, ReviewReportLineage, ReviewReportLineageDisposition,
+    ReviewReportOverview, ReviewReportPhase, ReviewReportPhaseUsage, ReviewReportPublication,
+    ReviewReportSelection, ReviewReportState, ReviewReportStrategy, ReviewReportUsage,
+    ReviewReportUsageTotals, ReviewReportV3,
 };
 pub use review_tools::{
     ReviewToolAuthority, ReviewToolContract, ReviewToolCoverageEffect, ReviewToolId,
