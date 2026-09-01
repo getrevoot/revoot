@@ -2023,6 +2023,7 @@ name = "revoot-core"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

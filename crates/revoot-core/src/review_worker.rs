@@ -206,6 +206,10 @@ impl ReviewWorkerState {
     }
 
     /// Finish the optional planning phase with a validated checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid checkpoint or a worker outside the planning phase.
     pub fn finish_planning(
         &mut self,
         checkpoint: ReviewWorkerCheckpoint,
@@ -220,6 +224,10 @@ impl ReviewWorkerState {
     }
 
     /// Finish one review round and start a fresh next round or verification.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid checkpoint or a worker outside a review round.
     pub fn finish_round(
         &mut self,
         checkpoint: ReviewWorkerCheckpoint,
@@ -238,6 +246,10 @@ impl ReviewWorkerState {
     }
 
     /// Finish verification after the runtime has enforced coverage and gates.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a worker outside the verification phase.
     pub fn finish_verification(&mut self) -> Result<(), ReviewWorkerError> {
         if self.phase != ReviewWorkerPhase::Verifying {
             return Err(ReviewWorkerError::Transition);
@@ -247,6 +259,10 @@ impl ReviewWorkerState {
     }
 
     /// Mark a nonterminal worker partial after a bounded runtime failure.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a worker that is already complete or partial.
     pub fn mark_partial(&mut self) -> Result<(), ReviewWorkerError> {
         if matches!(
             self.phase,

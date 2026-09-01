@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod delegation;
 pub mod diff;
 pub mod egress;
 pub mod error;
@@ -18,10 +19,16 @@ pub mod partition;
 pub mod provider;
 pub mod publication;
 pub mod repository;
+pub mod review_budget;
 pub mod review_group;
 pub mod review_history;
+pub mod review_preview;
+pub mod review_verification;
 pub mod review_worker;
+pub mod sarif;
+pub mod scan;
 pub mod snapshot;
+pub mod tool_cursor;
 
 pub use config::{
     AssignmentScope, ConfigAssignment, ConfigCandidate, ConfigExplainRecord, ConfigField,
@@ -29,6 +36,11 @@ pub use config::{
     ConfigurationResolution, ConfigurationSchema, ConstraintViolation, EffectiveConfiguration,
     PolicyConstraint, PolicyExplanation, PolicyRule, RequestedConfiguration, ResolvedValue,
     SourceProvenance, ValueConstraint, ValueViolation,
+};
+pub use delegation::{
+    DelegationCanonicalError, DelegationError, DelegationExclusion, DelegationFile,
+    DelegationManifest, DelegationPolicyDigests, DelegationRuleGroup, DelegationRuleGroupInput,
+    build_delegation_manifest,
 };
 pub use diff::{
     DiffSide, ParsedFileDiff, UnifiedDiffError, UnifiedDiffLimits, parse_gitlab_file_diff,
@@ -103,10 +115,16 @@ pub use publication::{
     finding_lineage_id, prepare_review_publication, review_publication_scope_digest,
 };
 pub use repository::{
-    InventoryCoverage, InventoryGapReason, LineRange, ListFilesResult, ReadFileResult,
-    RepositoryDiff, RepositoryFile, RepositoryInventory, RepositoryLimitError, RepositoryPathError,
-    RepositoryRelativePath, RepositoryToolError, RepositoryToolLimits, RepositoryToolbox,
-    SearchMatch, SearchRequest, SearchResult, ShowDiffResult,
+    CodeSearchRequest, InventoryCoverage, InventoryGapReason, LineRange, ListFilesResult,
+    ReadFileResult, RepositoryDiff, RepositoryFile, RepositoryInventory, RepositoryLimitError,
+    RepositoryPathError, RepositoryRelativePath, RepositoryToolError, RepositoryToolLimits,
+    RepositoryToolbox, SearchMatch, SearchRequest, SearchResult, ShowDiffResult,
+};
+pub use review_budget::{
+    ConservativeChargeReason, OutstandingReviewReservations, ReviewBudgetBroker,
+    ReviewBudgetDimension, ReviewBudgetError, ReviewBudgetLimits, ReviewBudgetSnapshot,
+    ReviewBudgetUsage, ReviewBudgetValidationError, ReviewModelPermit, ReviewModelReservation,
+    ReviewModelSettlement, ReviewModelUsage,
 };
 pub use review_group::{
     CoverageError, CoverageRequirement, CoverageRequirementKind, FileCoverageLedger,
@@ -119,9 +137,34 @@ pub use review_history::{
     PriorReviewContext, PriorReviewContextError, PriorReviewDiscussion, PriorReviewReply,
     PriorReviewResolution, PriorReviewSource, PriorReviewState,
 };
+pub use review_preview::{
+    ReviewPreview, ReviewPreviewError, ReviewPreviewFile, ReviewPreviewGroup,
+    ReviewPreviewGroupInput, ReviewPreviewInitialContext, ReviewPreviewOmission, ReviewPreviewRule,
+    ReviewPreviewRuleSource, ReviewPreviewStrategy, build_review_preview,
+};
+pub use review_verification::{
+    AdjudicatedOverview, AdjudicationOutcome, AdjudicationSuppression,
+    AdjudicationSuppressionReason, AdjudicatorResponse, AdjudicatorResponseError,
+    CandidateForVerification, CandidateVerificationError, GloballySuppressedCandidate,
+    PreparedVerificationBatch, PreparedVerificationCandidate, SuppressedVerificationCandidate,
+    VerificationOutcome, VerifiedCandidate, VerifierDecision, VerifierDecisionKind,
+    VerifierResponse, VerifierResponseError, VerifierSuppressionReason, apply_adjudicator_response,
+    apply_verifier_response, prepare_verification_batch,
+};
 pub use review_worker::{
     ReviewGroupMetrics, ReviewRound, ReviewWorkerCheckpoint, ReviewWorkerError, ReviewWorkerPhase,
     ReviewWorkerPlan, ReviewWorkerState,
+};
+pub use sarif::{
+    SarifArtifactLocation, SarifCoverageMetadata, SarifDiffSide, SarifDriver, SarifError,
+    SarifFingerprints, SarifInvocation, SarifLevel, SarifLocation, SarifLog, SarifMessage,
+    SarifPhysicalLocation, SarifRegion, SarifResult, SarifResultProperties, SarifRule, SarifRun,
+    SarifRunMetadata, SarifRunProperties, SarifTool, render_sarif,
+};
+pub use scan::{
+    ScanCanonicalError, ScanChunk, ScanCoverage, ScanFile, ScanFileInput, ScanFileTracking,
+    ScanLimits, ScanOmission, ScanOmissionReason, ScanPlan, ScanPlanError, ScanRequestMetadata,
+    ScanUntrackedPolicy, build_scan_plan,
 };
 pub use snapshot::{
     AnchorId, AnchorPosition, AnchorTable, AnchorTableError, BlobAcquisition, BlobIdentity,
@@ -135,6 +178,10 @@ pub use snapshot::{
     ReviewSnapshotIdentity, Sha256Digest, SnapshotAssessment, SnapshotBinding, SnapshotBlocker,
     SnapshotEvidence, SnapshotReadiness, SnapshotScope, TrustedAnchor, UnrepresentedFileCount,
     bind_latest_snapshot,
+};
+pub use tool_cursor::{
+    CursorTool, ToolCursorBinding, ToolCursorError, ToolCursorStore, ToolPageRequest,
+    ToolResultLimits, ToolResultLimitsError, ToolResultPage,
 };
 
 /// The schema version for machine-readable doctor output.
