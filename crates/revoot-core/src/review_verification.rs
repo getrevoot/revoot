@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     AnchorId, AnchorPosition, AnchorTable, Finding, FindingsEnvelope, FindingsValidationError,
@@ -184,12 +184,54 @@ pub enum VerifierDecisionKind {
 }
 
 /// One verifier decision referencing an existing candidate by opaque ID.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VerifierDecision {
     pub candidate_id: String,
     #[serde(flatten)]
     pub kind: VerifierDecisionKind,
+}
+
+impl<'de> Deserialize<'de> for VerifierDecision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+        enum WireDecision {
+            Accept {
+                candidate_id: String,
+            },
+            Suppress {
+                candidate_id: String,
+                reason: VerifierSuppressionReason,
+            },
+            LowerConfidence {
+                candidate_id: String,
+                confidence_percent: u8,
+            },
+        }
+        Ok(match WireDecision::deserialize(deserializer)? {
+            WireDecision::Accept { candidate_id } => Self {
+                candidate_id,
+                kind: VerifierDecisionKind::Accept,
+            },
+            WireDecision::Suppress {
+                candidate_id,
+                reason,
+            } => Self {
+                candidate_id,
+                kind: VerifierDecisionKind::Suppress { reason },
+            },
+            WireDecision::LowerConfidence {
+                candidate_id,
+                confidence_percent,
+            } => Self {
+                candidate_id,
+                kind: VerifierDecisionKind::LowerConfidence { confidence_percent },
+            },
+        })
+    }
 }
 
 /// Complete verifier output. No finding, anchor, path, or evidence fields are
@@ -337,12 +379,59 @@ pub enum AdjudicationSuppressionReason {
 }
 
 /// One suppressed candidate in a global adjudication response.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AdjudicationSuppression {
     pub candidate_id: String,
     #[serde(flatten)]
     pub reason: AdjudicationSuppressionReason,
+}
+
+impl<'de> Deserialize<'de> for AdjudicationSuppression {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+        enum WireSuppression {
+            Duplicate {
+                candidate_id: String,
+                canonical_candidate_id: String,
+            },
+            Superseded {
+                candidate_id: String,
+            },
+            LowerPriority {
+                candidate_id: String,
+            },
+            Policy {
+                candidate_id: String,
+            },
+        }
+        Ok(match WireSuppression::deserialize(deserializer)? {
+            WireSuppression::Duplicate {
+                candidate_id,
+                canonical_candidate_id,
+            } => Self {
+                candidate_id,
+                reason: AdjudicationSuppressionReason::Duplicate {
+                    canonical_candidate_id,
+                },
+            },
+            WireSuppression::Superseded { candidate_id } => Self {
+                candidate_id,
+                reason: AdjudicationSuppressionReason::Superseded,
+            },
+            WireSuppression::LowerPriority { candidate_id } => Self {
+                candidate_id,
+                reason: AdjudicationSuppressionReason::LowerPriority,
+            },
+            WireSuppression::Policy { candidate_id } => Self {
+                candidate_id,
+                reason: AdjudicationSuppressionReason::Policy,
+            },
+        })
+    }
 }
 
 /// Structured overview authored from verified candidates and aggregate state.
@@ -904,5 +993,41 @@ mod tests {
             "findings": []
         }));
         assert!(adjudicator.is_err());
+    }
+
+    #[test]
+    fn model_decision_schemas_round_trip_valid_strict_outputs() {
+        let verifier = VerifierResponse {
+            schema_version: VerifierResponse::SCHEMA_VERSION.to_owned(),
+            decisions: vec![VerifierDecision {
+                candidate_id: "candidate-1".to_owned(),
+                kind: VerifierDecisionKind::Suppress {
+                    reason: VerifierSuppressionReason::Policy,
+                },
+            }],
+        };
+        let verifier_json = serde_json::to_vec(&verifier).expect("verifier JSON");
+        assert_eq!(
+            serde_json::from_slice::<VerifierResponse>(&verifier_json).expect("verifier response"),
+            verifier
+        );
+
+        let adjudicator = AdjudicatorResponse {
+            schema_version: AdjudicatorResponse::SCHEMA_VERSION.to_owned(),
+            publish: vec!["candidate-1".to_owned()],
+            suppress: vec![AdjudicationSuppression {
+                candidate_id: "candidate-2".to_owned(),
+                reason: AdjudicationSuppressionReason::Duplicate {
+                    canonical_candidate_id: "candidate-1".to_owned(),
+                },
+            }],
+            overview: overview(),
+        };
+        let adjudicator_json = serde_json::to_vec(&adjudicator).expect("adjudicator JSON");
+        assert_eq!(
+            serde_json::from_slice::<AdjudicatorResponse>(&adjudicator_json)
+                .expect("adjudicator response"),
+            adjudicator
+        );
     }
 }

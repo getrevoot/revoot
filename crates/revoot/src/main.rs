@@ -90,6 +90,26 @@ fn run() -> Result<i32, Diagnostic> {
                 )
             })?,
         ),
+        "rules" => revoot::rules_command::run(
+            args,
+            env::vars_os(),
+            &env::current_dir().map_err(|_| {
+                Diagnostic::new(
+                    ErrorCode::RepositoryUnavailable,
+                    "current directory is unavailable",
+                )
+            })?,
+        ),
+        "scan" => revoot::scan_command::run(
+            args,
+            env::vars_os(),
+            &env::current_dir().map_err(|_| {
+                Diagnostic::new(
+                    ErrorCode::RepositoryUnavailable,
+                    "current directory is unavailable",
+                )
+            })?,
+        ),
         "mcp" => {
             let Some(subcommand) = args.next() else {
                 return Err(Diagnostic::new(
@@ -314,7 +334,7 @@ fn run_doctor(args: &DoctorArgs) -> Result<i32, Diagnostic> {
 
 fn print_help() {
     println!(
-        "revoot — independent review for agent-written code\n\nUSAGE:\n  revoot review [OPTIONS]\n  revoot delegate preview\n  revoot delegate rule <path...>\n  revoot mcp serve\n  revoot config explain [OPTIONS]\n  revoot init gitlab [OPTIONS]\n  revoot init github [OPTIONS]\n  revoot doctor [--json]\n  revoot completions bash|zsh|fish\n  revoot version"
+        "revoot — independent review for agent-written code\n\nUSAGE:\n  revoot review [OPTIONS]\n  revoot scan [--path PATH]... [--include-untracked] [--preview] [--format human|json|sarif]\n  revoot delegate preview\n  revoot delegate rule <path...>\n  revoot rules check <path...> [--json]\n  revoot mcp serve\n  revoot config explain [OPTIONS]\n  revoot init gitlab [OPTIONS]\n  revoot init github [OPTIONS]\n  revoot doctor [--json]\n  revoot completions bash|zsh|fish\n  revoot version"
     );
 }
 
