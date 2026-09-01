@@ -41,6 +41,7 @@ pub mod review_grouper;
 pub mod review_overview;
 pub mod review_preparation;
 pub mod review_result_reducer;
+pub mod review_rule_bundle;
 pub mod review_rules;
 pub mod review_strategy_config;
 pub mod review_verifier;
