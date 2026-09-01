@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 use revoot_core::review_packet::{
     ReviewPacket, ReviewPacketComposer, ReviewPacketComposition, ReviewPacketDiffContext,
@@ -13,14 +14,14 @@ use revoot_core::review_packet::{
     ReviewPacketRecentExchange, ReviewPacketToolCall, ReviewPacketToolResult,
 };
 use revoot_core::{
-    AgentBudget, AgentBudgetLimits, AnchorId, AnchorTable, CancellationToken,
+    AgentBudget, AgentBudgetLimits, AgentBudgetUsage, AnchorId, AnchorTable, CancellationToken,
     CandidateForVerification, CodeSearchRequest, CompleteGroupRejection, CoverageCompletionGate,
-    GroupCompletion, GroupPartialCause, LineRange, ModelContent, ModelFinishReason, ModelMessage,
-    ModelRequest, ModelRole, ModelTool, PreparedVerificationBatch, PriorReviewContext,
-    ProviderAdapter, RepositoryPath, RepositoryRelativePath, RepositoryToolbox, ReviewBudgetBroker,
-    ReviewModelReservation, ReviewModelUsage, ReviewWorkerCheckpoint, ReviewWorkerError,
-    ReviewWorkerPhase, ReviewWorkerPlan, ReviewWorkerState, Sha256Digest, UnreadHunkDisposition,
-    prepare_verification_batch,
+    GroupCompletion, GroupCoverageLedger, GroupPartialCause, LineRange, ModelContent,
+    ModelFinishReason, ModelMessage, ModelRequest, ModelRole, ModelTool, PreparedVerificationBatch,
+    PriorReviewContext, ProviderAdapter, RepositoryPath, RepositoryRelativePath, RepositoryToolbox,
+    ReviewBudgetBroker, ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
+    ReviewWorkerCheckpoint, ReviewWorkerError, ReviewWorkerPhase, ReviewWorkerPlan,
+    ReviewWorkerState, Sha256Digest, UnreadHunkDisposition, WorkUnitId, prepare_verification_batch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -80,12 +81,12 @@ pub struct GroupWorkerRequest {
     /// Trusted candidate-target path to originating partition work-unit ID.
     /// Both old-side deletion targets and new-side addition/context targets
     /// are represented when the group spans multiple work units.
-    pub work_unit_ids_by_path: BTreeMap<RepositoryPath, String>,
+    pub work_unit_ids_by_path: BTreeMap<RepositoryPath, WorkUnitId>,
     pub assigned_paths: BTreeSet<RepositoryRelativePath>,
     pub issued_anchors: BTreeSet<AnchorId>,
     pub anchor_table: AnchorTable,
     pub coverage_gate: CoverageCompletionGate,
-    pub history: Option<GitHistoryToolbox>,
+    pub history: Option<Arc<GitHistoryToolbox>>,
     pub prior_review: PriorReviewContext,
     pub limits: GroupWorkerLimits,
 }
@@ -180,6 +181,8 @@ pub struct GroupWorkerOutput {
     pub evidence: Vec<GroupWorkerEvidence>,
     pub summary: GroupWorkerSummary,
     pub status: GroupWorkerStatus,
+    pub coverage: GroupCoverageLedger,
+    pub usage: AgentBudgetUsage,
     pub provider_turns: u32,
     pub tool_calls: u32,
 }
@@ -192,6 +195,8 @@ impl fmt::Debug for GroupWorkerOutput {
             .field("evidence_count", &self.evidence.len())
             .field("summary", &self.summary)
             .field("status", &self.status)
+            .field("coverage", &self.coverage)
+            .field("usage", &self.usage)
             .field("provider_turns", &self.provider_turns)
             .field("tool_calls", &self.tool_calls)
             .finish()
@@ -218,7 +223,7 @@ struct WorkerRuntime<'a> {
     assigned_provider_paths: BTreeSet<RepositoryPath>,
     issued_anchors: &'a BTreeSet<AnchorId>,
     anchor_table: &'a AnchorTable,
-    work_unit_ids_by_path: &'a BTreeMap<RepositoryPath, String>,
+    work_unit_ids_by_path: &'a BTreeMap<RepositoryPath, WorkUnitId>,
     candidate_target_paths: BTreeSet<RepositoryPath>,
     cancellation: &'a CancellationToken,
     clock: &'a dyn GroupWorkerClock,
@@ -227,6 +232,9 @@ struct WorkerRuntime<'a> {
     prior_review_cursor: usize,
     local_budget: AgentBudget,
     coverage_gate: Option<CoverageCompletionGate>,
+    final_coverage: Option<GroupCoverageLedger>,
+    provider_usage: AgentBudgetUsage,
+    started_at_millis: u64,
     candidates: Vec<CandidateForVerification>,
     delivered_evidence_ids: BTreeSet<String>,
     evidence: Vec<GroupWorkerEvidence>,
@@ -290,11 +298,14 @@ pub async fn run_group_worker(
         candidate_target_paths,
         cancellation,
         clock,
-        history: request.history.as_ref(),
+        history: request.history.as_deref(),
         prior_review: &request.prior_review,
         prior_review_cursor: 0,
         local_budget,
         coverage_gate: Some(request.coverage_gate),
+        final_coverage: None,
+        provider_usage: AgentBudgetUsage::default(),
+        started_at_millis: started_at,
         candidates: Vec::new(),
         delivered_evidence_ids: BTreeSet::new(),
         evidence: Vec::new(),
@@ -382,8 +393,12 @@ pub async fn run_group_worker(
         else {
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Budget);
         };
+        runtime.provider_usage.turns = runtime.provider_usage.turns.saturating_add(1);
+        runtime.provider_usage.model_requests =
+            runtime.provider_usage.model_requests.saturating_add(1);
         let Ok(response) = adapter.complete(&model_request, cancellation).await else {
             drop(permit);
+            record_provider_usage(&mut runtime, reservation);
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Provider);
         };
         let reported = (response.usage.input_tokens != 0 || response.usage.output_tokens != 0)
@@ -392,9 +407,12 @@ pub async fn run_group_worker(
                 output_tokens: response.usage.output_tokens,
                 cost_microusd: request.limits.reserved_cost_microusd,
             });
-        if permit.commit(reported, clock.now_millis()).is_err() {
+        let settlement = permit.commit(reported, clock.now_millis());
+        let Ok(settlement) = settlement else {
+            record_provider_usage(&mut runtime, reservation);
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Budget);
-        }
+        };
+        record_provider_settlement(&mut runtime, settlement);
         let Ok(tool_calls) = validate_provider_response(&response, &request.model) else {
             return partial_output(
                 &mut state,
@@ -566,15 +584,19 @@ fn validate_request(
             | revoot_core::AnchorPosition::Context { .. } => anchor.path.new_path.clone(),
         });
     }
-    if candidate_targets.iter().any(|path| {
+    let allowed_binding_paths = assigned_provider_paths
+        .union(&candidate_targets)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if allowed_binding_paths.iter().any(|path| {
         request
             .work_unit_ids_by_path
             .get(path)
-            .is_none_or(|id| !valid_work_unit_id(id))
+            .is_none_or(|id| !valid_work_unit_id(id.as_str()))
     }) || request
         .work_unit_ids_by_path
         .iter()
-        .any(|(path, id)| !candidate_targets.contains(path) || !valid_work_unit_id(id))
+        .any(|(path, id)| !allowed_binding_paths.contains(path) || !valid_work_unit_id(id.as_str()))
     {
         return Err(GroupWorkerError::GroupBinding);
     }
@@ -1493,12 +1515,12 @@ fn execute_candidate(
         .work_unit_ids_by_path
         .get(&target_path)
         .ok_or_else(|| recoverable("candidate"))?;
-    if args.candidate.work_unit_id != *expected_work_unit_id {
+    if args.candidate.work_unit_id != expected_work_unit_id.as_str() {
         return Err(recoverable("candidate"));
     }
     prepare_verification_batch(
         [args.candidate.clone()],
-        expected_work_unit_id,
+        expected_work_unit_id.as_str(),
         &runtime.candidate_target_paths,
         runtime.issued_anchors,
         &runtime.delivered_evidence_ids,
@@ -1550,6 +1572,12 @@ fn execute_complete(
     state
         .finish_round(args.checkpoint.clone())
         .map_err(|_| recoverable("transition"))?;
+    let completion = runtime
+        .coverage_gate
+        .as_ref()
+        .map(|gate| gate.ledger().clone())
+        .ok_or_else(|| recoverable("coverage"))?;
+    runtime.final_coverage = Some(completion);
     let completion = runtime
         .coverage_gate
         .take()
@@ -1721,7 +1749,7 @@ fn prepare_candidates(
             .ok_or(GroupWorkerError::Candidate)?;
         let mut one = prepare_verification_batch(
             [candidate.clone()],
-            expected_work_unit_id,
+            expected_work_unit_id.as_str(),
             &runtime.candidate_target_paths,
             runtime.issued_anchors,
             &runtime.delivered_evidence_ids,
@@ -1748,6 +1776,8 @@ fn complete_output(
             .clone()
             .unwrap_or_else(GroupWorkerSummary::partial),
         status: GroupWorkerStatus::Complete(completion),
+        coverage: output_coverage(runtime)?,
+        usage: output_usage(runtime),
         provider_turns: state.provider_turns(),
         tool_calls: runtime.tool_calls,
     })
@@ -1772,9 +1802,73 @@ fn partial_output(
             .clone()
             .unwrap_or_else(GroupWorkerSummary::partial),
         status: GroupWorkerStatus::Partial(reason),
+        coverage: output_coverage(runtime)?,
+        usage: output_usage(runtime),
         provider_turns: state.provider_turns(),
         tool_calls: runtime.tool_calls,
     })
+}
+
+fn record_provider_settlement(runtime: &mut WorkerRuntime<'_>, settlement: ReviewModelSettlement) {
+    let usage = match settlement {
+        ReviewModelSettlement::Reported(usage)
+        | ReviewModelSettlement::Conservative { charged: usage, .. } => usage,
+    };
+    record_provider_usage(
+        runtime,
+        ReviewModelReservation {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cost_microusd: usage.cost_microusd,
+        },
+    );
+}
+
+fn record_provider_usage(runtime: &mut WorkerRuntime<'_>, usage: ReviewModelReservation) {
+    runtime.provider_usage.input_tokens = runtime
+        .provider_usage
+        .input_tokens
+        .saturating_add(usage.input_tokens);
+    runtime.provider_usage.output_tokens = runtime
+        .provider_usage
+        .output_tokens
+        .saturating_add(usage.output_tokens);
+    runtime.provider_usage.cost_microusd = runtime
+        .provider_usage
+        .cost_microusd
+        .saturating_add(usage.cost_microusd);
+}
+
+fn output_coverage(runtime: &WorkerRuntime<'_>) -> Result<GroupCoverageLedger, GroupWorkerError> {
+    runtime
+        .final_coverage
+        .clone()
+        .or_else(|| {
+            runtime
+                .coverage_gate
+                .as_ref()
+                .map(|gate| gate.ledger().clone())
+        })
+        .ok_or(GroupWorkerError::CoverageBinding)
+}
+
+fn output_usage(runtime: &WorkerRuntime<'_>) -> AgentBudgetUsage {
+    let local = runtime.local_budget.usage();
+    AgentBudgetUsage {
+        turns: runtime.provider_usage.turns,
+        model_requests: runtime.provider_usage.model_requests,
+        tool_calls: runtime.tool_calls,
+        repository_files: local.repository_files,
+        repository_bytes: local.repository_bytes,
+        input_tokens: runtime.provider_usage.input_tokens,
+        output_tokens: runtime.provider_usage.output_tokens,
+        cost_microusd: runtime.provider_usage.cost_microusd,
+        candidate_findings: u32::try_from(runtime.candidates.len()).unwrap_or(u32::MAX),
+        elapsed_millis: runtime
+            .clock
+            .now_millis()
+            .saturating_sub(runtime.started_at_millis),
+    }
 }
 
 #[cfg(test)]
@@ -1938,6 +2032,7 @@ mod tests {
             .pop()
             .expect("file manifest");
         let group = group(tier);
+        let trusted_work_unit_id = group.files[0].work_unit_id.clone();
         let metrics = ReviewGroupMetrics {
             changed_lines_by_path: BTreeMap::from([(provider_path(), changed_lines)]),
         };
@@ -2012,7 +2107,7 @@ mod tests {
             system_policy: "Use bounded tools and complete the assigned review group.".to_owned(),
             plan,
             initial_packet,
-            work_unit_ids_by_path: BTreeMap::new(),
+            work_unit_ids_by_path: BTreeMap::from([(provider_path(), trusted_work_unit_id)]),
             assigned_paths: BTreeSet::from([path]),
             issued_anchors: BTreeSet::new(),
             anchor_table: anchors,
@@ -2131,6 +2226,12 @@ mod tests {
         assert_eq!(output.provider_turns, 1);
         assert_eq!(output.tool_calls, 2);
         assert_eq!(output.evidence.len(), 1);
+        assert_eq!(output.coverage.files.len(), 1);
+        assert_eq!(output.usage.model_requests, 1);
+        assert_eq!(output.usage.tool_calls, 2);
+        assert!(output.usage.repository_files >= 1);
+        assert!(output.usage.input_tokens > 0);
+        assert_eq!(output.usage.output_tokens, 4_096);
         assert_eq!(provider.calls(), 1);
     }
 

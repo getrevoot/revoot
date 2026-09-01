@@ -235,6 +235,20 @@ impl ReviewBudgetBroker {
         }
     }
 
+    /// Check whether the aggregate deadline still permits new dispatch.
+    ///
+    /// This observation is redaction-safe and does not consume request, token,
+    /// tool, output, or cost capacity. It uses the same monotonic-clock and
+    /// deadline validation as an atomic reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when time regresses or the aggregate deadline passed.
+    pub fn ensure_dispatch_deadline(&self, now_millis: u64) -> Result<(), ReviewBudgetError> {
+        let mut state = lock_state(&self.inner);
+        observe_for_dispatch(&self.inner, &mut state, now_millis)
+    }
+
     /// Atomically reserve request, token, output, cost, and deadline capacity.
     ///
     /// The returned permit conservatively settles itself if dropped before an

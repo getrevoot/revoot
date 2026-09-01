@@ -34,6 +34,7 @@ pub mod review_adjudicator;
 pub mod review_checkpoint;
 pub mod review_command;
 pub mod review_engine;
+pub mod review_group_execution;
 pub mod review_group_inputs;
 pub mod review_group_packet;
 pub mod review_grouper;
