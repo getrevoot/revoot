@@ -48,3 +48,4 @@ pub mod review_verifier;
 pub mod rule_diagnostics;
 pub mod rules_command;
 pub mod scan_command;
+pub mod tool_first_engine;
