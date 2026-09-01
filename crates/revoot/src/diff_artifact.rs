@@ -447,7 +447,7 @@ impl DiffArtifactStore {
     }
 
     #[cfg(test)]
-    fn directory_path(&self) -> &Path {
+    pub(crate) fn directory_path(&self) -> &Path {
         self.directory.path()
     }
 }
