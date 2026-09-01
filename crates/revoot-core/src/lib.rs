@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adjudication_fallback;
 pub mod agent;
 pub mod agent_manifest;
 pub mod concurrency_trace;
@@ -42,6 +43,9 @@ pub mod token_efficiency;
 pub mod tool_cursor;
 pub mod worker_transcript;
 
+pub use adjudication_fallback::{
+    AdjudicationFallbackCoverage, AdjudicationFallbackError, deterministic_adjudication_fallback,
+};
 pub use agent_manifest::{
     AgentAuthorityState, AgentCliWorkflow, AgentCliWorkflowId, AgentIntegrationAuthority,
     AgentIntegrationManifest, AgentManifestError, AgentMcpAccess, AgentMcpSurface, AgentMcpTool,
