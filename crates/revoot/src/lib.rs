@@ -22,6 +22,7 @@ pub mod gitlab_publication;
 pub mod gitlab_review_context;
 pub mod gitlab_snapshot;
 pub mod gitlab_transport;
+pub mod group_runtime;
 pub mod group_scheduler;
 pub mod grouping;
 pub mod local_review;
