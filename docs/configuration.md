@@ -92,15 +92,18 @@ backoff with jitter, a 30-second per-delay cap, and a 60-second total retry
 budget. The request and review deadlines still dominate that budget. Valid
 `Retry-After` delay-seconds and HTTP-date values take precedence but are capped;
 missing, malformed, duplicated, or past values fall back to the bounded
-schedule. Transient connection-establishment failures, HTTP 408, HTTP 429, and
-selected 5xx responses are eligible. Authentication, authorization, malformed
-requests, protocol failures, and recognized permanent quota or billing 429s
-stop immediately.
+schedule. Connection-establishment failures that prove the provider did not
+accept the request and transient HTTP 429 responses are eligible.
+Authentication, authorization, malformed requests, protocol failures, and
+recognized permanent quota or billing 429s stop immediately. Received HTTP 408
+and 5xx responses are also terminal because the model request may already have
+been accepted and charged.
 
-Once a provider has started a successful response, an interruption is not
-replayed: provider acceptance and resulting usage may be ambiguous, so an
-automatic retry could duplicate model cost. The payload-free terminal
-diagnostic reports that ambiguity without retaining response content.
+Once provider acceptance is ambiguous—including a received 408 or 5xx
+response, a request timeout after connection, or an interrupted successful
+response—the request is not replayed because an automatic retry could duplicate
+model cost. The payload-free terminal diagnostic reports that ambiguity without
+retaining response content.
 
 GitHub and standalone GitLab reads use the same four-attempt, 60-second policy.
 GitLab snapshot and publication controllers retain their tighter local delays

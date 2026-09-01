@@ -15,7 +15,7 @@ use revoot_core::{AllowedProviderEgress, CertificateAuthorityMode, EgressRouteKi
 use rustls::{ClientConfig, RootCertStore};
 use tokio::time::{Instant, sleep, timeout_at};
 
-use crate::retry::{RetryJitter, RetryPolicy, retry_after, retryable_server_status};
+use crate::retry::{RetryJitter, RetryPolicy, retry_after};
 
 pub mod anthropic;
 pub mod openai;
@@ -506,15 +506,17 @@ fn classify_status(status: StatusCode, permanent_quota: bool) -> ProviderError {
     let (kind, retryable) = match code {
         401 => (ProviderErrorKind::Authentication, false),
         403 => (ProviderErrorKind::PermissionDenied, false),
-        408 => (ProviderErrorKind::Timeout, true),
+        408 => (ProviderErrorKind::Timeout, false),
         429 => (ProviderErrorKind::RateLimited, !permanent_quota),
-        500..=599 => (
-            ProviderErrorKind::Unavailable,
-            retryable_server_status(code),
-        ),
+        500..=599 => (ProviderErrorKind::Unavailable, false),
         _ => (ProviderErrorKind::InvalidRequest, false),
     };
-    ProviderError::new(kind, Some(code), retryable)
+    let error = ProviderError::new(kind, Some(code), retryable);
+    if code == 408 || (500..=599).contains(&code) {
+        error.with_cost_ambiguous()
+    } else {
+        error
+    }
 }
 
 fn permanent_quota_error(body: &[u8]) -> bool {
@@ -631,6 +633,12 @@ mod tests {
         assert_eq!(error.kind(), ProviderErrorKind::RateLimited);
         assert!(error.retryable());
         assert_eq!(error.status_code(), Some(429));
+        let timeout = classify_status(StatusCode::REQUEST_TIMEOUT, false);
+        assert!(!timeout.retryable());
+        assert!(timeout.cost_ambiguous());
+        let unavailable = classify_status(StatusCode::SERVICE_UNAVAILABLE, false);
+        assert!(!unavailable.retryable());
+        assert!(unavailable.cost_ambiguous());
         assert!(!classify_status(StatusCode::NOT_IMPLEMENTED, false).retryable());
     }
 
@@ -663,13 +671,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retries_429_and_503_then_succeeds_with_one_budget() {
+    async fn retries_transient_429_then_succeeds_with_one_budget() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for (status, extra) in [
                 ("429 Too Many Requests", "Retry-After: 0\r\n"),
-                ("503 Service Unavailable", ""),
+                ("429 Too Many Requests", ""),
                 ("200 OK", ""),
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -691,26 +699,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retries_408_then_succeeds() {
+    async fn received_408_is_cost_ambiguous_and_not_retried() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for status in ["408 Request Timeout", "200 OK"] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                read_request(&mut stream).await;
-                write_response(&mut stream, status, "", b"{}").await;
-            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "408 Request Timeout", "", b"{}").await;
         });
         let http = DirectHttp::new_for_loopback("fixture", address, test_limits());
-        assert!(
-            http.post_json(
+        let result = http
+            .post_json(
                 HeaderMap::new(),
                 b"{}".to_vec(),
-                &CancellationToken::default()
+                &CancellationToken::default(),
             )
-            .await
-            .is_ok()
-        );
+            .await;
+        let Err(error) = result else {
+            panic!("408 response must be terminal")
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::Timeout);
+        assert!(!error.retryable());
+        assert!(error.cost_ambiguous());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn received_503_is_cost_ambiguous_and_not_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "503 Service Unavailable", "", b"{}").await;
+        });
+        let http = DirectHttp::new_for_loopback("fixture", address, test_limits());
+        let result = http
+            .post_json(
+                HeaderMap::new(),
+                b"{}".to_vec(),
+                &CancellationToken::default(),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("503 response must be terminal")
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::Unavailable);
+        assert!(!error.retryable());
+        assert!(error.cost_ambiguous());
         server.await.unwrap();
     }
 
@@ -777,7 +813,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             read_request(&mut stream).await;
-            write_response(&mut stream, "503 Service Unavailable", "", b"{}").await;
+            write_response(&mut stream, "429 Too Many Requests", "", b"{}").await;
         });
         let mut limits = test_limits();
         limits.retry_initial_delay = Duration::from_secs(30);
