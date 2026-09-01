@@ -195,7 +195,7 @@ impl Default for ReviewEngineLimits {
             reserved_input_tokens_per_turn: 32_000,
             reserved_cost_microusd_per_turn: 500_000,
             max_conversation_bytes: 512 * 1024,
-            max_tool_result_bytes: 64 * 1024,
+            max_tool_result_bytes: 32 * 1024,
             minimum_confidence_percent: 85,
             max_inline_diff_bytes: MAX_INLINE_GROUP_DIFF_BYTES,
             max_parallel_groups: 4,
