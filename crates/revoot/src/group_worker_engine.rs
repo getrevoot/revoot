@@ -1330,13 +1330,13 @@ fn worker_lifecycle(
 fn phase_instructions(phase: ReviewWorkerPhase, total_rounds: usize) -> &'static str {
     match phase {
         ReviewWorkerPhase::Planning => {
-            "Planning has at most two turns. Batch essential evidence reads, then call checkpoint_review with a bounded plan_summary no later than the final turn."
+            "Planning has at most two turns. Only one payload-returning tool call (read_diff, a search tool, get_rules, and similar) is honored per turn; extra ones in the same turn are rejected without result. Batch multiple pages within one read_diff call's reads array instead of issuing several read_diff calls. Then call checkpoint_review with a bounded plan_summary no later than the final turn."
         }
         ReviewWorkerPhase::Reviewing { round } if usize::from(round) < total_rounds => {
-            "This review round has at most four turns. coverage_requirements gives the exact action, path, hunk_id, and missing_pages still required. Batch those read_diff pages, submit evidenced findings, then call checkpoint_review no later than the final turn."
+            "This review round has at most four turns. coverage_requirements gives the exact action, path, hunk_id, and missing_pages still required. Only one payload-returning tool call is honored per turn; extra ones in the same turn are rejected without result. Batch multiple pages within one read_diff call's reads array instead of issuing several read_diff calls. Submit evidenced findings, then call checkpoint_review no later than the final turn."
         }
         ReviewWorkerPhase::Reviewing { .. } => {
-            "This is the final review round and it has at most four turns. coverage_requirements gives the exact action, path, hunk_id, and missing_pages still required. Batch those read_diff pages, submit evidenced findings, then call complete_group no later than the final turn."
+            "This is the final review round and it has at most four turns. coverage_requirements gives the exact action, path, hunk_id, and missing_pages still required. Only one payload-returning tool call is honored per turn; extra ones in the same turn are rejected without result. Batch multiple pages within one read_diff call's reads array instead of issuing several read_diff calls. Submit evidenced findings, then call complete_group no later than the final turn."
         }
         ReviewWorkerPhase::Verifying => "Complete the required deterministic coverage transition.",
         ReviewWorkerPhase::Complete | ReviewWorkerPhase::Partial => {
@@ -1440,7 +1440,7 @@ fn tool_description(name: &str) -> &'static str {
             "List assigned files, hunk IDs, page counts, risks, rules, and trusted coverage state without diff bodies."
         }
         "read_diff" => {
-            "Read up to 32 exact assigned hunk pages in one call. Returned pages include citeable evidence_id values and exact anchor IDs."
+            "Read up to 32 exact assigned hunk pages in one call, but the combined result is capped at 32 KiB; requesting more pages than fit returns nothing rather than a partial result, so prefer a handful of pages per call unless they are known to be small. Returned pages include citeable evidence_id values and exact anchor IDs."
         }
         "search_diff" => {
             "Search assigned diff artifacts with bounded, cursor-paginated results and citeable evidence IDs."
