@@ -26,7 +26,15 @@ const MAX_EVIDENCE_IDS: usize = 32;
 const MAX_UNRESOLVED_COVERAGE: usize = 10_000;
 const MAX_TOOL_CALLS_PER_EXCHANGE: usize = 32;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 32 * 1024;
-const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+
+/// Largest a single echoed tool-result body may be. The `recent_exchange`
+/// this bounds is re-serialized into every following packet, so this is not
+/// an independent guess: it is the real ceiling on any tool result that
+/// needs to survive one more turn, and callers that hand a tool its own
+/// larger result-size budget (`revoot::group_worker_engine`'s `read_diff`,
+/// for example) must stay at or under this value or `validate_exchange`
+/// will hard-reject the following turn instead of degrading gracefully.
+pub const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 const MAX_LABEL_BYTES: usize = 128;
 
 /// Exact purpose of one freshly composed request.

@@ -9,9 +9,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use revoot_core::review_packet::{
-    ReviewPacket, ReviewPacketComposer, ReviewPacketComposition, ReviewPacketDiffContext,
-    ReviewPacketFindingSummary, ReviewPacketInput, ReviewPacketPlanSummary, ReviewPacketPurpose,
-    ReviewPacketRecentExchange, ReviewPacketToolCall, ReviewPacketToolResult,
+    MAX_TOOL_RESULT_BYTES as MAX_EXCHANGE_RESULT_BYTES, ReviewPacket, ReviewPacketComposer,
+    ReviewPacketComposition, ReviewPacketDiffContext, ReviewPacketFindingSummary,
+    ReviewPacketInput, ReviewPacketPlanSummary, ReviewPacketPurpose, ReviewPacketRecentExchange,
+    ReviewPacketToolCall, ReviewPacketToolResult,
 };
 use revoot_core::{
     AgentBudget, AgentBudgetLimits, AgentBudgetUsage, AnchorId, AnchorTable, CancellationToken,
@@ -1456,7 +1457,7 @@ fn tool_description(name: &str) -> &'static str {
             "List assigned files, hunk IDs, page counts, risks, rules, and trusted coverage state without diff bodies."
         }
         "read_diff" => {
-            "Read up to 32 exact assigned hunk pages in one call, but the combined result is capped at 32 KiB. If the requested pages do not all fit, the ones that do are still delivered and the rest are listed under undelivered for a later call; only an empty result means none fit at all. A page already delivered - inline in the initial packet's diff field, or by an earlier call - returns error already_delivered instead of the body; use the evidence_id already provided for it. Returned pages include citeable evidence_id values and exact anchor IDs."
+            "Read up to 32 exact assigned hunk pages in one call, but the combined result is capped at 64 KiB. If the requested pages do not all fit, the ones that do are still delivered and the rest are listed under undelivered for a later call; only an empty result means none fit at all. A page already delivered - inline in the initial packet's diff field, or by an earlier call - returns error already_delivered instead of the body; use the evidence_id already provided for it. Returned pages include citeable evidence_id values and exact anchor IDs."
         }
         "search_diff" => {
             "Search assigned diff artifacts with bounded, cursor-paginated results and citeable evidence IDs."
@@ -1750,6 +1751,21 @@ fn execute_manifest(
 /// reproduce their exact encoded size.
 const READ_DIFF_RESPONSE_MARGIN_BYTES: usize = 4 * 1024;
 
+/// `read_diff` carries real code content, unlike the small paginated results
+/// from search/list tools, so it gets more room than the general
+/// `MAX_TOOL_RESULT_BYTES`. The reference implementation this engine was
+/// ported from places no cap at all on its equivalent diff-read tool and
+/// relies solely on aggregate context management; this engine still bounds a
+/// single result, but not with an independent guess. Every tool result,
+/// `read_diff`'s included, is echoed back verbatim as the next turn's
+/// `recent_exchange` (see `validate_exchange` in
+/// `revoot_core::review_packet`), so `MAX_EXCHANGE_RESULT_BYTES` is already
+/// the real, load-bearing ceiling on how large a result can be while still
+/// surviving one more turn - reusing it here (rather than picking a larger
+/// number that would pass locally but hard-fail on the following packet)
+/// is the actual justification, not a coincidence of matching magic numbers.
+const MAX_READ_DIFF_RESULT_BYTES: usize = MAX_EXCHANGE_RESULT_BYTES;
+
 fn execute_read_diff(
     input: Value,
     runtime: &mut WorkerRuntime<'_>,
@@ -1815,7 +1831,7 @@ fn execute_read_diff(
     } else {
         json!({"pages": pages, "undelivered": undelivered})
     };
-    let prepared_evidence = prepare_evidence(&value, runtime)?;
+    let prepared_evidence = prepare_evidence_bounded(&value, runtime, MAX_READ_DIFF_RESULT_BYTES)?;
     runtime
         .coverage_gate
         .as_mut()
@@ -1848,7 +1864,7 @@ fn read_diff_batch_fits(pages: &[Value]) -> bool {
     serde_json::to_string(&json!({ "pages": pages }))
         .map_or(usize::MAX, |encoded| encoded.len())
         .saturating_add(READ_DIFF_RESPONSE_MARGIN_BYTES)
-        <= MAX_TOOL_RESULT_BYTES
+        <= MAX_READ_DIFF_RESULT_BYTES
 }
 
 fn execute_search_diff(
@@ -2505,14 +2521,15 @@ struct PreparedEvidence {
     content: String,
 }
 
-fn prepare_evidence(
+fn prepare_evidence_bounded(
     value: &Value,
     runtime: &WorkerRuntime<'_>,
+    max_bytes: usize,
 ) -> Result<PreparedEvidence, ToolExecutionError> {
     let evidence_id = format!("evidence:{:04}", runtime.tool_calls);
     let delivered = json!({"evidence_id": evidence_id, "result": value});
     let content = serde_json::to_string(&delivered).map_err(|_| recoverable("serialization"))?;
-    if content.len() > MAX_TOOL_RESULT_BYTES {
+    if content.len() > max_bytes {
         return Err(recoverable("result_too_large"));
     }
     Ok(PreparedEvidence {
@@ -2520,6 +2537,13 @@ fn prepare_evidence(
         delivered,
         content,
     })
+}
+
+fn prepare_evidence(
+    value: &Value,
+    runtime: &WorkerRuntime<'_>,
+) -> Result<PreparedEvidence, ToolExecutionError> {
+    prepare_evidence_bounded(value, runtime, MAX_TOOL_RESULT_BYTES)
 }
 
 fn record_evidence(
@@ -4120,13 +4144,13 @@ mod tests {
     async fn oversized_batched_diff_read_delivers_what_fits_and_lists_the_rest() {
         let large_line = "x".repeat(2_048);
         let mut added_lines = String::new();
-        for _ in 0..20 {
+        for _ in 0..60 {
             added_lines.push('+');
             added_lines.push_str(&large_line);
             added_lines.push('\n');
         }
         let diff = format!(
-            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,20 @@\n-old\n{added_lines}"
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,60 @@\n-old\n{added_lines}"
         );
         let fixture = fixture_with_diff(
             ReviewEffort::Low,
@@ -4170,7 +4194,7 @@ mod tests {
         assert!(read_diff_batch_fits(&[]));
         let small_page = json!({"content": "x".repeat(1_024)});
         assert!(read_diff_batch_fits(&[small_page.clone(), small_page]));
-        let oversized_page = json!({"content": "x".repeat(MAX_TOOL_RESULT_BYTES)});
+        let oversized_page = json!({"content": "x".repeat(MAX_READ_DIFF_RESULT_BYTES)});
         assert!(!read_diff_batch_fits(&[oversized_page]));
     }
 
