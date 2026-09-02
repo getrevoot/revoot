@@ -65,7 +65,7 @@ and Anthropic Messages remain the only direct model providers.
 ## Fixed defaults and interfaces
 
 - Effort: `medium`.
-- Parallel groups: 4, operator range 1-8.
+- Parallel groups: 2, operator range 1-8.
 - Model requests: 64, range 1-256.
 - Combined model tokens: 300,000, range 1-2,000,000.
 - Local tool calls: 256, range 1-2,048.

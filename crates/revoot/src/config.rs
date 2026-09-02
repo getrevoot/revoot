@@ -1173,7 +1173,7 @@ fn product_schema() -> Result<ConfigurationSchema, Diagnostic> {
         ),
         unsigned_field(
             "review.max_parallel_groups",
-            4,
+            2,
             AssignmentScope::TrustedOnly,
             1,
             8,

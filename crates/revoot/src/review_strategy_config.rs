@@ -26,7 +26,7 @@ const MAX_TOOL_CALLS: u64 = 2_048;
 const DEFAULT_DEADLINE_SECONDS: u64 = 600;
 const DEFAULT_INLINE_DIFF_BYTES: u64 = 16_384;
 const MIN_PARALLEL_GROUPS: u64 = 1;
-const DEFAULT_PARALLEL_GROUPS: u64 = 4;
+const DEFAULT_PARALLEL_GROUPS: u64 = 2;
 const MAX_PARALLEL_GROUPS: u64 = 8;
 const TARGET_REQUEST_INPUT_TOKENS: u64 = 96_000;
 const MAX_REQUEST_OUTPUT_TOKENS: u64 = 4_096;
@@ -452,7 +452,7 @@ mod tests {
         let strategy = resolve(root.path(), []).expect("strategy");
         assert_eq!(strategy, ReviewStrategyConfiguration::default());
         assert_eq!(strategy.effort, ReviewEffort::Medium);
-        assert_eq!(strategy.max_parallel_groups, 4);
+        assert_eq!(strategy.max_parallel_groups, 2);
         assert_eq!(strategy.aggregate_budget.max_model_requests, 64);
         assert_eq!(
             strategy.aggregate_budget.max_cost_microusd,
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(strategy.aggregate_budget.max_elapsed_millis, 300_000);
         assert_eq!(strategy.max_inline_diff_bytes, 8_000);
         assert_eq!(strategy.effort, ReviewEffort::Medium);
-        assert_eq!(strategy.max_parallel_groups, 4);
+        assert_eq!(strategy.max_parallel_groups, 2);
     }
 
     #[test]
