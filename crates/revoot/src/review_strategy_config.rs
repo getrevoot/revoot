@@ -635,6 +635,116 @@ mod tests {
         assert_eq!(unescalated.effort, ReviewEffort::Medium);
     }
 
+    /// Replays the request/settlement pattern actually observed dogfooding
+    /// PR #30 at full scale (24 requests: 11 read_diff-heavy, 13 light;
+    /// reservations pessimistic per `estimate_wire_tokens`, settlements the
+    /// real reported averages from that run's usage report), `repeats` times
+    /// in a row against a given budget. Requests are reserved two at a time
+    /// before either settles, mirroring the real run's `max_parallel_groups:
+    /// 2` - the peak pressure comes from outstanding, not-yet-settled
+    /// reservations held concurrently, not from the eventual settled sum.
+    /// Returns how many requests it admitted before the aggregate token
+    /// dimension was exhausted, or `None` if every repeat admitted in full.
+    fn admit_observed_dogfood_pattern(limits: ReviewBudgetLimits, repeats: usize) -> Option<usize> {
+        use revoot_core::review_budget::{ReviewBudgetDimension, ReviewBudgetError};
+        use revoot_core::{ReviewBudgetBroker, ReviewModelReservation, ReviewModelUsage};
+
+        // Heavy turns follow a read_diff delivery: recent_exchange echoes the
+        // large result body back, so the pessimistic byte-based reservation
+        // is large even though the real settled token count is not.
+        const HEAVY_RESERVED_INPUT: u64 = 85_000;
+        const HEAVY_SETTLED_INPUT: u64 = 15_000;
+        const LIGHT_RESERVED_INPUT: u64 = 12_000;
+        const LIGHT_SETTLED_INPUT: u64 = 8_000;
+        const SETTLED_OUTPUT: u64 = 700;
+        const RESERVED_OUTPUT: u64 = 4_096;
+
+        let broker = ReviewBudgetBroker::new(limits, 0).expect("valid budget");
+
+        let reserve = |heavy: bool| {
+            broker.reserve_model_request(
+                ReviewModelReservation {
+                    input_tokens: if heavy {
+                        HEAVY_RESERVED_INPUT
+                    } else {
+                        LIGHT_RESERVED_INPUT
+                    },
+                    output_tokens: RESERVED_OUTPUT,
+                    cost_microusd:
+                        revoot_core::review_budget::CONSERVATIVE_MODEL_CALL_COST_MICROUSD,
+                },
+                0,
+            )
+        };
+        let settle = |permit: revoot_core::ReviewModelPermit, heavy: bool| {
+            permit
+                .commit(
+                    Some(ReviewModelUsage {
+                        input_tokens: if heavy {
+                            HEAVY_SETTLED_INPUT
+                        } else {
+                            LIGHT_SETTLED_INPUT
+                        },
+                        output_tokens: SETTLED_OUTPUT,
+                        cost_microusd:
+                            revoot_core::review_budget::CONSERVATIVE_MODEL_CALL_COST_MICROUSD,
+                    }),
+                    0,
+                )
+                .expect("settlement");
+        };
+
+        let one_pass = [true; 11].into_iter().chain([false; 13]);
+        let pattern: Vec<bool> = std::iter::repeat_n(one_pass, repeats).flatten().collect();
+        let mut admitted = 0;
+        for pair in pattern.chunks(2) {
+            let mut permits = Vec::with_capacity(pair.len());
+            for &heavy in pair {
+                match reserve(heavy) {
+                    Ok(permit) => permits.push((permit, heavy)),
+                    Err(ReviewBudgetError::Exhausted(ReviewBudgetDimension::ModelTokens)) => {
+                        return Some(admitted);
+                    }
+                    Err(error) => panic!("unexpected budget error: {error:?}"),
+                }
+                admitted += 1;
+            }
+            for (permit, heavy) in permits {
+                settle(permit, heavy);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn old_default_would_have_exhausted_the_observed_dogfood_pattern() {
+        let old_limits = ReviewBudgetLimits {
+            max_model_tokens: 300_000,
+            ..ReviewStrategyConfiguration::default().aggregate_budget
+        };
+        let stopped_after = admit_observed_dogfood_pattern(old_limits, 1);
+        assert!(
+            stopped_after.is_some_and(|count| count < 24),
+            "the old 300,000 ceiling should reproduce the dogfood exhaustion locally"
+        );
+    }
+
+    #[test]
+    fn new_default_admits_the_full_observed_dogfood_pattern_with_headroom() {
+        let budget = ReviewStrategyConfiguration::default().aggregate_budget;
+        assert!(
+            admit_observed_dogfood_pattern(budget, 1).is_none(),
+            "the new default should admit every request PR #30's dogfood run actually made"
+        );
+        // Headroom check: the same pattern replayed a second full time, as a
+        // stand-in for the additional turns the five starved groups never
+        // got to make, should still fit within the default request count.
+        assert!(
+            admit_observed_dogfood_pattern(budget, 2).is_none(),
+            "the new default should have headroom left for the requests the starved groups never made"
+        );
+    }
+
     fn resolve<const N: usize>(
         root: &Path,
         environment: [(&str, &str); N],
