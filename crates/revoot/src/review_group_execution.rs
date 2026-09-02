@@ -5,9 +5,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use revoot_core::{
-    AgentBudgetUsage, CancellationToken, GroupCoverageLedger, ProviderAdapter, ReviewBudgetBroker,
-    ReviewBudgetUsage, ReviewGroupId, ReviewGroupPlan, SuppressedVerificationCandidate,
-    VerifiedCandidate,
+    AgentBudgetUsage, CancellationToken, CoverageRequirementKind, GroupCoverageLedger,
+    ProviderAdapter, ReviewBudgetBroker, ReviewBudgetUsage, ReviewGroupId, ReviewGroupPlan,
+    SuppressedVerificationCandidate, VerifiedCandidate,
 };
 
 use crate::diff_artifact::DiffArtifactStore;
@@ -350,6 +350,7 @@ where
     .await;
     let (verification, verifier_failed) = verification_status(verifier.outcome);
     let worker_outcome = scheduler_outcome(&worker.status);
+    log_group_completion_outcome(&scheduled.group.id, &worker);
     let result = ExecutedReviewGroup {
         group_id: scheduled.group.id.clone(),
         summary: worker.summary,
@@ -380,6 +381,26 @@ where
         },
         SchedulerOutcome::Cancelled => GroupWorkerResult::Cancelled,
     }
+}
+
+/// Temporary payload-free diagnostic for the dogfood coverage gap: emits only
+/// the group id, terminal status, turn/tool counts, and missing-requirement
+/// counts by kind, never file paths, hunk ids, or any provider content.
+fn log_group_completion_outcome(group_id: &ReviewGroupId, worker: &GroupWorkerOutput) {
+    let missing = worker.coverage.missing_requirements();
+    let count_kind =
+        |kind: CoverageRequirementKind| missing.iter().filter(|item| item.kind == kind).count();
+    eprintln!(
+        "revoot_diag group={} status={:?} provider_turns={} tool_calls={} missing_hunk_body={} missing_sample={} missing_disposition={} missing_manifest={}",
+        group_id.as_str(),
+        worker.status,
+        worker.provider_turns,
+        worker.tool_calls,
+        count_kind(CoverageRequirementKind::HunkBody),
+        count_kind(CoverageRequirementKind::Sample),
+        count_kind(CoverageRequirementKind::Disposition),
+        count_kind(CoverageRequirementKind::Manifest),
+    );
 }
 
 fn required_verifier_evidence(worker: &GroupWorkerOutput) -> Vec<VerifierEvidence> {
