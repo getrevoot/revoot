@@ -20,8 +20,12 @@ use crate::group_scheduler::{
 /// Synchronous shared-budget observation made immediately before dispatch.
 ///
 /// Workers remain responsible for atomically reserving their exact request,
-/// token, tool, cost, and deadline capacity. Returning `false` closes future
-/// group dispatch while already-running workers finish cooperatively.
+/// token, tool, cost, and deadline capacity. Returning `false` pauses new
+/// group dispatch for this call only; it is re-evaluated on every loop
+/// iteration and does not by itself close future dispatch. Capacity is
+/// counted with outstanding (not yet settled) reservations included, so it
+/// can dip below the threshold only momentarily while other groups are still
+/// in flight and free back up once they settle.
 pub trait GroupDispatchBudget: Send + Sync {
     fn has_dispatch_capacity(&self) -> bool;
 }
@@ -153,10 +157,12 @@ struct CompletedTask<R> {
 /// Execute isolated groups with real concurrency bounded to `1..=8`.
 ///
 /// `GroupScheduler` supplies stable high-signal ordering. The runtime checks
-/// cancellation and shared-budget state before each refill. A worker reporting
-/// `BudgetExhausted` also closes future dispatch immediately. Already completed
-/// results and explicitly verified partial results are retained even when the
-/// overall run stops early.
+/// cancellation and shared-budget state before each refill. Cancellation is a
+/// permanent stop; a shared-budget shortfall pauses new dispatch and only
+/// becomes a permanent stop once no group is left running to free more
+/// capacity, since outstanding reservations from in-flight groups can settle
+/// for less than reserved. Already completed results and explicitly verified
+/// partial results are retained even when the overall run stops early.
 ///
 /// # Errors
 ///
@@ -184,8 +190,7 @@ where
     let mut stop_reason = None;
 
     loop {
-        observe_dispatch_stop(&mut scheduler, &cancellation, &budget, &mut stop_reason);
-        if stop_reason.is_none() {
+        if dispatch_may_proceed(&mut scheduler, &cancellation, &budget, &mut stop_reason) {
             dispatch_ready(
                 &mut scheduler,
                 &mut tasks,
@@ -210,12 +215,7 @@ where
                 if expected != completion.group_id {
                     return Err(GroupRuntimeError::TaskBookkeeping);
                 }
-                finish_completed_task(
-                    &mut scheduler,
-                    completion,
-                    &mut retained_results,
-                    &mut stop_reason,
-                )?;
+                finish_completed_task(&mut scheduler, completion, &mut retained_results)?;
             }
             Err(join_error) => {
                 let group_id = task_groups
@@ -237,22 +237,39 @@ where
     })
 }
 
-fn observe_dispatch_stop<B: GroupDispatchBudget>(
+/// Decide whether the scheduler may dispatch more queued groups this
+/// iteration, re-evaluating shared capacity fresh every call rather than
+/// latching a stale verdict.
+///
+/// Cancellation is a one-way, permanent stop. A momentary capacity shortfall
+/// is not: outstanding (not yet settled) reservations from groups already in
+/// flight can free up real capacity once those groups finish, so a shortfall
+/// only becomes terminal once nothing is left running to free more of it.
+fn dispatch_may_proceed<B: GroupDispatchBudget>(
     scheduler: &mut GroupScheduler,
     cancellation: &CancellationToken,
     budget: &B,
     stop_reason: &mut Option<GroupRuntimeStopReason>,
-) {
-    if stop_reason.is_some() {
-        return;
+) -> bool {
+    if matches!(
+        stop_reason,
+        Some(GroupRuntimeStopReason::CancellationRequested)
+    ) {
+        return false;
     }
     if cancellation.is_cancelled() {
         *stop_reason = Some(GroupRuntimeStopReason::CancellationRequested);
         scheduler.request_cancellation();
-    } else if !budget.has_dispatch_capacity() {
+        return false;
+    }
+    if budget.has_dispatch_capacity() {
+        return true;
+    }
+    if scheduler.running_groups() == 0 && scheduler.queued_groups() > 0 {
         *stop_reason = Some(GroupRuntimeStopReason::BudgetExhausted);
         scheduler.request_cancellation();
     }
+    false
 }
 
 fn dispatch_ready<R, W, WorkerFuture>(
@@ -287,7 +304,6 @@ fn finish_completed_task<R>(
     scheduler: &mut GroupScheduler,
     completion: CompletedTask<R>,
     retained_results: &mut Vec<RetainedGroupResult<R>>,
-    stop_reason: &mut Option<GroupRuntimeStopReason>,
 ) -> Result<(), GroupRuntimeError> {
     let CompletedTask {
         group_id,
@@ -317,10 +333,10 @@ fn finish_completed_task<R>(
                     result,
                 });
             }
-            if reason == GroupPartialReason::BudgetExhausted && stop_reason.is_none() {
-                *stop_reason = Some(GroupRuntimeStopReason::BudgetExhausted);
-                scheduler.request_cancellation();
-            }
+            // A worker's own reservation losing a race for the last shared
+            // capacity does not by itself mean no other group can proceed;
+            // the dispatch loop's own capacity check decides that, and only
+            // gives up once nothing is left running to free more of it.
         }
         GroupWorkerResult::Failed(reason) => {
             scheduler.finish_group(&group_id, GroupRunOutcome::Failed(reason))?;
@@ -481,6 +497,65 @@ mod tests {
         assert_eq!(
             report.retained_results[0].kind,
             RetainedGroupResultKind::VerifiedPartial(GroupPartialReason::BudgetExhausted)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn budget_shortfall_pauses_refill_but_lets_running_groups_finish() {
+        let plan = plan((0..3).map(|index| standard_group(index, index)).collect());
+        let budget_available = Arc::new(AtomicBool::new(true));
+        // Whichever of the two concurrently dispatched groups is polled
+        // first (dispatch order is the scheduler's own high-signal order,
+        // not necessarily plan order) reports the shortfall immediately; the
+        // other keeps running past that report and must be allowed to finish.
+        let shortfall_claimed = Arc::new(AtomicBool::new(false));
+        let report: GroupRuntimeReport<u32> = run_group_runtime(
+            &plan,
+            2,
+            CancellationToken::default(),
+            {
+                let budget_available = Arc::clone(&budget_available);
+                move || budget_available.load(Ordering::SeqCst)
+            },
+            {
+                let budget_available = Arc::clone(&budget_available);
+                let shortfall_claimed = Arc::clone(&shortfall_claimed);
+                move |scheduled, _| {
+                    let budget_available = Arc::clone(&budget_available);
+                    let shortfall_claimed = Arc::clone(&shortfall_claimed);
+                    async move {
+                        if shortfall_claimed
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            budget_available.store(false, Ordering::SeqCst);
+                            return GroupWorkerResult::Partial {
+                                reason: GroupPartialReason::BudgetExhausted,
+                                verified_result: Some(scheduled.priority_position),
+                            };
+                        }
+                        // Outlives the shortfall report; must not be
+                        // preemptively cancelled by that alone.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        GroupWorkerResult::Complete(scheduled.priority_position)
+                    }
+                }
+            },
+        )
+        .await
+        .expect("runtime");
+        assert_eq!(
+            report.stop_reason,
+            Some(GroupRuntimeStopReason::BudgetExhausted)
+        );
+        assert_eq!(report.schedule.cancelled_groups, 1);
+        assert_eq!(report.retained_results.len(), 2);
+        assert!(
+            report
+                .retained_results
+                .iter()
+                .any(|result| result.kind == RetainedGroupResultKind::Complete),
+            "the group that outlived the shortfall report must still be retained"
         );
     }
 
