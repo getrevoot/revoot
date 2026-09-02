@@ -19,6 +19,26 @@ pub const fn conservative_model_cost_limit(max_model_requests: u64) -> Option<u6
     max_model_requests.checked_mul(CONSERVATIVE_MODEL_CALL_COST_MICROUSD)
 }
 
+/// Conservative bytes-per-token ratio used to estimate token cost from
+/// encoded request/diff size when no real tokenizer is available. English
+/// and source-code text average roughly 4 bytes per token; this stays at
+/// that real average rather than the far more pessimistic 1-byte-per-token
+/// identity this codebase used until now, which silently quadrupled every
+/// byte-derived token estimate against every token-denominated budget and
+/// threshold it fed - the actual mechanism behind this session's recurring
+/// `budget_exhausted` and `context_overflow` friction. It intentionally
+/// stops short of the reference implementation's real, tokenizer-derived
+/// counts, keeping a safety margin for token-dense content (numbers,
+/// punctuation, non-English text) without reintroducing that 4x error.
+pub const CONSERVATIVE_BYTES_PER_TOKEN: u64 = 4;
+
+/// Estimate a conservative (never-under-counted) token cost from an encoded
+/// byte length, using [`CONSERVATIVE_BYTES_PER_TOKEN`].
+#[must_use]
+pub const fn estimate_tokens_from_bytes(bytes: u64) -> u64 {
+    bytes.div_ceil(CONSERVATIVE_BYTES_PER_TOKEN)
+}
+
 /// Review-wide limits shared by every review worker.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

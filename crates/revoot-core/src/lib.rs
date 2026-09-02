@@ -172,10 +172,11 @@ pub use repository::{
     RepositoryToolbox, SearchMatch, SearchRequest, SearchResult, ShowDiffResult,
 };
 pub use review_budget::{
-    ConservativeChargeReason, OutstandingReviewReservations, ReviewBudgetBroker,
-    ReviewBudgetDimension, ReviewBudgetError, ReviewBudgetLimits, ReviewBudgetPhase,
-    ReviewBudgetSnapshot, ReviewBudgetUsage, ReviewBudgetValidationError, ReviewCallUsage,
-    ReviewModelPermit, ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
+    CONSERVATIVE_BYTES_PER_TOKEN, ConservativeChargeReason, OutstandingReviewReservations,
+    ReviewBudgetBroker, ReviewBudgetDimension, ReviewBudgetError, ReviewBudgetLimits,
+    ReviewBudgetPhase, ReviewBudgetSnapshot, ReviewBudgetUsage, ReviewBudgetValidationError,
+    ReviewCallUsage, ReviewModelPermit, ReviewModelReservation, ReviewModelSettlement,
+    ReviewModelUsage, estimate_tokens_from_bytes,
 };
 pub use review_group::{
     CoverageError, CoverageRequirement, CoverageRequirementKind, FileCoverageLedger,

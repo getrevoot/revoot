@@ -713,7 +713,8 @@ fn estimate_manifest_tokens(
     .map_err(|_| ReviewGroupPacketError::Serialization)?;
     u64::try_from(bytes.len())
         .ok()
-        .and_then(|bytes| bytes.checked_add(CONSERVATIVE_PACKET_OVERHEAD_TOKENS))
+        .map(revoot_core::estimate_tokens_from_bytes)
+        .and_then(|tokens| tokens.checked_add(CONSERVATIVE_PACKET_OVERHEAD_TOKENS))
         .ok_or(ReviewGroupPacketError::ContextCapacity)
 }
 

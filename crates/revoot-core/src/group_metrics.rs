@@ -10,6 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::diff_hazards::{DiffHazardInspection, DiffHazardReport};
+use crate::review_budget::estimate_tokens_from_bytes;
 use crate::{FileChangeKind, RepositoryPath, ReviewGroup, ReviewGroupId, ReviewValueTier};
 
 const MAX_GROUP_FILES: usize = 10;
@@ -279,7 +280,7 @@ pub fn build_group_metrics(
         files.push(file);
     }
     let file_count = u32::try_from(files.len()).map_err(|_| GroupMetricsError::CountOverflow)?;
-    let conservative_diff_tokens = exact_diff_bytes;
+    let conservative_diff_tokens = estimate_tokens_from_bytes(exact_diff_bytes);
     let estimated_request_tokens = policy
         .fixed_context_tokens
         .checked_add(conservative_diff_tokens)
@@ -601,7 +602,7 @@ mod tests {
             manifests,
             hazards,
             GroupMetricsPolicy {
-                fixed_context_tokens: 90_000,
+                fixed_context_tokens: 93_000,
                 ..GroupMetricsPolicy::default()
             },
         )

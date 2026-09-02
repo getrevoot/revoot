@@ -47,8 +47,22 @@ const WORKER_PAGE_BYTES: u32 = 8 * 1024;
 const DEFAULT_SEARCH_RESULTS: u32 = 200;
 const MAX_SEARCH_RESULTS: u32 = 500;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024;
-const MAX_REQUEST_BYTES: usize = 96_000;
 const MAX_REQUEST_INPUT_TOKENS: u64 = 96_000;
+/// Wire-size safety valve for one composed request, denominated honestly:
+/// `MAX_REQUEST_INPUT_TOKENS` tokens at the real, conservative
+/// `CONSERVATIVE_BYTES_PER_TOKEN` (4 bytes/token) average - not the same
+/// numeral copied across two different units. The old `96_000` (bytes) here
+/// happened to equal `MAX_REQUEST_INPUT_TOKENS` (tokens), silently treating
+/// 1 byte as 1 token and capping real usable input at roughly a quarter of
+/// the token budget this engine claims to support. This is the actual
+/// bottleneck behind this session's `budget_exhausted` and
+/// `context_overflow` friction, not any single tool's result size.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "384,000 fits usize on every supported target"
+)]
+const MAX_REQUEST_BYTES: usize =
+    (MAX_REQUEST_INPUT_TOKENS * revoot_core::CONSERVATIVE_BYTES_PER_TOKEN) as usize;
 const MAX_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_SUMMARY_ASSUMPTIONS: usize = 64;
 const MAX_SUMMARY_ASSUMPTION_BYTES: usize = 512;
@@ -922,7 +936,7 @@ fn packet_purpose(phase: ReviewWorkerPhase) -> Option<ReviewPacketPurpose> {
 }
 
 fn estimate_wire_tokens(encoded_bytes: usize) -> u64 {
-    u64::try_from(encoded_bytes).unwrap_or(u64::MAX)
+    revoot_core::estimate_tokens_from_bytes(u64::try_from(encoded_bytes).unwrap_or(u64::MAX))
 }
 
 fn rebase_packet(
@@ -1756,14 +1770,23 @@ const READ_DIFF_RESPONSE_MARGIN_BYTES: usize = 4 * 1024;
 /// `MAX_TOOL_RESULT_BYTES`. The reference implementation this engine was
 /// ported from places no cap at all on its equivalent diff-read tool and
 /// relies solely on aggregate context management; this engine still bounds a
-/// single result, but not with an independent guess. Every tool result,
-/// `read_diff`'s included, is echoed back verbatim as the next turn's
-/// `recent_exchange` (see `validate_exchange` in
-/// `revoot_core::review_packet`), so `MAX_EXCHANGE_RESULT_BYTES` is already
-/// the real, load-bearing ceiling on how large a result can be while still
-/// surviving one more turn - reusing it here (rather than picking a larger
-/// number that would pass locally but hard-fail on the following packet)
-/// is the actual justification, not a coincidence of matching magic numbers.
+/// single result, but not with an independent guess.
+///
+/// Every tool result, `read_diff`'s included, is echoed back verbatim as the
+/// next turn's `recent_exchange` (see `validate_exchange` in
+/// `revoot_core::review_packet`), which caps any single echoed result body at
+/// `MAX_EXCHANGE_RESULT_BYTES` - the real, load-bearing ceiling here.
+///
+/// PR #33's cheap validation run showed that ceiling alone is not quite
+/// sufficient by itself: re-embedding an already-JSON-encoded result as an
+/// escaped string in the next turn's request costs real overhead beyond its
+/// own bytes, and a result near this cap produced a following-turn request
+/// of 96,021 bytes against what was then a 96,000-byte `MAX_REQUEST_BYTES` -
+/// a near-miss, not a hard failure. That was fixed at the root instead of by
+/// padding this constant further: `MAX_REQUEST_BYTES` was itself
+/// mis-denominated (see its own doc comment) and is now four times larger,
+/// leaving ample real margin for that re-encoding overhead without needing a
+/// second, independently-guessed deflation factor here.
 const MAX_READ_DIFF_RESULT_BYTES: usize = MAX_EXCHANGE_RESULT_BYTES;
 
 fn execute_read_diff(
@@ -4273,9 +4296,9 @@ mod tests {
 
     #[test]
     fn conservative_wire_estimate_has_no_fixed_thirty_two_thousand_token_floor() {
-        assert_eq!(estimate_wire_tokens(1_024), 1_024);
+        assert_eq!(estimate_wire_tokens(1_024), 256);
         assert!(estimate_wire_tokens(1_024) < MAX_REQUEST_INPUT_TOKENS);
-        assert_eq!(estimate_wire_tokens(32_001), 32_001);
+        assert_eq!(estimate_wire_tokens(32_001), 8_001);
     }
 
     #[test]

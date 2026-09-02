@@ -235,7 +235,9 @@ pub async fn run_review_adjudicator(
         );
     }
     let reservation = ReviewModelReservation {
-        input_tokens: u64::try_from(request_bytes).unwrap_or(u64::MAX),
+        input_tokens: revoot_core::estimate_tokens_from_bytes(
+            u64::try_from(request_bytes).unwrap_or(u64::MAX),
+        ),
         output_tokens: u64::from(config.max_output_tokens),
         cost_microusd: config.reserved_cost_microusd,
     };
