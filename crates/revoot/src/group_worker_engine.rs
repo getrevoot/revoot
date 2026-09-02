@@ -1440,7 +1440,7 @@ fn tool_description(name: &str) -> &'static str {
             "List assigned files, hunk IDs, page counts, risks, rules, and trusted coverage state without diff bodies."
         }
         "read_diff" => {
-            "Read up to 32 exact assigned hunk pages in one call, but the combined result is capped at 32 KiB; requesting more pages than fit returns nothing rather than a partial result, so prefer a handful of pages per call unless they are known to be small. Returned pages include citeable evidence_id values and exact anchor IDs."
+            "Read up to 32 exact assigned hunk pages in one call, but the combined result is capped at 32 KiB. If the requested pages do not all fit, the ones that do are still delivered and the rest are listed under undelivered for a later call; only an empty result means none fit at all. Returned pages include citeable evidence_id values and exact anchor IDs."
         }
         "search_diff" => {
             "Search assigned diff artifacts with bounded, cursor-paginated results and citeable evidence IDs."
@@ -1729,6 +1729,11 @@ fn execute_manifest(
     serde_json::to_value(manifest).map_err(|_| recoverable("serialization"))
 }
 
+/// Reserved headroom in a `read_diff` result for the evidence-id wrapper and
+/// the `undelivered` list, so the incremental fit check does not need to
+/// reproduce their exact encoded size.
+const READ_DIFF_RESPONSE_MARGIN_BYTES: usize = 4 * 1024;
+
 fn execute_read_diff(
     input: Value,
     runtime: &mut WorkerRuntime<'_>,
@@ -1740,6 +1745,7 @@ fn execute_read_diff(
     let mut pages = Vec::with_capacity(args.reads.len());
     let mut deliveries = Vec::with_capacity(args.reads.len());
     let mut delivered_anchor_ids = BTreeSet::new();
+    let mut undelivered = Vec::new();
     for read in args.reads {
         let path = assigned_path(&read.path, runtime)?;
         let page = runtime
@@ -1748,7 +1754,7 @@ fn execute_read_diff(
             .map_err(|_| recoverable("diff_read"))?;
         let provider_path =
             RepositoryPath::try_from(path.as_str().to_owned()).map_err(|_| recoverable("path"))?;
-        deliveries.push((provider_path, page.hunk_id.clone(), page.page));
+        let mut anchor_ids = Vec::new();
         let anchors = runtime
             .anchor_table
             .iter()
@@ -1759,20 +1765,40 @@ fn execute_read_diff(
             })
             .filter(|anchor| page.positions.contains(&anchor.position))
             .map(|anchor| {
-                delivered_anchor_ids.insert(anchor.id.clone());
+                anchor_ids.push(anchor.id.clone());
                 json!({"anchor_id": anchor.id, "position": anchor.position})
             })
             .collect::<Vec<_>>();
-        pages.push(json!({
+        let page_json = json!({
             "path": page.path,
             "hunk_id": page.hunk_id,
             "page": page.page,
             "total_pages": page.total_pages,
             "content": page.content,
             "anchors": anchors,
-        }));
+        });
+        let mut trial_pages = pages.clone();
+        trial_pages.push(page_json.clone());
+        if read_diff_batch_fits(&trial_pages) {
+            pages.push(page_json);
+            deliveries.push((provider_path, page.hunk_id.clone(), page.page));
+            delivered_anchor_ids.extend(anchor_ids);
+        } else {
+            undelivered.push(json!({
+                "path": read.path,
+                "hunk_id": read.hunk_id,
+                "page": read.page,
+            }));
+        }
     }
-    let value = json!({"pages": pages});
+    if pages.is_empty() {
+        return Err(recoverable("result_too_large"));
+    }
+    let value = if undelivered.is_empty() {
+        json!({"pages": pages})
+    } else {
+        json!({"pages": pages, "undelivered": undelivered})
+    };
     let prepared_evidence = prepare_evidence(&value, runtime)?;
     runtime
         .coverage_gate
@@ -1782,6 +1808,13 @@ fn execute_read_diff(
         .map_err(|_| recoverable("coverage"))?;
     runtime.delivered_anchor_ids.extend(delivered_anchor_ids);
     Ok(commit_evidence(prepared_evidence, runtime))
+}
+
+fn read_diff_batch_fits(pages: &[Value]) -> bool {
+    serde_json::to_string(&json!({ "pages": pages }))
+        .map_or(usize::MAX, |encoded| encoded.len())
+        .saturating_add(READ_DIFF_RESPONSE_MARGIN_BYTES)
+        <= MAX_TOOL_RESULT_BYTES
 }
 
 fn execute_search_diff(
@@ -3105,17 +3138,28 @@ mod tests {
                 file_count: 1,
                 hunk_count: u32::try_from(file_manifest.hunks.len()).expect("hunk count"),
             },
-            complete_diff: Some(ReviewPacketCompleteDiff::SmallComplete {
-                body: diff.to_owned(),
-                sha256: diff_sha,
+            complete_diff: Some(if diff.len() as u64 <= MAX_INLINE_GROUP_DIFF_BYTES {
+                ReviewPacketCompleteDiff::SmallComplete {
+                    body: diff.to_owned(),
+                    sha256: diff_sha,
+                }
+            } else {
+                ReviewPacketCompleteDiff::LargeManifestOnly {
+                    sha256: diff_sha,
+                    bytes: u64::try_from(diff.len()).expect("diff bytes"),
+                }
             }),
             token_estimates: ReviewPacketTokenEstimates {
                 manifest_request_tokens: 400,
-                inline_request_tokens: Some(if inline {
-                    600
+                inline_request_tokens: if diff.len() as u64 <= MAX_INLINE_GROUP_DIFF_BYTES {
+                    Some(if inline {
+                        600
+                    } else {
+                        MAX_REQUEST_INPUT_TOKENS + 1
+                    })
                 } else {
-                    MAX_REQUEST_INPUT_TOKENS + 1
-                }),
+                    None
+                },
             },
         };
         let request = GroupWorkerRequest {
@@ -3995,10 +4039,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_batched_diff_result_credits_no_pages() {
+    async fn oversized_batched_diff_read_delivers_what_fits_and_lists_the_rest() {
         let large_line = "x".repeat(2_048);
+        let mut added_lines = String::new();
+        for _ in 0..20 {
+            added_lines.push('+');
+            added_lines.push_str(&large_line);
+            added_lines.push('\n');
+        }
         let diff = format!(
-            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+{large_line}\n"
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,20 @@\n-old\n{added_lines}"
         );
         let fixture = fixture_with_diff(
             ReviewEffort::Low,
@@ -4012,22 +4062,38 @@ mod tests {
             .store
             .manifest(&[relative_path()])
             .expect("manifest");
-        let hunk_id = manifest[0].hunks[0].hunk_id.clone();
-        let reads = (0..32)
-            .map(|_| json!({"path":"src/lib.rs","hunk_id":hunk_id,"page":1}))
+        let hunk = &manifest[0].hunks[0];
+        let hunk_id = hunk.hunk_id.clone();
+        let total_pages = hunk.pages;
+        assert!(
+            total_pages >= 4,
+            "fixture must span several pages to exercise partial delivery"
+        );
+        let reads = (1..=total_pages)
+            .map(|page| json!({"path":"src/lib.rs","hunk_id":hunk_id,"page":page}))
             .collect::<Vec<_>>();
         let provider = FakeProvider::new(vec![
             tool_response(1, "read_diff", json!({"reads":reads})),
             tool_response(2, "complete_group", complete_call()),
         ]);
         let output = run(fixture, &provider).await;
-        assert_eq!(
-            output.status,
-            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Provider)
+        let delivered = delivered_page_count(&output);
+        assert!(delivered > 0, "pages that fit must still be delivered");
+        assert!(
+            delivered < total_pages as usize,
+            "not every requested page should fit in one bounded result"
         );
-        assert_eq!(delivered_page_count(&output), 0);
-        assert!(output.evidence.is_empty());
-        assert!(provider_request_contains(&provider, 1, "result_too_large"));
+        assert!(!output.evidence.is_empty());
+        assert!(provider_request_contains(&provider, 1, "undelivered"));
+    }
+
+    #[test]
+    fn read_diff_batch_fits_leaves_margin_for_the_response_wrapper() {
+        assert!(read_diff_batch_fits(&[]));
+        let small_page = json!({"content": "x".repeat(1_024)});
+        assert!(read_diff_batch_fits(&[small_page.clone(), small_page]));
+        let oversized_page = json!({"content": "x".repeat(MAX_TOOL_RESULT_BYTES)});
+        assert!(!read_diff_batch_fits(&[oversized_page]));
     }
 
     #[tokio::test]
