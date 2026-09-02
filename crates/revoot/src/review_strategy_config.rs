@@ -19,7 +19,6 @@ use crate::config::{ResolvedReviewConfiguration, resolve_review_configuration};
 
 const DEFAULT_MODEL_REQUESTS: u64 = 64;
 const MAX_MODEL_REQUESTS: u64 = 256;
-const DEFAULT_MODEL_TOKENS: u64 = 300_000;
 const MAX_MODEL_TOKENS: u64 = 2_000_000;
 const DEFAULT_TOOL_CALLS: u64 = 256;
 const MAX_TOOL_CALLS: u64 = 2_048;
@@ -29,6 +28,25 @@ const MIN_PARALLEL_GROUPS: u64 = 1;
 const DEFAULT_PARALLEL_GROUPS: u64 = 2;
 const MAX_PARALLEL_GROUPS: u64 = 8;
 const TARGET_REQUEST_INPUT_TOKENS: u64 = 96_000;
+
+/// The aggregate token pool a full review draws its per-request reservations
+/// from. Every reservation is deliberately pessimistic (one encoded request
+/// byte reserves one token, with no discount for real tokenization - see
+/// `estimate_wire_tokens`), so this pool has to be sized for
+/// `DEFAULT_MODEL_REQUESTS` real requests each near
+/// `TARGET_REQUEST_INPUT_TOKENS`, not for their much smaller actual token
+/// cost. A flat 300,000 only covered about three worst-case requests before
+/// `Exhausted(ModelTokens)` fired, starving every group after it regardless
+/// of real usage - clamped to the existing `MAX_MODEL_TOKENS` ceiling
+/// operators can already select, since `max_model_requests` and
+/// `max_cost_microusd` (bounded independently, $0.50/request) remain the
+/// real governors of total spend.
+const DEFAULT_MODEL_TOKENS: u64 =
+    if DEFAULT_MODEL_REQUESTS * TARGET_REQUEST_INPUT_TOKENS > MAX_MODEL_TOKENS {
+        MAX_MODEL_TOKENS
+    } else {
+        DEFAULT_MODEL_REQUESTS * TARGET_REQUEST_INPUT_TOKENS
+    };
 const MAX_REQUEST_OUTPUT_TOKENS: u64 = 4_096;
 const STRATEGY_VERSION: &str = "tool-first-v1";
 
@@ -458,7 +476,7 @@ mod tests {
             strategy.aggregate_budget.max_cost_microusd,
             64 * CONSERVATIVE_MODEL_CALL_COST_MICROUSD
         );
-        assert_eq!(strategy.aggregate_budget.max_model_tokens, 300_000);
+        assert_eq!(strategy.aggregate_budget.max_model_tokens, 2_000_000);
         assert_eq!(strategy.aggregate_budget.max_tool_calls, 256);
         assert_eq!(strategy.aggregate_budget.max_elapsed_millis, 600_000);
         assert_eq!(strategy.max_inline_diff_bytes, 16_384);

@@ -156,7 +156,7 @@ The dogfood run for `e9c9753` is currently active. When it completes:
    - grouping/planning/review/verification/adjudication requests and tokens.
 4. Confirm CI run `33577710162` also passes.
 
-For this nearly 1 MiB change, a partial result can be legitimate under a 300,000-token aggregate ceiling. It is not acceptable if it again delivers almost no diff bodies, silently loops, uses untrusted deferrals, or produces no candidates because the tool protocol is unusable.
+For this nearly 1 MiB change, a partial result can be legitimate under the aggregate token ceiling (raised from 300,000 to 2,000,000 after dogfooding showed the pessimistic byte-for-byte reservation estimate left the old ceiling room for only ~3 worst-case requests). It is not acceptable if it again delivers almost no diff bodies, silently loops, uses untrusted deferrals, or produces no candidates because the tool protocol is unusable.
 
 ## If the active dogfood run still fails quality
 
@@ -167,7 +167,7 @@ Do not tune budgets or turn ceilings blindly. Add or inspect payload-free operat
 3. Count candidate submissions and rejection reason codes without retaining finding content.
 4. Verify `read_diff` calls use exact structured `path`, raw `hunk_id`, and `missing_pages` values.
 5. If reads succeed but candidates remain zero, inspect whether evidence IDs and anchor IDs are visible in the immediately following packet and whether the final-turn tool restriction leaves a candidate-submission opportunity.
-6. If coverage is distributed but the 300,000-token cap is genuinely reached, wire the existing phase allocator into live dispatch or reserve explicit verification/adjudication capacity rather than increasing the global default first.
+6. If coverage is distributed but the aggregate token cap is genuinely reached, wire the existing phase allocator into live dispatch or reserve explicit verification/adjudication capacity rather than increasing the global default again without this evidence.
 
 Raw prompts, raw provider responses, source bodies, and tool payloads must never be logged or persisted during this diagnosis.
 

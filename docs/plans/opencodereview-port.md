@@ -67,7 +67,7 @@ and Anthropic Messages remain the only direct model providers.
 - Effort: `medium`.
 - Parallel groups: 2, operator range 1-8.
 - Model requests: 64, range 1-256.
-- Combined model tokens: 300,000, range 1-2,000,000.
+- Combined model tokens: 2,000,000, range 1-2,000,000 (sized so the default 64 model requests can each reach the 96,000-token per-request target under the pessimistic byte-for-byte reservation estimate).
 - Local tool calls: 256, range 1-2,048.
 - Deadline: 600 seconds.
 - Per-request input target: 96,000 tokens.

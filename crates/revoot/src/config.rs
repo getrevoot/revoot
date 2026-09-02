@@ -684,7 +684,9 @@ fn adapt_document(
         }
         if let Some(budget) = document.budget {
             if budget.max_model_requests.is_some_and(|value| value > 64)
-                || budget.max_model_tokens.is_some_and(|value| value > 300_000)
+                || budget
+                    .max_model_tokens
+                    .is_some_and(|value| value > 2_000_000)
                 || budget.max_tool_calls.is_some_and(|value| value > 256)
                 || budget.deadline_seconds.is_some_and(|value| value > 600)
             {
@@ -1152,7 +1154,7 @@ fn product_schema() -> Result<ConfigurationSchema, Diagnostic> {
         ),
         unsigned_field(
             "budget.max_model_tokens",
-            300_000,
+            2_000_000,
             AssignmentScope::RepositoryAndTrusted,
             1,
             2_000_000,

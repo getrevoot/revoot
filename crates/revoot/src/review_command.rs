@@ -3724,7 +3724,7 @@ mod tests {
             exploration.max_repository_bytes,
             defaults.max_repository_bytes
         );
-        assert_eq!(exploration.max_input_tokens, 300_000);
+        assert_eq!(exploration.max_input_tokens, 2_000_000);
         assert_eq!(exploration.max_output_tokens, 64 * 4_096);
     }
 
