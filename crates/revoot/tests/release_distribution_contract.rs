@@ -21,6 +21,8 @@ fn release_workflow_builds_packages_images_and_checksums() {
     assert!(pipeline.contains("mise run release:version"));
     assert!(pipeline.contains("mise run package:linux"));
     assert!(pipeline.contains("mise run package:macos"));
+    assert!(pipeline.contains("mise run \"package:oci:${{ matrix.architecture }}\""));
+    assert!(pipeline.contains("REVOOT_OCI_TAG=\"$IMAGE:$IMAGE_TAG\""));
     assert!(pipeline.contains("mise run release:checksums"));
     assert!(pipeline.contains("mise run release:notes"));
     assert!(pipeline.contains("mise run sbom"));
@@ -45,6 +47,41 @@ fn linux_archive_verification_uses_portable_numeric_ownership() {
     assert!(verifier.contains("$3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/"));
     assert!(verifier.contains("-rwxr-xr-x 0 0 revoot"));
     assert!(!verifier.contains("*root*root*"));
+    assert!(verifier.contains("THIRD_PARTY_NOTICES.md"));
+    assert!(verifier.contains("embedded-review-rules-LICENSE.md"));
+}
+
+#[test]
+fn distribution_surfaces_retain_third_party_notices() {
+    let root = workspace();
+    for script in [
+        "scripts/package-linux-artifact.sh",
+        "scripts/package-macos-artifact.sh",
+    ] {
+        let package = fs::read_to_string(root.join(script)).expect("package script");
+        assert!(package.contains("THIRD_PARTY_NOTICES.md"), "{script}");
+        assert!(
+            package.contains("crates/revoot/assets/review_rules/LICENSE.md"),
+            "{script}"
+        );
+    }
+
+    let image = fs::read_to_string(root.join("packaging/oci/Dockerfile")).expect("OCI file");
+    assert!(image.contains("THIRD_PARTY_NOTICES.md"));
+    assert!(image.contains("embedded-review-rules-LICENSE.md"));
+
+    let builder =
+        fs::read_to_string(root.join("scripts/build-oci-image.sh")).expect("OCI build script");
+    assert!(builder.contains("docker cp"));
+    assert!(builder.contains("image-THIRD_PARTY_NOTICES.md"));
+    assert!(builder.contains("image-embedded-review-rules-LICENSE.md"));
+
+    let dogfood =
+        fs::read_to_string(root.join(".github/workflows/revoot.yml")).expect("dogfood workflow");
+    assert!(dogfood.contains("THIRD_PARTY_NOTICES.md > image-context/THIRD_PARTY_NOTICES.md"));
+    assert!(dogfood.contains(
+        "licenses/embedded-review-rules-LICENSE.md > image-context/embedded-review-rules-LICENSE.md"
+    ));
 }
 
 #[test]
@@ -221,6 +258,8 @@ fn release_version_guard_binds_tag_package_and_changelog() {
         &["init"][..],
         &["config", "user.name", "Revoot Test"][..],
         &["config", "user.email", "test@example.invalid"][..],
+        &["config", "commit.gpgSign", "false"][..],
+        &["config", "tag.gpgSign", "false"][..],
         &["add", "."][..],
         &["commit", "-m", "test: release fixture"][..],
         &["tag", "-a", "v0.1.0", "-m", "Revoot v0.1.0"][..],
@@ -280,6 +319,8 @@ fn merged_release_tagger_is_validated_and_idempotent() {
         &["init", "-b", "main"][..],
         &["config", "user.name", "Revoot Test"][..],
         &["config", "user.email", "test@example.invalid"][..],
+        &["config", "commit.gpgSign", "false"][..],
+        &["config", "tag.gpgSign", "false"][..],
         &["add", "."][..],
         &["commit", "-m", "chore: release v0.1.0"][..],
     ] {

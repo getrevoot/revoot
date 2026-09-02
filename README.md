@@ -5,22 +5,27 @@
 <p align="center"><strong>Agentic code review made easy.</strong></p>
 
 Revoot is an independent AI reviewer built for agent-written code—not a wrapper
-that stuffs one giant diff into a prompt. Its review engine ranks changed files
-by signal, splits large changes into bounded work units, and gives the reviewing
-agent read-only tools to investigate a policy-approved checkout inventory and
-commit history.
+that stuffs one giant diff into a prompt. Its tool-first engine ranks changed
+files by signal, groups them into isolated review workers, and gives each worker
+bounded read-only tools to inspect exact diff hunks, a policy-approved checkout
+inventory, rules, prior discussions, and commit history. Large groups begin
+from metadata and fetch only the evidence they need.
 Candidate findings are evidence-checked, confidence-filtered, deduplicated, and
 ranked before Revoot publishes line-specific comments and a concise risk
 summary.
 
 Reviews carry forward as the code changes. Revoot remembers existing
-discussions, respects human resolutions, re-anchors findings when lines move,
-and updates one summary instead of starting over or posting duplicates. The
-pull or merge request is the state store—no external service or database
-required.
+discussions, respects human resolutions, and updates one summary instead of
+starting over or posting duplicates. A model cannot relocate a finding:
+comments bind to exact anchors from the authoritative diff, and a prior finding
+can be marked fixed only after its current location or deletion hunk was
+inspected. The pull or merge request is the state store—no external service or
+database required.
 
-Revoot is bring-your-own-keys (BYOK): it calls Anthropic or OpenAI directly from your
-CI runner. There is no Revoot service or hosted control plane.
+Revoot is bring-your-own-keys (BYOK): it calls Anthropic or OpenAI directly from
+your CI runner. Those are the only model providers; Bedrock and arbitrary
+compatible endpoints are not supported. There is no Revoot service or hosted
+control plane.
 
 > Revoot is pre-1.0. Interfaces may change between minor releases.
 
@@ -87,6 +92,7 @@ max_findings = 12
 
 [model_context]
 exclude = ["internal/**", "fixtures/private/**"]
+max_inline_diff_bytes = 16384
 
 [[rules]]
 paths = ["src/payments/**"]
@@ -96,8 +102,29 @@ focus = ["authorization", "idempotency"]
 The [configuration reference](docs/configuration.md) also covers repository
 fields, guidance, budgets, and finding suppressions.
 
-Use `revoot review --help` for command options and `--format json` for
-machine-readable output.
+Use `revoot review --help` for command options, `--format json` for the
+`revoot.review-report/v3` machine-readable report, or `--format sarif` for
+exact-anchor SARIF 2.1.0. Host agents can start the read-only stdio integration
+with `revoot mcp serve`. See the
+[CLI and agent integration guide](docs/cli-and-agent-integration.md) for review,
+scan, delegation, rules, MCP, coverage, partial-result, and output contracts.
+
+Provider-free inspection commands expose the same deterministic preparation
+contracts without sending source to a model:
+
+```sh
+revoot review --preview
+revoot scan --preview --format json
+revoot rules check src/lib.rs --json
+revoot delegate manifest
+revoot delegate preview
+revoot delegate rule src/lib.rs
+```
+
+`scan --preview` produces a body-free, immutable local scan plan. A completed
+scan uses the configured direct provider and emits local human, JSON, or SARIF
+findings; it never publishes to a pull or merge request. Untracked files require
+the explicit local `--include-untracked` flag and are rejected in CI.
 
 ## Running Revoot locally
 
@@ -125,6 +152,8 @@ infers the default branch; append `--base origin/release` to override it.
 
 Revoot does not modify the checkout or execute repository code. Reviewed code
 and selected repository context are sent directly to your configured provider.
+The shipped binary does not invoke a shell or Git executable and has no Node,
+Bun, model CLI, or external agent-harness runtime dependency.
 
 ### Run via native binary
 

@@ -17,6 +17,33 @@ Add either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a masked CI/CD variable.
 Provider and model default to `auto` and can be overridden through component
 inputs.
 
+Revoot calls the selected Anthropic or OpenAI API directly. The component does
+not install or launch a model CLI, Node, Bun, or another agent harness, and
+Revoot does not support Bedrock. Checkout inspection uses embedded Git; Revoot
+does not execute Git, repository hooks, a shell, or reviewed code.
+
+## Review execution and report
+
+The component runs the tool-first engine: deterministic risk selection,
+metadata-only semantic grouping when needed, isolated bounded workers, measured
+diff coverage, candidate verification, and global adjudication. Large group
+diffs begin from hunk manifests instead of being copied into every model turn.
+
+Every job retains `revoot-review.json` as a developer-visible artifact for
+seven days. It uses `revoot.review-report/v3` and includes exact finding
+coordinates, overview, lineage/publication state, selection, strategy,
+risk-adaptive coverage, and five reconciled usage phases. It contains bounded
+consumer-facing finding prose and evidence, which may quote approved source,
+but excludes prompts, raw responses, raw tool payloads, automatically retained
+source pages, and temporary artifact paths.
+
+Budget exhaustion or incomplete required coverage stops new dispatch and
+returns verified findings as an explicitly partial review. Partial coverage
+never resolves an existing lineage automatically. Publication failures remain
+job failures; a computed partial review is not itself a publication failure.
+Operator variables may select effort and concurrency within product bounds;
+repository configuration can only lower resource ceilings.
+
 ## Publishing token
 
 Revoot needs a write-capable token to create inline discussions, resolve its
@@ -59,6 +86,12 @@ discussions. Resolved findings stay suppressed unless semantic review confirms
 a recurrence. Human and other bot discussions may suppress duplicates but are
 never modified. Embedded metadata identifies owned comments; GitLab remains
 the state store.
+
+For a provider-free diagnostic before enabling publication, run
+`revoot review --ci --preview --format json` with publication disabled. Preview
+prepares and replay-validates selection, grouping/rule metadata, and budgets but
+does not discover provider credentials, call a model, or publish. SARIF is
+available only for completed findings and uses exact issued anchors.
 
 ## Component project
 

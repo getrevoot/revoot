@@ -1,0 +1,156 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Revoot",
+          "informationUri": "https://github.com/getrevoot/revoot",
+          "rules": [
+            {
+              "id": "revoot.correctness",
+              "name": "Correctness",
+              "shortDescription": {
+                "text": "Revoot Correctness finding"
+              }
+            },
+            {
+              "id": "revoot.security",
+              "name": "Security",
+              "shortDescription": {
+                "text": "Revoot Security finding"
+              }
+            },
+            {
+              "id": "revoot.reliability",
+              "name": "Reliability",
+              "shortDescription": {
+                "text": "Revoot Reliability finding"
+              }
+            }
+          ]
+        }
+      },
+      "invocations": [
+        {
+          "executionSuccessful": true
+        }
+      ],
+      "results": [
+        {
+          "ruleId": "revoot.correctness",
+          "level": "warning",
+          "message": {
+            "text": "Finding 1: exact verified evidence."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/old%20name.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 4,
+                  "endLine": 4
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "revootFindingKey/v1": "1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          "properties": {
+            "anchorId": "ga1_c239683aa3f269ae949293045fb341908e4c5e9fae40b9525a3d0451d21e46a5",
+            "workUnitId": "wu-contract",
+            "confidencePercent": 91,
+            "diffSide": "old",
+            "oldLine": 4,
+            "contentSha256": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        },
+        {
+          "ruleId": "revoot.security",
+          "level": "error",
+          "message": {
+            "text": "Finding 2: exact verified evidence."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/new%20%23name.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 7,
+                  "endLine": 7
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "revootFindingKey/v1": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "properties": {
+            "anchorId": "ga1_7db4f19b0c22b30a4572b3b9c8e37f541bffe8b586f4ac7deccd17eca20dbdd2",
+            "workUnitId": "wu-contract",
+            "confidencePercent": 91,
+            "diffSide": "new",
+            "newLine": 7,
+            "contentSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        },
+        {
+          "ruleId": "revoot.reliability",
+          "level": "note",
+          "message": {
+            "text": "Finding 3: exact verified evidence."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/new%20%23name.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 9,
+                  "endLine": 9
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "revootFindingKey/v1": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          "properties": {
+            "anchorId": "ga1_85677d83a9053cee7cd20f128cdbc320523df2944612b009f63e5d8397d48e4e",
+            "workUnitId": "wu-contract",
+            "confidencePercent": 91,
+            "diffSide": "both",
+            "oldLine": 8,
+            "newLine": 9,
+            "contentSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        }
+      ],
+      "properties": {
+        "snapshotSha256": "abee6b73cd685ca172c7516021f7b1e24c1a07cfd4cb3bfeaafb2d5a7852ae6b",
+        "partial": false,
+        "coverage": {
+          "selectedFiles": 3,
+          "fullyReadFiles": 1,
+          "sampledFiles": 1,
+          "manifestOnlyFiles": 1,
+          "deliveredHighRiskHunks": 2,
+          "requiredHighRiskHunks": 2,
+          "explicitDeferrals": 1,
+          "failedGroups": 0,
+          "policyVersion": "revoot.risk-adaptive-coverage/v1"
+        }
+      }
+    }
+  ]
+}

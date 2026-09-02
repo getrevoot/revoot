@@ -121,14 +121,14 @@ fn invocation() -> ReviewInvocation {
 }
 
 #[test]
-fn cli_exposes_one_review_operation_without_internal_modes() {
+fn cli_exposes_one_review_operation_with_bounded_controls() {
     let root_help = successful_stdout(&["--help"]);
     let review_operations: Vec<_> = root_help
         .lines()
         .map(str::trim)
         .filter(|line| line.starts_with("revoot review"))
         .collect();
-    assert_eq!(review_operations, ["revoot review"]);
+    assert_eq!(review_operations, ["revoot review [OPTIONS]"]);
 
     let config_help = successful_stdout(&["config", "explain", "--help"]);
     let init_help = successful_stdout(&["init", "gitlab", "--help"]);

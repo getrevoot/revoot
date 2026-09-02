@@ -41,7 +41,10 @@ run = "cd crates/revoot && cargo cyclonedx --format json --all --target all --sp
 
 [tasks.contracts]
 description = "Validate versioned contracts and golden vectors"
-run = "cargo test --locked -p revoot-core"
+run = [
+  "cargo test --locked -p revoot-core",
+  "cargo test --locked -p revoot --test versioned_contract_artifacts",
+]
 
 [tasks."check:targets"]
 description = "Validate both supported Linux musl targets with the pinned Zig toolchain"
@@ -65,6 +68,10 @@ run = "cargo test --locked -p revoot --test live_provider_conformance -- --ignor
 [tasks."test:quality:live"]
 description = "Optionally run one provider through the review scenario corpus"
 run = "cargo test --locked -p revoot --test live_review_quality live_full_checkout_quality -- --ignored --exact --nocapture"
+
+[tasks."test:live-quality"]
+description = "Backward-compatible alias for the credentialed live review quality task"
+run = [{ task = "test:quality:live" }]
 
 [tasks."release:version"]
 description = "Require the release tag, Cargo package version, and changelog to agree"

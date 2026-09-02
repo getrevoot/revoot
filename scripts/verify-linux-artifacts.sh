@@ -80,10 +80,14 @@ verify_archive() {
       echo "archive contains non-normalized ownership: $entry ($uid:$gid)" >&2
       exit 1
     fi
+    if [[ $entry != revoot && $_mode != '-rw-r--r--' ]]; then
+      echo "archive documentation has an unsafe mode: $entry ($_mode)" >&2
+      exit 1
+    fi
   done <<< "$metadata"
 
   members=$(tar -tzf "$archive")
-  if [[ $members != $'revoot\nLICENSE\ncompletions/revoot.bash\ncompletions/_revoot\ncompletions/revoot.fish' ]]; then
+  if [[ $members != $'revoot\nLICENSE\nTHIRD_PARTY_NOTICES.md\nlicenses/embedded-review-rules-LICENSE.md\ncompletions/revoot.bash\ncompletions/_revoot\ncompletions/revoot.fish' ]]; then
     echo "archive member set or order is wrong: $archive" >&2
     exit 1
   fi
@@ -102,6 +106,9 @@ verify_archive() {
   fi
 
   cmp <(tar -xOzf "$archive" LICENSE) LICENSE
+  cmp <(tar -xOzf "$archive" THIRD_PARTY_NOTICES.md) THIRD_PARTY_NOTICES.md
+  cmp <(tar -xOzf "$archive" licenses/embedded-review-rules-LICENSE.md) \
+    crates/revoot/assets/review_rules/LICENSE.md
   cmp <(tar -xOzf "$archive" completions/revoot.bash) packaging/completions/revoot.bash
   cmp <(tar -xOzf "$archive" completions/_revoot) packaging/completions/_revoot
   cmp <(tar -xOzf "$archive" completions/revoot.fish) packaging/completions/revoot.fish

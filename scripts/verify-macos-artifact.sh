@@ -21,7 +21,7 @@ if strings "$binary" | grep -Fq "$project_root"; then
 fi
 
 members=$(tar -tzf "$archive")
-expected=$'revoot\nLICENSE\ncompletions/revoot.bash\ncompletions/_revoot\ncompletions/revoot.fish'
+expected=$'revoot\nLICENSE\nTHIRD_PARTY_NOTICES.md\nlicenses/embedded-review-rules-LICENSE.md\ncompletions/revoot.bash\ncompletions/_revoot\ncompletions/revoot.fish'
 if [[ $members != "$expected" ]]; then
   echo "macOS archive member set or order is wrong" >&2
   exit 1
@@ -35,6 +35,9 @@ archived_hash=$(tar -xOzf "$archive" revoot | shasum -a 256 | awk '{print $1}')
 built_hash=$(shasum -a 256 "$binary" | awk '{print $1}')
 test "$archived_hash" = "$built_hash"
 cmp <(tar -xOzf "$archive" LICENSE) LICENSE
+cmp <(tar -xOzf "$archive" THIRD_PARTY_NOTICES.md) THIRD_PARTY_NOTICES.md
+cmp <(tar -xOzf "$archive" licenses/embedded-review-rules-LICENSE.md) \
+  crates/revoot/assets/review_rules/LICENSE.md
 cmp <(tar -xOzf "$archive" completions/revoot.bash) packaging/completions/revoot.bash
 cmp <(tar -xOzf "$archive" completions/_revoot) packaging/completions/_revoot
 cmp <(tar -xOzf "$archive" completions/revoot.fish) packaging/completions/revoot.fish

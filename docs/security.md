@@ -9,10 +9,11 @@ change without turning repository content into executable authority.
 ## What crosses each boundary
 
 The model provider receives the trusted reviewer policy plus bounded review
-data: selected diffs and anchors, policy-approved repository file excerpts,
-bounded commit history, repository guidance, and prior review discussions. The
-selected provider key is attached by the HTTP adapter as authentication; it is
-not placed in the prompt or a model tool result.
+data: small selected group diffs or requested diff pages, exact anchors,
+policy-approved repository file excerpts, bounded commit history, repository
+guidance, and prior review discussions. Metadata-only grouping requests never
+contain diff bodies. The selected provider key is attached by the HTTP adapter
+as authentication; it is not placed in the prompt or a model tool result.
 
 Code-host credentials are used only by the GitHub or GitLab transport. They are
 not included in model requests. Unknown environment variables are ignored by
@@ -63,6 +64,33 @@ developers can review work in progress. The same sensitive-path policy still
 applies, but CI's tracked-only guarantee does not. Keep unrelated sensitive
 files outside a locally reviewed worktree or exclude them explicitly.
 
+Local scan is narrower: tracked files are the default, and untracked files are
+included only with an explicit local `--include-untracked`. That flag is
+rejected when Revoot detects CI. Scan findings are local output and cannot enter
+the GitHub or GitLab publication controllers.
+
+## Private diff handling and bounded context
+
+Selected unified diffs are materialized for one run in a randomized private
+temporary directory. The directory is mode `0700`, artifact files are mode
+`0600`, filenames are internal digests rather than repository paths, and the
+model never receives an artifact filesystem path. RAII cleanup removes the
+store on success, error, or cancellation.
+
+Groups no larger than 16 KiB may receive their complete diff once when the
+whole request remains inside the 96,000-token target. Larger groups receive
+only file and hunk metadata initially. Workers fetch exact bounded hunk pages
+with `read_diff` or search the private artifacts with `search_diff`; no large
+group is partially inlined. Tool results are deterministically paginated and
+never exceed 32 KiB. Delivered coverage is recorded from successful inline and
+tool results rather than model claims.
+
+Rebased model turns retain the immutable compact group brief, a structured
+checkpoint of at most 4 KiB, and only the latest tool-call/result exchange.
+Older source slices and raw conversation history are not repeatedly inserted,
+persisted, or summarized by another model call. Revoot does not use
+provider-side conversation retention or a previous-response identifier.
+
 ## Prompt-injection containment
 
 Repository content is placed in delimited user content and is explicitly
@@ -70,13 +98,15 @@ labeled untrusted. Repository guidance can express domain invariants and review
 priorities, but cannot change provider selection, credentials, budgets,
 publication, network policy, or the trusted system prompt.
 
-The model has a closed tool set: list approved files, read approved files,
-search approved files, inspect approved diffs and bounded history, read prior
-discussions, submit a candidate finding, and submit one summary. There is no
-shell, subprocess, environment, arbitrary HTTP, filesystem write, code-host
-write, or credential tool. Tool arguments are parsed through strict schemas and
-the repository toolbox independently enforces its allowlist, so prompt text
-cannot grant access to a denied path.
+The model has a closed tool set: inspect the assigned diff manifest, read or
+search bounded diff pages, find/read/search allowlisted snapshot files, inspect
+bounded history and prior discussions, fetch effective rule guidance by ID,
+checkpoint bounded structured state, submit an exact-anchor candidate, and
+complete a group only after the coverage gate permits it. There is no shell,
+subprocess, environment, arbitrary HTTP, filesystem write, code-host write, or
+credential tool. Tool arguments are parsed through strict schemas and the
+repository toolbox independently enforces its allowlist, so prompt text cannot
+grant access to a denied path.
 
 Publication is a separate deterministic stage. Findings must bind to an anchor
 issued from the authoritative diff, pass size and confidence limits, and survive
@@ -85,6 +115,21 @@ external URLs, code-host quick actions, marker injection, and control characters
 are rejected; HTML is escaped. The model never receives a publication tool or
 a host token.
 
+Coverage and lineage also fail closed. Coverage is advanced only by content
+actually inlined or returned successfully by a read tool. An incomplete
+high/standard-risk contract, budget exhaustion, tool failure, verifier failure,
+or cancellation produces an explicit partial result. Verified partial findings
+may still be reported or published, but partial coverage never authorizes a
+prior finding to be marked fixed. Exact-anchor SARIF rejects unknown and
+line-zero anchors rather than fabricating a path or coordinate.
+
+The stdio MCP server exposes the same bounded read-only repository and diff
+handlers through opaque process-local review handles. It has no listener,
+publication, write, command, provider-call, credential, environment, or network
+tool. Cursor tokens are authenticated and bound to the handle, snapshot, tool,
+and query; stale, tampered, cross-handle, and cross-snapshot cursors fail closed.
+Standard output is reserved for protocol JSON.
+
 These are capability controls, not a claim that prompt injection is solved. A
 successful injection can still influence analysis or cause allowed repository
 text to be repeated in plain-text output. Keep secrets out of the tracked
@@ -92,7 +137,9 @@ reviewable repository and use the context policy as a second boundary.
 
 ## Network and runtime containment
 
-Revoot constructs clients only for the selected model provider and code host.
+Revoot constructs clients only for the selected direct Anthropic or OpenAI
+provider and the code host. Bedrock, generic compatible endpoints, and
+repository-selected endpoints are not supported.
 Endpoints must be canonical HTTPS; requests use exact origins and API paths,
 platform DNS results are pinned to the client, private and special-purpose
 addresses are denied unless an operator explicitly allows a CIDR for a
@@ -111,8 +158,9 @@ The OCI image declares UID/GID 65532. GitLab runs the image as that user. A
 GitHub job container starts as root because `actions/checkout` must populate the
 mounted workspace; the generated workflow then assigns the workspace to UID
 65532 and invokes only Revoot as that user with `no-new-privileges`. Git remains
-in the image for checkout compatibility, but Revoot uses its embedded Git
-implementation and never executes repository hooks or Git subprocesses.
+in the image for checkout compatibility, but the Revoot binary has no shell or
+Git runtime dependency: it uses its embedded Git implementation and never
+executes repository hooks, reviewed code, shell commands, or Git subprocesses.
 
 Generated configuration requires `image@sha256:DIGEST` references. The OCI base
 image and third-party GitHub Actions are pinned by digest or commit. Release CI
@@ -158,6 +206,10 @@ before adoption.
   validation blocks active links and markup abuse, not semantic disclosure.
 - Repository comments and uploaded JSON reports inherit the visibility and
   retention of the code host and CI artifact settings.
+- Revoot does not retain raw prompts, raw provider responses, tool payloads,
+  tool-returned source pages, or model reasoning for a session viewer. Bounded
+  finding prose and evidence may quote approved source. Provider-side retention
+  remains governed by the selected account and provider policy.
 
 ## Deployment checklist
 

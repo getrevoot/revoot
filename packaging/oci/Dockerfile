@@ -5,6 +5,7 @@ RUN apk add --no-cache ca-certificates git \
     && adduser -u 65532 -S -D -H -G revoot revoot
 
 COPY --chmod=0555 revoot /usr/local/bin/revoot
+COPY --chmod=0444 LICENSE THIRD_PARTY_NOTICES.md embedded-review-rules-LICENSE.md /usr/share/licenses/revoot/
 
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/revoot"]

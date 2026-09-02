@@ -11,6 +11,7 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentBudget, AgentBudgetError};
@@ -128,7 +129,7 @@ impl Default for RepositoryToolLimits {
             max_file_bytes: 2 * 1024 * 1024,
             max_read_bytes: 256 * 1024,
             max_search_bytes: 8 * 1024 * 1024,
-            max_search_matches: 200,
+            max_search_matches: 500,
             max_list_results: 2_000,
             max_diff_bytes: 2 * 1024 * 1024,
         }
@@ -288,6 +289,16 @@ pub struct SearchRequest {
     pub max_results: u32,
 }
 
+/// A bounded literal or Rust-regex repository search request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeSearchRequest {
+    pub query: String,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub paths: Vec<RepositoryRelativePath>,
+    pub max_results: u32,
+}
+
 /// Search results plus honest coverage evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -422,6 +433,15 @@ impl RepositoryToolbox {
     #[must_use]
     pub const fn inventory(&self) -> &RepositoryInventory {
         &self.inventory
+    }
+
+    /// Iterate the exact trusted diffs without charging a model tool budget.
+    ///
+    /// This setup-only view allows the runtime to materialize private indexed
+    /// artifacts before any model call. It does not expose checkout paths or
+    /// bytes outside the current process.
+    pub fn exact_diffs(&self) -> impl Iterator<Item = (&RepositoryRelativePath, &str)> {
+        self.diffs.iter().map(|(path, text)| (path, text.as_str()))
     }
 
     /// List files below an optional repository-relative prefix.
@@ -599,6 +619,123 @@ impl RepositoryToolbox {
         })
     }
 
+    /// Search UTF-8 inventoried files using a literal or bounded Rust regex.
+    ///
+    /// Empty `paths` searches the complete admitted inventory. The regex crate
+    /// guarantees linear-time matching; compilation size is additionally
+    /// bounded so untrusted patterns cannot create excessive automata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid query or regex, invalid scope,
+    /// cancellation, changed files, or aggregate budget exhaustion.
+    pub fn search_code(
+        &self,
+        request: &CodeSearchRequest,
+        budget: &mut AgentBudget,
+        cancellation: &CancellationToken,
+        now_millis: u64,
+    ) -> Result<SearchResult, RepositoryToolError> {
+        check_cancelled(cancellation)?;
+        if request.query.is_empty()
+            || request.query.len() > MAX_QUERY_BYTES
+            || request.query.contains(['\n', '\r', '\0'])
+            || request.max_results == 0
+            || request.max_results > self.limits.max_search_matches
+        {
+            return Err(RepositoryToolError::InvalidQuery);
+        }
+        let pattern = if request.regex {
+            request.query.clone()
+        } else {
+            regex::escape(&request.query)
+        };
+        let compiled_regex = RegexBuilder::new(&pattern)
+            .case_insensitive(!request.case_sensitive)
+            .size_limit(1024 * 1024)
+            .dfa_size_limit(1024 * 1024)
+            .build()
+            .map_err(|_| RepositoryToolError::InvalidQuery)?;
+        let candidates: Vec<_> = if request.paths.is_empty() {
+            self.inventory.files.iter().map(|file| &file.path).collect()
+        } else {
+            request
+                .paths
+                .iter()
+                .map(|path| {
+                    self.files
+                        .get_key_value(path)
+                        .map(|(key, _)| key)
+                        .ok_or(RepositoryToolError::PathNotInventoried)
+                })
+                .collect::<Result<_, _>>()?
+        };
+        let reserved_bytes = candidates
+            .iter()
+            .filter_map(|path| self.files.get(*path))
+            .map(|file| file.public.size_bytes.min(self.limits.max_file_bytes))
+            .fold(0_u64, u64::saturating_add)
+            .min(self.limits.max_search_bytes);
+        budget.charge_tool(
+            1,
+            u64::try_from(candidates.len()).unwrap_or(u64::MAX),
+            reserved_bytes,
+            now_millis,
+        )?;
+        let mut matches = Vec::new();
+        let mut scanned_files = 0_u32;
+        let mut skipped_files = 0_u32;
+        let mut scanned_bytes = 0_u64;
+        let mut truncated = false;
+        for path in candidates {
+            check_cancelled(cancellation)?;
+            let Some(file) = self.files.get(path) else {
+                return Err(RepositoryToolError::PathNotInventoried);
+            };
+            if file.public.size_bytes > self.limits.max_file_bytes
+                || scanned_bytes.saturating_add(file.public.size_bytes)
+                    > self.limits.max_search_bytes
+            {
+                skipped_files = skipped_files.saturating_add(1);
+                truncated = true;
+                continue;
+            }
+            let bytes = match self.read_inventoried(path) {
+                Ok(bytes) => bytes,
+                Err(RepositoryToolError::NonUtf8Content | RepositoryToolError::FileTooLarge) => {
+                    skipped_files = skipped_files.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            scanned_bytes =
+                scanned_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                skipped_files = skipped_files.saturating_add(1);
+                continue;
+            };
+            scanned_files = scanned_files.saturating_add(1);
+            collect_regex_matches(
+                path,
+                text,
+                &compiled_regex,
+                request.max_results,
+                &mut matches,
+                &mut truncated,
+            );
+            if matches.len() >= usize::try_from(request.max_results).unwrap_or(usize::MAX) {
+                truncated = true;
+                break;
+            }
+        }
+        Ok(SearchResult {
+            matches,
+            scanned_files,
+            skipped_files,
+            truncated,
+        })
+    }
+
     /// Return a bounded exact diff supplied by the trusted acquisition layer.
     ///
     /// # Errors
@@ -735,6 +872,35 @@ fn collect_matches(
                     .saturating_add(1),
                 column: u32::try_from(column).unwrap_or(u32::MAX).saturating_add(1),
                 excerpt: bounded_excerpt(line, column, MAX_SEARCH_EXCERPT_BYTES),
+            });
+        }
+    }
+}
+
+fn collect_regex_matches(
+    path: &RepositoryRelativePath,
+    text: &str,
+    compiled_regex: &Regex,
+    max_results: u32,
+    matches: &mut Vec<SearchMatch>,
+    truncated: &mut bool,
+) {
+    let maximum = usize::try_from(max_results).unwrap_or(usize::MAX);
+    for (line_index, line) in text.lines().enumerate() {
+        for matched in compiled_regex.find_iter(line) {
+            if matches.len() == maximum {
+                *truncated = true;
+                return;
+            }
+            matches.push(SearchMatch {
+                path: path.clone(),
+                line: u32::try_from(line_index)
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1),
+                column: u32::try_from(matched.start())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1),
+                excerpt: bounded_excerpt(line, matched.start(), MAX_SEARCH_EXCERPT_BYTES),
             });
         }
     }
@@ -1311,6 +1477,61 @@ mod tests {
         assert_eq!(budget.usage().tool_calls, 4);
         assert_eq!(budget.usage().repository_files, 6);
         assert!(budget.usage().repository_bytes > 0);
+    }
+
+    #[test]
+    fn code_search_supports_bounded_regex_and_case_insensitive_literals() {
+        let fixture = Fixture::new();
+        let toolbox = toolbox(&fixture);
+        let cancellation = CancellationToken::default();
+        let mut budget = budget();
+        let regex = toolbox
+            .search_code(
+                &CodeSearchRequest {
+                    query: r"answer(_is)?".to_owned(),
+                    regex: true,
+                    case_sensitive: true,
+                    paths: vec![path("tests/answer.rs")],
+                    max_results: 10,
+                },
+                &mut budget,
+                &cancellation,
+                1,
+            )
+            .expect("regex search succeeds");
+        assert_eq!(regex.matches.len(), 2);
+
+        let literal = toolbox
+            .search_code(
+                &CodeSearchRequest {
+                    query: "FIXTURE".to_owned(),
+                    regex: false,
+                    case_sensitive: false,
+                    paths: vec![path("README.md")],
+                    max_results: 10,
+                },
+                &mut budget,
+                &cancellation,
+                2,
+            )
+            .expect("case-insensitive literal search succeeds");
+        assert_eq!(literal.matches.len(), 1);
+
+        assert_eq!(
+            toolbox.search_code(
+                &CodeSearchRequest {
+                    query: "(".to_owned(),
+                    regex: true,
+                    case_sensitive: true,
+                    paths: Vec::new(),
+                    max_results: 10,
+                },
+                &mut budget,
+                &cancellation,
+                3,
+            ),
+            Err(RepositoryToolError::InvalidQuery)
+        );
     }
 
     #[test]

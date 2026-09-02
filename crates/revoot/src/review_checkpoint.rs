@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 use revoot_core::{GitSha, RepositoryRelativePath, Sha256Digest};
 
 use crate::embedded_git::EmbeddedRepository;
-use crate::review_engine::REVIEWER_POLICY_VERSION;
 use crate::review_overview::{OVERVIEW_END, OVERVIEW_START};
+use crate::reviewer_policy::REVIEWER_POLICY_VERSION;
 
 const PREFIX: &str = "<!-- revoot:checkpoint:v1 ";
 const SUFFIX: &str = " -->";

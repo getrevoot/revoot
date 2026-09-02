@@ -1,0 +1,13 @@
+{
+  "policy_version": "revoot.risk-adaptive-coverage/v1",
+  "high_risk_files": 1,
+  "standard_risk_files": 1,
+  "low_risk_files": 1,
+  "fully_read_files": 1,
+  "sampled_files": 1,
+  "manifest_only_files": 1,
+  "delivered_high_risk_hunks": 2,
+  "required_high_risk_hunks": 2,
+  "explicit_deferrals": 1,
+  "failed_groups": 0
+}

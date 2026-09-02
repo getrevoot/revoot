@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use revoot_core::provider::ProviderAdapter;
@@ -15,10 +16,15 @@ use revoot_core::{
     CancellationToken, CertificateAuthorityMode, ConfigValue, Diagnostic, ErrorCode,
     GitLabOriginPolicy, GitLabProjectIdentity, GitLabVerificationInput, GitLabWireLimits, GitSha,
     IpCidr, IssuedWorkUnitAnchors, MergeRequestIid, PartitionLimits, PublicationCandidate,
-    PublicationTarget, PullRequestNumber, RankedFinding, RepositoryPath, RepositoryRelativePath,
-    RepositoryToolLimits, ReviewOmissionReason, ReviewOutcome, ReviewPartitionPlan,
-    ReviewSelectionPolicy, ReviewSnapshotIdentity, ReviewValueTier, Severity, SnapshotReadiness,
-    UnifiedDiffLimits, classify_gitlab_ci_environment, parse_project_response,
+    PublicationTarget, PullRequestNumber, RankedFinding, RepositoryPath, RepositoryToolLimits,
+    ReviewBudgetBroker, ReviewGroupingSource, ReviewOmissionReason, ReviewOutcome,
+    ReviewPartitionPlan, ReviewPreview, ReviewPreviewGroupInput, ReviewPreviewRule,
+    ReviewPreviewRuleSource, ReviewPreviewStrategy, ReviewReportCoverage, ReviewReportOverview,
+    ReviewReportPhase, ReviewReportPhaseUsage, ReviewReportPublication, ReviewReportSelection,
+    ReviewReportState, ReviewReportStrategy, ReviewReportUsage, ReviewReportUsageTotals,
+    ReviewReportV3, ReviewSelectionPolicy, ReviewSnapshotIdentity, ReviewValueTier, Severity,
+    Sha256Digest, SnapshotReadiness, UnifiedDiffLimits, build_review_group_plan,
+    build_review_preview, classify_gitlab_ci_environment, parse_project_response,
     validate_rank_and_render,
 };
 use rustls::pki_types::pem::{PemObject, SectionKind};
@@ -28,8 +34,8 @@ use sha2::{Digest, Sha256};
 use crate::config::{
     RepositoryReviewPolicy, ResolvedReviewConfiguration, resolve_review_configuration,
 };
-use crate::credentials::{CredentialKind, DiscoveredCredentials};
-use crate::egress_setup::{authorize_configured_provider, authorize_standard_provider};
+use crate::credentials::DiscoveredCredentials;
+use crate::egress_setup::authorize_configured_provider;
 use crate::git_history::GitHistoryToolbox;
 use crate::github_checkout::{
     DiscoveredGitHubRepository, GitHubCiContext, GitHubRepositorySlug, GitHubServer,
@@ -66,28 +72,38 @@ use crate::gitlab_transport::{
     GitLabCaMode, GitLabCustomCaBundle, GitLabReadClient, GitLabReadEndpoint,
     GitLabTransportConfig, GitLabTransportLimits, GitLabWriteClient,
 };
+use crate::group_worker_engine::{GroupWorkerClock, GroupWorkerLimits};
 use crate::local_review::{
     LocalReviewContext, LocalReviewContextOptions, build_local_review_context, capture_local_git,
     local_snapshot_is_fresh,
 };
 use crate::prior_review::{acquire_github_prior_review, acquire_gitlab_prior_review};
-use crate::providers::ApiKey;
-use crate::providers::anthropic::{AnthropicAdapter, AnthropicConfig};
-use crate::providers::openai::{OpenAiAdapter, OpenAiConfig};
+use crate::review_adjudicator::ReviewAdjudicatorClock;
 use crate::review_checkpoint::{
     ReviewAttention, ReviewCheckpoint, extract_checkpoint, plan_attention,
 };
-use crate::review_engine::{
-    IndependentReviewBrief, MonotonicClock, PriorFindingDisposition, PriorFindingDispositionKind,
-    ReviewAnchor, ReviewEngineLimits, ReviewEngineRequest, ReviewReport, run_review,
+use crate::review_contracts::{
+    PriorFindingDisposition, PriorFindingDispositionKind, ReviewCoverage, ReviewStrategy,
 };
+use crate::review_grouper::ReviewGrouperClock;
 use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
 };
+use crate::review_sarif::render_report_v3_sarif;
+use crate::review_strategy_config::{
+    ReviewStrategyConfiguration, escalate_effort_for_large_diff, strategy_from_resolved,
+};
+use crate::review_verifier::ReviewVerifierClock;
+use crate::reviewer_policy::{REVIEWER_POLICY_VERSION, tool_first_reviewer_system_policy};
+use crate::rule_diagnostics::{
+    RepositoryRuleMetadata, RuleDiagnosticPolicy, RulePrecedenceSource, diagnose_rules,
+};
+use crate::tool_first_engine::{
+    ToolFirstEngineLimits, ToolFirstEngineReport, ToolFirstEngineRequest, run_tool_first_engine,
+};
+use crate::tool_first_report::{ToolFirstReportInput, build_tool_first_report};
 
-const REPORT_SCHEMA_VERSION: &str = "revoot.review-report/v2";
-const MODEL_CATALOG_SCHEMA_VERSION: &str = "revoot.model-catalog/v1";
-const MODEL_CATALOG: &str = include_str!("../assets/model-catalog-v1.json");
+const TERMINAL_REPORT_SCHEMA_VERSION: &str = "revoot.review-terminal/v1";
 const MAX_CODE_HOST_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
 const DEFERRED_PROVIDER: &str = "deferred";
 const DEFERRED_MODEL: &str = "deferred";
@@ -97,31 +113,21 @@ enum OutputFormat {
     #[default]
     Human,
     Json,
+    Sarif,
 }
 
 #[derive(Debug, Default)]
 struct ReviewArgs {
     ci: bool,
+    preview: bool,
+    effort: Option<revoot_core::ReviewEffort>,
+    max_parallel_groups: Option<u8>,
     format: OutputFormat,
     output: Option<PathBuf>,
     base_ref: Option<String>,
     merge_request_iid: Option<MergeRequestIid>,
     pull_request_number: Option<PullRequestNumber>,
     github_repository: Option<GitHubRepositorySlug>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelCatalog {
-    schema_version: String,
-    providers: Vec<ModelCatalogProvider>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelCatalogProvider {
-    adapter: String,
-    default_model: String,
 }
 
 #[derive(Serialize)]
@@ -132,8 +138,21 @@ struct ReviewOutput<'a> {
     review: &'a CanonicalReviewReport,
 }
 
+enum ReviewCommandResult {
+    Review {
+        provider: String,
+        model: String,
+        report: Box<CanonicalReviewReport>,
+    },
+    Preview(Box<ReviewPreview>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CanonicalReviewReport {
+    #[serde(skip)]
+    stable_report: Option<ReviewReportV3>,
+    #[serde(skip)]
+    sarif_anchors: Option<AnchorTable>,
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     overview: Option<ReviewOverview>,
@@ -151,6 +170,10 @@ struct CanonicalReviewReport {
     tool_calls: u32,
     admitted_candidates: u32,
     suppressed_candidates: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strategy: Option<ReviewStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<ReviewCoverage>,
     selection: CanonicalSelection,
     publication: CanonicalPublication,
     #[serde(skip)]
@@ -262,6 +285,7 @@ struct CanonicalPublication {
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
     actions_confirmed: u32,
+    published_findings: u32,
     mutation_attempts: u32,
     resolved_discussions: u32,
 }
@@ -276,6 +300,7 @@ impl CanonicalPublication {
             state: "pending",
             reason: None,
             actions_confirmed: 0,
+            published_findings: 0,
             mutation_attempts: 0,
             resolved_discussions: 0,
         }
@@ -286,6 +311,7 @@ impl CanonicalPublication {
             state,
             reason,
             actions_confirmed: 0,
+            published_findings: 0,
             mutation_attempts: 0,
             resolved_discussions: 0,
         }
@@ -359,14 +385,6 @@ impl PreparedReview {
             Self::GitLab(prepared) => &prepared.context.partition,
             Self::GitHub(prepared) => &prepared.context.partition,
             Self::Local(prepared) => &prepared.context.partition,
-        }
-    }
-
-    fn invocation(&self) -> Option<&revoot_core::ReviewInvocation> {
-        match self {
-            Self::GitLab(prepared) => prepared.context.invocation.as_ref(),
-            Self::GitHub(prepared) => prepared.context.invocation.as_ref(),
-            Self::Local(prepared) => prepared.context.invocation.as_ref(),
         }
     }
 
@@ -518,40 +536,6 @@ impl PreparedReview {
         omissions
     }
 
-    fn review_anchors(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, ReviewAnchor>, Diagnostic> {
-        self.anchors()
-            .iter()
-            .map(|anchor| {
-                RepositoryRelativePath::try_from(anchor.path.new_path.as_str().to_owned())
-                    .map(|path| {
-                        (
-                            anchor.id.as_str().to_owned(),
-                            ReviewAnchor {
-                                path,
-                                position: anchor.position,
-                            },
-                        )
-                    })
-                    .map_err(|_| {
-                        diagnostic(
-                            ErrorCode::ContractInvalid,
-                            "trusted anchor has no safe checkout path",
-                        )
-                    })
-            })
-            .collect()
-    }
-
-    const fn change_request_label(&self) -> &'static str {
-        match self {
-            Self::GitLab(_) => "merge-request",
-            Self::GitHub(_) => "pull-request",
-            Self::Local(_) => "local change",
-        }
-    }
-
     fn toolbox(
         &self,
         repository_policy: &RepositoryReviewPolicy,
@@ -652,7 +636,25 @@ impl ProcessClock {
     }
 }
 
-impl MonotonicClock for ProcessClock {
+impl ReviewGrouperClock for ProcessClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl GroupWorkerClock for ProcessClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl ReviewVerifierClock for ProcessClock {
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl ReviewAdjudicatorClock for ProcessClock {
     fn now_millis(&self) -> u64 {
         u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -673,7 +675,28 @@ pub fn run(
         print_help();
         return Ok(0);
     };
-    let environment: Vec<_> = environment.into_iter().collect();
+    let mut environment: Vec<_> = environment.into_iter().collect();
+    if let Some(effort) = args.effort {
+        set_operator_environment(
+            &mut environment,
+            "REVOOT_REVIEW_EFFORT",
+            match effort {
+                revoot_core::ReviewEffort::Low => "low",
+                revoot_core::ReviewEffort::Medium => "medium",
+                revoot_core::ReviewEffort::High => "high",
+            },
+        );
+    }
+    if let Some(maximum) = args.max_parallel_groups {
+        set_operator_environment(
+            &mut environment,
+            "REVOOT_MAX_PARALLEL_GROUPS",
+            &maximum.to_string(),
+        );
+    }
+    if args.preview {
+        set_operator_environment(&mut environment, "REVOOT_PUBLICATION_ENABLED", "false");
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -683,15 +706,27 @@ pub fn run(
                 "failed to start the review runtime",
             )
         })?;
-    let (provider, model, report) = runtime.block_on(run_async(
+    let result = runtime.block_on(run_async(
         &environment,
         current_directory,
         args.ci,
+        args.preview,
         args.base_ref.as_deref(),
         args.merge_request_iid,
         args.pull_request_number,
         args.github_repository.clone(),
     ))?;
+    let (provider, model, report) = match result {
+        ReviewCommandResult::Review {
+            provider,
+            model,
+            report,
+        } => (provider, model, report),
+        ReviewCommandResult::Preview(preview) => {
+            emit_preview(&args, &preview)?;
+            return Ok(0);
+        }
+    };
     emit_report(&args, &provider, &model, &report)?;
     if report.publication.reason == Some("github_thread_resolution_unavailable") {
         eprintln!(
@@ -707,16 +742,22 @@ pub fn run(
     Ok(0)
 }
 
-#[allow(clippy::too_many_lines)]
+fn set_operator_environment(environment: &mut Vec<(OsString, OsString)>, name: &str, value: &str) {
+    environment.retain(|(existing, _)| existing != name);
+    environment.push((OsString::from(name), OsString::from(value)));
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_async(
     environment: &[(OsString, OsString)],
     current_directory: &Path,
     ci_requested: bool,
+    preview: bool,
     explicit_base: Option<&str>,
     merge_request_iid: Option<MergeRequestIid>,
     pull_request_number: Option<PullRequestNumber>,
     explicit_github_repository: Option<GitHubRepositorySlug>,
-) -> Result<(String, String, CanonicalReviewReport), Diagnostic> {
+) -> Result<ReviewCommandResult, Diagnostic> {
     if merge_request_iid.is_some()
         && (pull_request_number.is_some() || explicit_github_repository.is_some())
     {
@@ -750,24 +791,25 @@ async fn run_async(
             "both GitHub and GitLab CI contexts are present",
         ));
     }
-    if matches!(gitlab_ci, revoot_core::GitLabCiContext::ForkMismatch { .. })
+    if !preview
+        && matches!(gitlab_ci, revoot_core::GitLabCiContext::ForkMismatch { .. })
         && matches!(
             fork_behavior(&string_environment)?,
             GitLabForkBehavior::Skip
         )
     {
-        return Ok((
-            "not_used".to_owned(),
-            "not_used".to_owned(),
-            skipped_fork_review_report(),
-        ));
+        return Ok(ReviewCommandResult::Review {
+            provider: "not_used".to_owned(),
+            model: "not_used".to_owned(),
+            report: Box::new(skipped_fork_review_report()),
+        });
     }
     let explicit_host = ci_requested
         || merge_request_iid.is_some()
         || pull_request_number.is_some()
         || explicit_github_repository.is_some();
     if github_ci.is_none() && !gitlab_ci_active && !explicit_host {
-        return run_local_review(environment, current_directory, explicit_base).await;
+        return run_local_review(environment, current_directory, explicit_base, preview).await;
     }
     if explicit_base.is_some() {
         return Err(diagnostic(
@@ -843,6 +885,7 @@ async fn run_async(
         environment.iter().cloned(),
     )?;
     let resolution = &resolved.effective;
+    let strategy = typed_review_strategy(&resolved)?;
     let mut prepared = if let Some(repository) = github_repository {
         PreparedReview::GitHub(Box::new(
             acquire_github_context(
@@ -850,6 +893,7 @@ async fn run_async(
                 github_ci.as_ref(),
                 &string_environment,
                 resolution,
+                &strategy,
                 &resolved.repository,
                 DEFERRED_PROVIDER,
                 DEFERRED_MODEL,
@@ -867,6 +911,7 @@ async fn run_async(
                 &origin_policy,
                 environment,
                 resolution,
+                &strategy,
                 &resolved.repository,
                 DEFERRED_PROVIDER,
                 DEFERRED_MODEL,
@@ -884,6 +929,11 @@ async fn run_async(
             "CI base configuration identity does not match the authoritative review snapshot",
         ));
     }
+    if preview {
+        return build_prepared_preview(&prepared, &resolved, &strategy)
+            .map(Box::new)
+            .map(ReviewCommandResult::Preview);
+    }
     let job_url = ci_job_url(&string_environment, &prepared)?;
     if prepared.partition().work_units.is_empty() {
         let provider = "deterministic".to_owned();
@@ -892,26 +942,32 @@ async fn run_async(
         report.publication =
             publish_with_checkpoint(&prepared, &report, &provider, &model, job_url.as_deref(), 0)
                 .await;
-        return Ok((provider, model, report));
+        attach_no_model_stable_report(&mut report, &prepared, &strategy)?;
+        return Ok(ReviewCommandResult::Review {
+            provider,
+            model,
+            report: Box::new(report),
+        });
     }
-    let credentials =
-        DiscoveredCredentials::discover(environment.iter().cloned()).map_err(|_| {
-            diagnostic(
-                ErrorCode::ProviderUnavailable,
-                "provider credential discovery failed",
-            )
-        })?;
+    let credentials = crate::direct_provider::discover_credentials(environment.iter().cloned())?;
     let provider = select_provider(config_string(resolution, "review.provider")?, &credentials)?;
     let model = select_model(&provider, config_string(resolution, "review.model")?)?;
     prepared.bind_provider_model(&provider, &model)?;
-    execute_prepared_review(provider, model, credentials, resolved, prepared, job_url).await
+    execute_prepared_review(provider, model, credentials, resolved, prepared, job_url)
+        .await
+        .map(|(provider, model, report)| ReviewCommandResult::Review {
+            provider,
+            model,
+            report: Box::new(report),
+        })
 }
 
 async fn run_local_review(
     environment: &[(OsString, OsString)],
     current_directory: &Path,
     explicit_base: Option<&str>,
-) -> Result<(String, String, CanonicalReviewReport), Diagnostic> {
+    preview: bool,
+) -> Result<ReviewCommandResult, Diagnostic> {
     let capture = capture_local_git(current_directory, explicit_base).map_err(|error| {
         diagnostic(ErrorCode::RepositoryUnavailable, error.to_string()).with_remediation(
             "run inside a Git repository with an available default-branch history, or pass --base <ref>",
@@ -924,20 +980,14 @@ async fn run_local_review(
         None,
         environment.iter().cloned(),
     )?;
-    if capture.is_empty() {
-        return Ok((
-            "not_used".to_owned(),
-            "not_used".to_owned(),
-            no_changes_report(),
-        ));
-    }
     let resolution = &resolved.effective;
+    let strategy = typed_review_strategy(&resolved)?;
     let context = build_local_review_context(
         capture,
         &LocalReviewContextOptions {
             provider_adapter: DEFERRED_PROVIDER.to_owned(),
             model_id: DEFERRED_MODEL.to_owned(),
-            agent_limits: agent_limits(resolution)?,
+            agent_limits: agent_limits(resolution, &strategy)?,
             diff_limits: diff_limits(resolution)?,
             selection_policy: selection_policy(resolution, &resolved.repository)?,
             partition_limits: partition_limits(resolution)?,
@@ -945,26 +995,198 @@ async fn run_local_review(
     )
     .map_err(|error| diagnostic(ErrorCode::ReviewFailed, error.to_string()))?;
     let mut prepared = PreparedReview::Local(Box::new(PreparedLocalReview { context }));
-    if prepared.partition().work_units.is_empty() {
-        return Ok((
-            "not_used".to_owned(),
-            "not_used".to_owned(),
-            no_model_review_report(&prepared),
-        ));
+    if preview {
+        return build_prepared_preview(&prepared, &resolved, &strategy)
+            .map(Box::new)
+            .map(ReviewCommandResult::Preview);
     }
-    let credentials =
-        DiscoveredCredentials::discover(environment.iter().cloned()).map_err(|_| {
-            diagnostic(
-                ErrorCode::ProviderUnavailable,
-                "provider credential discovery failed",
-            )
-        })?;
+    if prepared.partition().work_units.is_empty() {
+        let mut report = no_model_review_report(&prepared);
+        attach_no_model_stable_report(&mut report, &prepared, &strategy)?;
+        return Ok(ReviewCommandResult::Review {
+            provider: "not_used".to_owned(),
+            model: "not_used".to_owned(),
+            report: Box::new(report),
+        });
+    }
+    let credentials = crate::direct_provider::discover_credentials(environment.iter().cloned())?;
     let provider = select_provider(config_string(resolution, "review.provider")?, &credentials)?;
     let model = select_model(&provider, config_string(resolution, "review.model")?)?;
     prepared.bind_provider_model(&provider, &model)?;
-    execute_prepared_review(provider, model, credentials, resolved, prepared, None).await
+    execute_prepared_review(provider, model, credentials, resolved, prepared, None)
+        .await
+        .map(|(provider, model, report)| ReviewCommandResult::Review {
+            provider,
+            model,
+            report: Box::new(report),
+        })
 }
 
+fn build_prepared_preview(
+    prepared: &PreparedReview,
+    resolved: &ResolvedReviewConfiguration,
+    strategy: &ReviewStrategyConfiguration,
+) -> Result<ReviewPreview, Diagnostic> {
+    let partition = prepared.partition();
+    let group_plan =
+        build_review_group_plan(partition, None, ReviewGroupingSource::DeterministicFallback)
+            .map_err(|_| preview_contract_error("deterministic preview grouping failed"))?;
+    let changed_lines = preview_changed_lines(prepared)?;
+    let group_inputs = group_plan
+        .groups
+        .iter()
+        .map(|group| {
+            let (maximum, total) =
+                group
+                    .files
+                    .iter()
+                    .try_fold((0_u32, 0_u32), |(maximum, total), file| {
+                        let lines =
+                            changed_lines
+                                .get(&file.path.new_path)
+                                .copied()
+                                .ok_or_else(|| {
+                                    preview_contract_error("preview diff metadata is incomplete")
+                                })?;
+                        total
+                            .checked_add(lines)
+                            .map(|total| (maximum.max(lines), total))
+                            .ok_or_else(|| preview_contract_error("preview line count overflowed"))
+                    })?;
+            let metadata_bytes = u64::try_from(
+                serde_json::to_vec(group)
+                    .map_err(|_| preview_contract_error("preview metadata serialization failed"))?
+                    .len(),
+            )
+            .map_err(|_| preview_contract_error("preview metadata is too large"))?;
+            let estimated_initial_input_tokens = group
+                .input_bytes
+                .checked_add(metadata_bytes)
+                .and_then(|tokens| tokens.checked_add(1_024))
+                .ok_or_else(|| preview_contract_error("preview token estimate overflowed"))?;
+            Ok(ReviewPreviewGroupInput {
+                group_id: group.id.clone(),
+                exact_diff_bytes: group.input_bytes,
+                max_file_changed_lines: maximum,
+                total_changed_lines: total,
+                estimated_initial_input_tokens,
+            })
+        })
+        .collect::<Result<Vec<_>, Diagnostic>>()?;
+    let rules = preview_rules(partition, &resolved.repository)?;
+    let budgets = agent_limits(&resolved.effective, strategy)?;
+    let preview_strategy = ReviewPreviewStrategy {
+        effort: strategy.effort,
+        rounds_per_group: strategy.effort.rounds(),
+        max_turns_per_group: strategy.effort.max_group_turns(),
+        max_parallel_groups: strategy.max_parallel_groups,
+        budgets,
+        max_inline_diff_bytes: strategy.max_inline_diff_bytes,
+        target_request_input_tokens: strategy.target_request_input_tokens,
+        max_request_output_tokens: strategy.max_request_output_tokens,
+    };
+    build_review_preview(
+        partition,
+        &group_plan,
+        preview_strategy,
+        group_inputs,
+        rules,
+    )
+    .map_err(|_| preview_contract_error("review preview construction failed"))
+}
+
+fn preview_changed_lines(
+    prepared: &PreparedReview,
+) -> Result<BTreeMap<RepositoryPath, u32>, Diagnostic> {
+    prepared
+        .repository_diffs()
+        .iter()
+        .map(|diff| {
+            let path = RepositoryPath::try_from(diff.path.as_str().to_owned())
+                .map_err(|_| preview_contract_error("preview contains an unsafe diff path"))?;
+            let lines = diff
+                .text
+                .lines()
+                .try_fold(0_u32, |count, line| {
+                    if (line.starts_with('+') && !line.starts_with("+++"))
+                        || (line.starts_with('-') && !line.starts_with("---"))
+                    {
+                        count.checked_add(1)
+                    } else {
+                        Some(count)
+                    }
+                })
+                .ok_or_else(|| preview_contract_error("preview line count overflowed"))?;
+            Ok((path, lines))
+        })
+        .collect()
+}
+
+fn preview_rules(
+    partition: &ReviewPartitionPlan,
+    repository: &RepositoryReviewPolicy,
+) -> Result<Vec<ReviewPreviewRule>, Diagnostic> {
+    let selected_paths = partition
+        .work_units
+        .iter()
+        .flat_map(|unit| unit.files.iter())
+        .map(|file| file.path.new_path.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let policy = RuleDiagnosticPolicy {
+        base_guidance_present: repository.guidance.is_some(),
+        repository_rules: repository
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| RepositoryRuleMetadata {
+                id: format!("repository:rule-{index:03}"),
+                path_patterns: rule.paths.clone(),
+            })
+            .collect(),
+    };
+    let mut indexed =
+        BTreeMap::<(ReviewPreviewRuleSource, String), BTreeSet<RepositoryPath>>::new();
+    let paths = selected_paths.into_iter().collect::<Vec<_>>();
+    for batch in paths.chunks(32) {
+        let diagnostics = diagnose_rules(batch.iter().cloned(), &policy)
+            .map_err(|_| preview_contract_error("preview rule resolution failed"))?;
+        for path in diagnostics.paths {
+            let repository_path = RepositoryPath::try_from(path.path.as_str().to_owned())
+                .map_err(|_| preview_contract_error("preview contains an unsafe rule path"))?;
+            for trace in path.trace.into_iter().filter(|trace| trace.active) {
+                let source = match trace.source {
+                    RulePrecedenceSource::CompiledSafety => ReviewPreviewRuleSource::CompiledSafety,
+                    RulePrecedenceSource::BaseConfiguration => {
+                        ReviewPreviewRuleSource::BaseConfiguration
+                    }
+                    RulePrecedenceSource::RepositoryRule => ReviewPreviewRuleSource::RepositoryRule,
+                    RulePrecedenceSource::EmbeddedRule => ReviewPreviewRuleSource::EmbeddedLanguage,
+                    RulePrecedenceSource::GenericRule => ReviewPreviewRuleSource::Generic,
+                };
+                for id in trace.rule_ids {
+                    indexed
+                        .entry((source, id))
+                        .or_default()
+                        .insert(repository_path.clone());
+                }
+            }
+        }
+    }
+    Ok(indexed
+        .into_iter()
+        .map(|((source, id), matched_paths)| ReviewPreviewRule {
+            id,
+            source,
+            matched_paths: matched_paths.into_iter().collect(),
+        })
+        .collect())
+}
+
+fn preview_contract_error(message: &'static str) -> Diagnostic {
+    diagnostic(ErrorCode::ContractInvalid, message)
+}
+
+#[allow(clippy::too_many_lines)]
 async fn execute_prepared_review(
     provider: String,
     model: String,
@@ -973,15 +1195,92 @@ async fn execute_prepared_review(
     prepared: PreparedReview,
     job_url: Option<String>,
 ) -> Result<(String, String, CanonicalReviewReport), Diagnostic> {
-    if prepared.partition().work_units.is_empty() {
-        return Ok((provider, model, no_model_review_report(&prepared)));
-    }
     let resolution = &resolved.effective;
-    let guidance = resolved.repository.guidance_text();
+    let strategy = typed_review_strategy(&resolved)?;
+    let strategy = escalate_effort_for_large_diff(
+        strategy,
+        resolution,
+        prepared.partition().coverage.included_files,
+        prepared.partition().coverage.included_bytes,
+    );
+    if prepared.partition().work_units.is_empty() {
+        let mut report = no_model_review_report(&prepared);
+        attach_no_model_stable_report(&mut report, &prepared, &strategy)?;
+        return Ok((provider, model, report));
+    }
     let attention = prepared.review_attention();
-    let review_brief = prepared_review_brief(&prepared, &attention)?;
+    let adapter: Arc<dyn ProviderAdapter> = Arc::from(build_provider(&provider, &credentials)?);
+    let minimum_confidence_percent =
+        u8::try_from(config_unsigned(resolution, "review.minimum_confidence")?)
+            .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "minimum confidence is invalid"))?;
+    let maximum_findings = usize::try_from(config_unsigned(resolution, "budget.max_findings")?)
+        .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "finding limit is invalid"))?;
+    let mut engine_report =
+        run_prepared_tool_first_engine(&prepared, &resolved, &strategy, &model, adapter).await?;
+    if !prepared.is_fresh() {
+        engine_report.result.outcome = ReviewOutcome::Stale {
+            usage: review_outcome_usage(&engine_report.result.outcome),
+        };
+    }
+    let repository_suppressions = filter_tool_first_findings(
+        &mut engine_report,
+        prepared.issued_anchors(),
+        prepared.anchors(),
+        maximum_findings,
+        minimum_confidence_percent,
+        &resolved.repository,
+    )?;
+    let mut report = canonicalize_report(
+        &engine_report,
+        prepared.issued_anchors(),
+        prepared.anchors(),
+        maximum_findings,
+        repository_suppressions,
+        strategy.effort,
+        CanonicalSelection::from_partition(prepared.partition()),
+    )?;
+    report.publication = publish_with_checkpoint(
+        &prepared,
+        &report,
+        &provider,
+        &model,
+        job_url.as_deref(),
+        attention.next_generation(),
+    )
+    .await;
+    let snapshot_sha256 = Sha256Digest::of_bytes(
+        &serde_json::to_vec(&prepared.partition().snapshot).map_err(|_| {
+            diagnostic(
+                ErrorCode::ContractInvalid,
+                "snapshot identity serialization failed",
+            )
+        })?,
+    );
+    report.stable_report = Some(
+        build_tool_first_report(ToolFirstReportInput {
+            engine: &engine_report,
+            partition: prepared.partition(),
+            anchors: prepared.anchors(),
+            snapshot_sha256,
+            selection: stable_selection(prepared.partition()),
+            publication: stable_publication(&report),
+            effort: strategy.effort,
+            phase_usage: Some(engine_report.phase_usage.clone()),
+        })
+        .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))?,
+    );
+    Ok((provider, model, report))
+}
+
+async fn run_prepared_tool_first_engine(
+    prepared: &PreparedReview,
+    resolved: &ResolvedReviewConfiguration,
+    strategy: &ReviewStrategyConfiguration,
+    model: &str,
+    provider: Arc<dyn ProviderAdapter>,
+) -> Result<ToolFirstEngineReport, Diagnostic> {
     let cancellation = CancellationToken::default();
-    let toolbox = prepared.toolbox(&resolved.repository, &cancellation)?;
+    let toolbox = Arc::new(prepared.toolbox(&resolved.repository, &cancellation)?);
     let mut initial_omissions = prepared.initial_omissions();
     let history = if let Ok(history) = GitHistoryToolbox::open(
         prepared.root(),
@@ -995,7 +1294,7 @@ async fn execute_prepared_review(
                 AgentOmissionReason::HistoryIncomplete,
             );
         }
-        Some(history)
+        Some(Arc::new(history))
     } else {
         push_unique_omission(
             &mut initial_omissions,
@@ -1004,77 +1303,161 @@ async fn execute_prepared_review(
         );
         None
     };
-    let adapter = build_provider(&provider, &credentials)?;
-    let minimum_confidence_percent =
-        u8::try_from(config_unsigned(resolution, "review.minimum_confidence")?)
-            .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "minimum confidence is invalid"))?;
-    let mut report = run_review(
-        adapter.as_ref(),
-        ReviewEngineRequest {
-            invocation: prepared.invocation().cloned().ok_or_else(|| {
-                diagnostic(
-                    ErrorCode::ContractInvalid,
-                    "reviewable partition has no invocation",
-                )
-            })?,
-            toolbox,
-            history,
-            prior_review: prepared.prior_review(),
-            anchors: prepared.review_anchors()?,
-            review_brief,
-            repository_guidance: guidance,
-            initial_omissions,
-            limits: ReviewEngineLimits {
-                minimum_confidence_percent,
-                ..ReviewEngineLimits::default()
-            },
-        },
-        cancellation,
-        &ProcessClock::start(),
+    let clock = Arc::new(ProcessClock::start());
+    let budget = ReviewBudgetBroker::new(
+        strategy.aggregate_budget,
+        ReviewGrouperClock::now_millis(clock.as_ref()),
     )
-    .await
-    .map_err(|error| diagnostic(ErrorCode::ReviewFailed, error.to_string()))?;
-    if !prepared.is_fresh() {
-        report.outcome = ReviewOutcome::Stale {
-            usage: review_outcome_usage(&report.outcome),
-        };
-    }
-    let mut report = canonicalize_report(
-        report,
-        prepared.issued_anchors(),
-        prepared.anchors(),
-        usize::try_from(config_unsigned(resolution, "budget.max_findings")?)
-            .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "finding limit is invalid"))?,
-        &resolved.repository,
-        CanonicalSelection::from_partition(prepared.partition()),
-    )?;
-    report.publication = publish_with_checkpoint(
-        &prepared,
-        &report,
-        &provider,
-        &model,
-        job_url.as_deref(),
-        attention.next_generation(),
-    )
-    .await;
-    Ok((provider, model, report))
-}
-
-fn prepared_review_brief(
-    prepared: &PreparedReview,
-    attention: &ReviewAttention,
-) -> Result<IndependentReviewBrief, Diagnostic> {
-    IndependentReviewBrief::try_new(review_prompt(
-        prepared.partition(),
-        prepared.change_request_label(),
-        attention,
-    )?)
     .map_err(|_| {
         diagnostic(
             ErrorCode::ContractInvalid,
-            "independent review brief is invalid",
+            "aggregate review budget is invalid",
         )
+    })?;
+    run_tool_first_engine(ToolFirstEngineRequest {
+        provider,
+        toolbox,
+        history,
+        prior_review: prepared.prior_review(),
+        anchor_table: prepared.anchors().clone(),
+        partition: prepared.partition().clone(),
+        rule_policy: resolved.repository.clone(),
+        budget,
+        cancellation,
+        clock,
+        limits: tool_first_limits(model, strategy, &resolved.effective)?,
+        system_policy_id: format!("{REVIEWER_POLICY_VERSION}.tool-first"),
+        system_policy: tool_first_reviewer_system_policy(),
+        initial_omissions,
     })
+    .await
+    .map_err(|error| diagnostic(ErrorCode::ReviewFailed, error.to_string()))
+}
+
+pub(crate) fn tool_first_limits(
+    model: &str,
+    strategy: &ReviewStrategyConfiguration,
+    resolution: &revoot_core::ConfigurationResolution,
+) -> Result<ToolFirstEngineLimits, Diagnostic> {
+    let max_output_tokens = u32::try_from(strategy.max_request_output_tokens).map_err(|_| {
+        diagnostic(
+            ErrorCode::ContractInvalid,
+            "per-request output token limit is invalid",
+        )
+    })?;
+    let max_findings = u32_value(resolution, "budget.max_findings")?;
+    let max_group_turns = strategy.effort.max_group_turns();
+    let mut limits = ToolFirstEngineLimits::new(model);
+    limits.effort = strategy.effort;
+    limits.max_parallel_groups = usize::from(strategy.max_parallel_groups);
+    limits.max_inline_diff_bytes = strategy.max_inline_diff_bytes;
+    limits.worker = GroupWorkerLimits {
+        max_output_tokens,
+        max_input_tokens: strategy.target_request_input_tokens,
+        local_tool_budget: AgentBudgetLimits {
+            max_turns: max_group_turns,
+            max_model_requests: max_group_turns,
+            max_tool_calls: strategy.aggregate_budget.max_tool_calls,
+            max_input_tokens: strategy.aggregate_budget.max_model_tokens,
+            max_output_tokens: strategy.aggregate_budget.max_output_tokens,
+            max_cost_microusd: strategy.aggregate_budget.max_cost_microusd,
+            max_candidate_findings: max_findings,
+            max_elapsed_millis: strategy.aggregate_budget.max_elapsed_millis,
+            ..AgentBudgetLimits::default()
+        },
+        ..GroupWorkerLimits::default()
+    };
+    limits.grouper.max_output_tokens = limits.grouper.max_output_tokens.min(max_output_tokens);
+    limits.verifier.max_output_tokens = limits.verifier.max_output_tokens.min(max_output_tokens);
+    limits.adjudicator.max_output_tokens =
+        limits.adjudicator.max_output_tokens.min(max_output_tokens);
+    Ok(limits)
+}
+
+fn filter_tool_first_findings(
+    engine: &mut ToolFirstEngineReport,
+    issued: &IssuedWorkUnitAnchors,
+    anchors: &AnchorTable,
+    maximum: usize,
+    minimum_confidence_percent: u8,
+    repository_policy: &RepositoryReviewPolicy,
+) -> Result<u32, Diagnostic> {
+    let envelopes = match &mut engine.result.outcome {
+        ReviewOutcome::Complete { findings, .. } | ReviewOutcome::Partial { findings, .. } => {
+            findings
+        }
+        ReviewOutcome::NoFindings { .. }
+        | ReviewOutcome::Stale { .. }
+        | ReviewOutcome::Blocked { .. }
+        | ReviewOutcome::Failed { .. }
+        | ReviewOutcome::Cancelled { .. } => return Ok(0),
+    };
+    validate_rank_and_render(envelopes.clone(), issued, anchors, maximum).map_err(|_| {
+        diagnostic(
+            ErrorCode::ReviewFailed,
+            "tool-first findings failed anchor or capacity validation",
+        )
+    })?;
+    let mut suppressed = 0_u32;
+    for envelope in envelopes {
+        let mut retained = Vec::with_capacity(envelope.findings.len());
+        for finding in std::mem::take(&mut envelope.findings) {
+            let ranked = validate_rank_and_render(
+                [revoot_core::FindingsEnvelope {
+                    schema_version: envelope.schema_version.clone(),
+                    work_unit_id: envelope.work_unit_id.clone(),
+                    findings: vec![finding.clone()],
+                    summary: envelope.summary.clone(),
+                }],
+                issued,
+                anchors,
+                25,
+            )
+            .map_err(|_| {
+                diagnostic(
+                    ErrorCode::ReviewFailed,
+                    "tool-first finding identity derivation failed",
+                )
+            })?;
+            let ranked = ranked.findings.first().ok_or_else(|| {
+                diagnostic(
+                    ErrorCode::ReviewFailed,
+                    "tool-first finding identity is missing",
+                )
+            })?;
+            if finding.confidence_percent < minimum_confidence_percent
+                || repository_policy.suppresses(&ranked.finding_key)
+            {
+                suppressed = suppressed.saturating_add(1);
+            } else {
+                retained.push(finding);
+            }
+        }
+        envelope.findings = retained;
+    }
+    Ok(suppressed)
+}
+
+fn stable_selection(partition: &ReviewPartitionPlan) -> ReviewReportSelection {
+    ReviewReportSelection {
+        changed_files: partition.coverage.input_files,
+        selected_files: partition.coverage.included_files,
+        omitted_files: partition.coverage.omitted_files,
+        selected_diff_bytes: partition.coverage.included_bytes,
+        omission_reasons: partition.coverage.omission_reasons.clone(),
+    }
+}
+
+fn stable_publication(report: &CanonicalReviewReport) -> ReviewReportPublication {
+    let planned_findings = u32::try_from(report.findings.len()).unwrap_or(u32::MAX);
+    let published_findings = report.publication.published_findings.min(planned_findings);
+    ReviewReportPublication {
+        planned_findings,
+        published_findings,
+        suppressed_findings: 0,
+        publication_complete: published_findings == planned_findings
+            && !report.publication.failed(),
+    }
 }
 
 fn review_outcome_usage(outcome: &ReviewOutcome) -> AgentBudgetUsage {
@@ -1089,28 +1472,10 @@ fn review_outcome_usage(outcome: &ReviewOutcome) -> AgentBudgetUsage {
     }
 }
 
-fn no_changes_report() -> CanonicalReviewReport {
-    CanonicalReviewReport {
-        state: "no_changes",
-        overview: None,
-        summary: Some("No local changes to review.".to_owned()),
-        findings: Vec::new(),
-        omissions: Vec::new(),
-        prior_finding_dispositions: Vec::new(),
-        duplicates_omitted: 0,
-        usage: AgentBudgetUsage::default(),
-        turns: 0,
-        tool_calls: 0,
-        admitted_candidates: 0,
-        suppressed_candidates: 0,
-        selection: CanonicalSelection::default(),
-        publication: CanonicalPublication::terminal("not_needed", Some("no_changes")),
-        finding_locations: BTreeMap::new(),
-    }
-}
-
 fn skipped_fork_review_report() -> CanonicalReviewReport {
     CanonicalReviewReport {
+        stable_report: None,
+        sarif_anchors: None,
         state: "skipped",
         overview: None,
         summary: Some("Fork merge request skipped by policy.".to_owned()),
@@ -1123,6 +1488,8 @@ fn skipped_fork_review_report() -> CanonicalReviewReport {
         tool_calls: 0,
         admitted_candidates: 0,
         suppressed_candidates: 0,
+        strategy: None,
+        coverage: None,
         selection: CanonicalSelection::default(),
         publication: CanonicalPublication::terminal("skipped", Some("fork_policy")),
         finding_locations: BTreeMap::new(),
@@ -1130,17 +1497,37 @@ fn skipped_fork_review_report() -> CanonicalReviewReport {
 }
 
 fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
+    let no_changes = prepared.partition().coverage.input_files == 0;
+    let summary = if no_changes {
+        "No local changes to review."
+    } else {
+        "No changed files were selected for model review."
+    };
     CanonicalReviewReport {
+        stable_report: None,
+        sarif_anchors: None,
         state: "no_findings",
         overview: Some(ReviewOverview {
-            summary: "No changed files were selected for model review.".to_owned(),
-            overall_risk: RiskLevel::Moderate,
-            overall_basis: "The overall risk could not be fully assessed because no changed files were selected for model review.".to_owned(),
+            summary: summary.to_owned(),
+            overall_risk: if no_changes {
+                RiskLevel::Low
+            } else {
+                RiskLevel::Moderate
+            },
+            overall_basis: if no_changes {
+                "The immutable snapshot contains no changed files.".to_owned()
+            } else {
+                "The overall risk could not be fully assessed because no changed files were selected for model review.".to_owned()
+            },
             risks: Vec::new(),
-            assumptions_and_gaps: vec!["The omitted files were not reviewed by the model.".to_owned()],
+            assumptions_and_gaps: if no_changes {
+                Vec::new()
+            } else {
+                vec!["The omitted files were not reviewed by the model.".to_owned()]
+            },
             manual_validations: Vec::new(),
         }),
-        summary: Some("No changed files were selected for model review.".to_owned()),
+        summary: Some(summary.to_owned()),
         findings: Vec::new(),
         omissions: prepared.initial_omissions(),
         prior_finding_dispositions: Vec::new(),
@@ -1150,10 +1537,98 @@ fn no_model_review_report(prepared: &PreparedReview) -> CanonicalReviewReport {
         tool_calls: 0,
         admitted_candidates: 0,
         suppressed_candidates: 0,
+        strategy: None,
+        coverage: None,
         selection: CanonicalSelection::from_partition(prepared.partition()),
         publication: CanonicalPublication::terminal("not_needed", Some("no_model_work")),
         finding_locations: BTreeMap::new(),
     }
+}
+
+fn attach_no_model_stable_report(
+    report: &mut CanonicalReviewReport,
+    prepared: &PreparedReview,
+    strategy: &ReviewStrategyConfiguration,
+) -> Result<(), Diagnostic> {
+    let partition = prepared.partition();
+    let selection = stable_selection(partition);
+    let partial = !report.omissions.is_empty() || selection.omitted_files > 0;
+    report.state = if partial { "partial" } else { "no_findings" };
+    let overview_text = report
+        .summary
+        .clone()
+        .unwrap_or_else(|| "No supported defects found.".to_owned());
+    let phases = [
+        ReviewReportPhase::Grouping,
+        ReviewReportPhase::Planning,
+        ReviewReportPhase::Review,
+        ReviewReportPhase::Verification,
+        ReviewReportPhase::Adjudication,
+    ]
+    .into_iter()
+    .map(|phase| ReviewReportPhaseUsage {
+        phase,
+        model_requests: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        tool_calls: 0,
+        cost_microusd: 0,
+    })
+    .collect();
+    let snapshot_sha256 =
+        Sha256Digest::of_bytes(&serde_json::to_vec(&partition.snapshot).map_err(|_| {
+            diagnostic(
+                ErrorCode::ContractInvalid,
+                "snapshot identity serialization failed",
+            )
+        })?);
+    let stable = ReviewReportV3::new(
+        if partial {
+            ReviewReportState::Partial
+        } else {
+            ReviewReportState::NoFindings
+        },
+        snapshot_sha256,
+        partition.plan_sha256.clone(),
+        Vec::new(),
+        ReviewReportOverview {
+            content_sha256: Sha256Digest::of_bytes(overview_text.as_bytes()),
+            text: overview_text,
+        },
+        Vec::new(),
+        stable_publication(report),
+        selection,
+        ReviewReportStrategy {
+            effort: strategy.effort,
+            grouping_source: ReviewGroupingSource::DeterministicFallback,
+            group_count: 0,
+            max_parallel_groups: strategy.max_parallel_groups,
+        },
+        ReviewReportCoverage {
+            policy_version: "revoot.risk-adaptive-coverage/v1".to_owned(),
+            high_risk_files: 0,
+            standard_risk_files: 0,
+            low_risk_files: 0,
+            fully_read_files: 0,
+            sampled_files: 0,
+            manifest_only_files: 0,
+            delivered_high_risk_hunks: 0,
+            required_high_risk_hunks: 0,
+            explicit_deferrals: partition.coverage.omitted_files,
+            failed_groups: 0,
+        },
+        ReviewReportUsage {
+            phases,
+            totals: ReviewReportUsageTotals::default(),
+        },
+    )
+    .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))?;
+    stable
+        .validate_against_anchors(prepared.anchors())
+        .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))?;
+    report.sarif_anchors = Some(prepared.anchors().clone());
+    report.stable_report = Some(stable);
+    Ok(())
 }
 
 fn minimum_review_risk(
@@ -1195,52 +1670,137 @@ fn minimum_review_risk(
 }
 
 fn canonicalize_report(
-    report: ReviewReport,
+    engine: &ToolFirstEngineReport,
     issued: &IssuedWorkUnitAnchors,
     anchors: &AnchorTable,
     maximum: usize,
-    repository_policy: &RepositoryReviewPolicy,
+    deterministic_suppressions: u32,
+    effort: revoot_core::ReviewEffort,
     selection: CanonicalSelection,
 ) -> Result<CanonicalReviewReport, Diagnostic> {
-    let mut overview = report.overview.clone();
-    let (state, summary, envelopes, omissions, usage) = match report.outcome {
-        ReviewOutcome::Complete {
-            findings,
-            summary,
-            usage,
-        } => ("complete", Some(summary), findings, Vec::new(), usage),
-        ReviewOutcome::Partial {
-            findings,
-            summary,
-            omissions,
-            usage,
-        } => ("partial", Some(summary), findings, omissions, usage),
-        ReviewOutcome::NoFindings {
-            summary,
-            omissions,
-            usage,
-        } => ("no_findings", Some(summary), Vec::new(), omissions, usage),
-        ReviewOutcome::Stale { usage } => ("stale", None, Vec::new(), Vec::new(), usage),
-        ReviewOutcome::Blocked { usage, .. } => ("blocked", None, Vec::new(), Vec::new(), usage),
-        ReviewOutcome::Failed { usage, .. } => ("failed", None, Vec::new(), Vec::new(), usage),
-        ReviewOutcome::Cancelled { usage } => ("cancelled", None, Vec::new(), Vec::new(), usage),
-    };
-    let mut ranked =
-        validate_rank_and_render(envelopes, issued, anchors, maximum).map_err(|_| {
-            diagnostic(
-                ErrorCode::ReviewFailed,
-                "review findings failed anchor, ranking, or deduplication validation",
-            )
-        })?;
-    let repository_suppressions_applied =
-        apply_repository_suppressions(&mut ranked.findings, repository_policy);
+    let mut overview = engine.result.overview.clone();
+    let CanonicalOutcomeParts {
+        state,
+        summary,
+        envelopes,
+        omissions,
+        usage,
+    } = canonical_outcome_parts(&engine.result.outcome);
+    let ranked = validate_rank_and_render(envelopes, issued, anchors, maximum).map_err(|_| {
+        diagnostic(
+            ErrorCode::ReviewFailed,
+            "review findings failed anchor, ranking, or deduplication validation",
+        )
+    })?;
     let (minimum_risk, minimum_basis) = minimum_review_risk(&ranked.findings, &selection);
     if overview.overall_risk < minimum_risk {
         overview.overall_risk = minimum_risk;
         minimum_basis.clone_into(&mut overview.overall_basis);
     }
-    let finding_locations = ranked
-        .findings
+    let finding_locations = finding_locations(&ranked.findings, anchors);
+    Ok(CanonicalReviewReport {
+        stable_report: None,
+        sarif_anchors: Some(anchors.clone()),
+        state,
+        overview: matches!(state, "complete" | "partial" | "no_findings").then_some(overview),
+        summary,
+        findings: ranked.findings,
+        omissions,
+        prior_finding_dispositions: engine.result.prior_finding_dispositions.clone(),
+        duplicates_omitted: ranked.duplicates_omitted,
+        usage,
+        turns: engine.budget_usage.model_requests,
+        tool_calls: engine.budget_usage.tool_calls,
+        admitted_candidates: engine.verified_candidates,
+        suppressed_candidates: engine
+            .verification_suppressions
+            .saturating_add(deterministic_suppressions),
+        strategy: Some(ReviewStrategy {
+            effort,
+            grouping_source: match engine.grouping_mode {
+                crate::review_grouper::ReviewGrouperMode::DeterministicSmallSelection => {
+                    ReviewGroupingSource::Deterministic
+                }
+                crate::review_grouper::ReviewGrouperMode::Semantic => {
+                    ReviewGroupingSource::Semantic
+                }
+                crate::review_grouper::ReviewGrouperMode::DeterministicFallback(_) => {
+                    ReviewGroupingSource::DeterministicFallback
+                }
+            },
+            group_count: engine.group_count,
+            max_parallel_groups: engine.schedule.max_parallel_groups,
+        }),
+        coverage: Some(engine.result.coverage.clone()),
+        selection,
+        publication: CanonicalPublication::pending(),
+        finding_locations,
+    })
+}
+
+struct CanonicalOutcomeParts {
+    state: &'static str,
+    summary: Option<String>,
+    envelopes: Vec<revoot_core::FindingsEnvelope>,
+    omissions: Vec<AgentOmission>,
+    usage: AgentBudgetUsage,
+}
+
+fn canonical_outcome_parts(outcome: &ReviewOutcome) -> CanonicalOutcomeParts {
+    let (state, summary, envelopes, omissions, usage) = match outcome {
+        ReviewOutcome::Complete {
+            findings,
+            summary,
+            usage,
+        } => (
+            "complete",
+            Some(summary.clone()),
+            findings.clone(),
+            Vec::new(),
+            *usage,
+        ),
+        ReviewOutcome::Partial {
+            findings,
+            summary,
+            omissions,
+            usage,
+        } => (
+            "partial",
+            Some(summary.clone()),
+            findings.clone(),
+            omissions.clone(),
+            *usage,
+        ),
+        ReviewOutcome::NoFindings {
+            summary,
+            omissions,
+            usage,
+        } => (
+            "no_findings",
+            Some(summary.clone()),
+            Vec::new(),
+            omissions.clone(),
+            *usage,
+        ),
+        ReviewOutcome::Stale { usage } => ("stale", None, Vec::new(), Vec::new(), *usage),
+        ReviewOutcome::Blocked { usage, .. } => ("blocked", None, Vec::new(), Vec::new(), *usage),
+        ReviewOutcome::Failed { usage, .. } => ("failed", None, Vec::new(), Vec::new(), *usage),
+        ReviewOutcome::Cancelled { usage } => ("cancelled", None, Vec::new(), Vec::new(), *usage),
+    };
+    CanonicalOutcomeParts {
+        state,
+        summary,
+        envelopes,
+        omissions,
+        usage,
+    }
+}
+
+fn finding_locations(
+    findings: &[RankedFinding],
+    anchors: &AnchorTable,
+) -> BTreeMap<AnchorId, String> {
+    findings
         .iter()
         .filter_map(|finding| {
             anchors.resolve(finding.anchor_id.as_str()).map(|anchor| {
@@ -1256,28 +1816,10 @@ fn canonicalize_report(
                 (finding.anchor_id.clone(), format!("{path}:{line}"))
             })
         })
-        .collect();
-    Ok(CanonicalReviewReport {
-        state,
-        overview: matches!(state, "complete" | "partial" | "no_findings").then_some(overview),
-        summary,
-        findings: ranked.findings,
-        omissions,
-        prior_finding_dispositions: report.prior_finding_dispositions,
-        duplicates_omitted: ranked.duplicates_omitted,
-        usage,
-        turns: report.turns,
-        tool_calls: report.tool_calls,
-        admitted_candidates: report.admitted_candidates,
-        suppressed_candidates: report
-            .suppressed_candidates
-            .saturating_add(repository_suppressions_applied),
-        selection,
-        publication: CanonicalPublication::pending(),
-        finding_locations,
-    })
+        .collect()
 }
 
+#[cfg(test)]
 fn apply_repository_suppressions(
     findings: &mut Vec<RankedFinding>,
     repository_policy: &RepositoryReviewPolicy,
@@ -1294,6 +1836,7 @@ async fn acquire_github_context(
     ci: Option<&GitHubCiContext>,
     environment: &[(String, String)],
     resolution: &revoot_core::ConfigurationResolution,
+    strategy: &ReviewStrategyConfiguration,
     repository_policy: &RepositoryReviewPolicy,
     provider: &str,
     model: &str,
@@ -1390,7 +1933,7 @@ async fn acquire_github_context(
         &GitHubReviewContextOptions {
             provider_adapter: provider.to_owned(),
             model_id: model.to_owned(),
-            agent_limits: agent_limits(resolution)?,
+            agent_limits: agent_limits(resolution, strategy)?,
             diff_limits: diff_limits(resolution)?,
             selection_policy: selection_policy(resolution, repository_policy)?,
             partition_limits: partition_limits(resolution)?,
@@ -1429,6 +1972,7 @@ async fn acquire_gitlab_context(
     origin_policy: &GitLabOriginPolicy,
     environment: &[(OsString, OsString)],
     resolution: &revoot_core::ConfigurationResolution,
+    strategy: &ReviewStrategyConfiguration,
     repository_policy: &RepositoryReviewPolicy,
     provider: &str,
     model: &str,
@@ -1503,7 +2047,7 @@ async fn acquire_gitlab_context(
         &GitLabReviewContextOptions {
             provider_adapter: provider.to_owned(),
             model_id: model.to_owned(),
-            agent_limits: agent_limits(resolution)?,
+            agent_limits: agent_limits(resolution, strategy)?,
             diff_limits: diff_limits(resolution)?,
             selection_policy: selection_policy(resolution, repository_policy)?,
             partition_limits: partition_limits(resolution)?,
@@ -1756,46 +2300,78 @@ async fn publish_gitlab_review(
             .refs
             .head_sha,
     );
-    match controller
-        .publish(
-            authorization,
-            prepared.snapshot.evidence().identity.clone(),
-            &prepared.context.anchors,
-            bot_user_id,
-            overview,
-            candidates,
-            &report.authorized_fixed_lineages(),
-        )
-        .await
-    {
-        GitLabPublicationOutcome::Completed { journal, evidence } => CanonicalPublication {
-            state: "completed",
-            reason: None,
-            actions_confirmed: u32::try_from(journal.entries.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(evidence.overview_confirmed),
-            mutation_attempts: evidence.mutation_attempts,
-            resolved_discussions: evidence.resolved_discussions,
-        },
+    canonical_gitlab_publication(
+        controller
+            .publish(
+                authorization,
+                prepared.snapshot.evidence().identity.clone(),
+                &prepared.context.anchors,
+                bot_user_id,
+                overview,
+                candidates,
+                &report.authorized_fixed_lineages(),
+            )
+            .await,
+    )
+}
+
+fn canonical_gitlab_publication(outcome: GitLabPublicationOutcome) -> CanonicalPublication {
+    match outcome {
+        GitLabPublicationOutcome::Completed { journal, evidence } => {
+            let published_findings = confirmed_gitlab_inline_findings(&journal);
+            CanonicalPublication {
+                state: "completed",
+                reason: None,
+                actions_confirmed: u32::try_from(journal.entries.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(evidence.overview_confirmed),
+                published_findings,
+                mutation_attempts: evidence.mutation_attempts,
+                resolved_discussions: evidence.resolved_discussions,
+            }
+        }
         GitLabPublicationOutcome::GateClosed { evidence } => CanonicalPublication {
             state: "unavailable",
             reason: Some("gate_closed"),
             actions_confirmed: 0,
+            published_findings: 0,
             mutation_attempts: evidence.mutation_attempts,
             resolved_discussions: evidence.resolved_discussions,
         },
         GitLabPublicationOutcome::Stopped {
             journal, evidence, ..
-        } => CanonicalPublication {
-            state: "failed",
-            reason: Some("publication_stopped"),
-            actions_confirmed: journal.as_ref().map_or(0, |value| {
-                u32::try_from(value.entries.len()).unwrap_or(u32::MAX)
-            }),
-            mutation_attempts: evidence.mutation_attempts,
-            resolved_discussions: evidence.resolved_discussions,
-        },
+        } => {
+            let published_findings = journal.as_ref().map_or(0, confirmed_gitlab_inline_findings);
+            CanonicalPublication {
+                state: "failed",
+                reason: Some("publication_stopped"),
+                actions_confirmed: journal.as_ref().map_or(0, |value| {
+                    u32::try_from(value.entries.len()).unwrap_or(u32::MAX)
+                }),
+                published_findings,
+                mutation_attempts: evidence.mutation_attempts,
+                resolved_discussions: evidence.resolved_discussions,
+            }
+        }
     }
+}
+
+fn confirmed_gitlab_inline_findings(journal: &revoot_core::PublicationJournal) -> u32 {
+    u32::try_from(
+        journal
+            .entries
+            .iter()
+            .filter(|entry| {
+                usize::try_from(entry.action)
+                    .ok()
+                    .and_then(|index| journal.actions.get(index))
+                    .is_some_and(|action| {
+                        matches!(action.publication.target, PublicationTarget::Inline(_))
+                    })
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 async fn gitlab_discussions_unchanged(prepared: &PreparedGitLabReview, bot_user_id: u64) -> bool {
@@ -1888,7 +2464,12 @@ async fn publish_github_review(
     .await
     {
         Ok(evidence) => evidence,
-        Err(failure) => return github_publication_failure(failure),
+        Err(failure) => {
+            return github_publication_failure(
+                failure,
+                u32::try_from(report.findings.len()).unwrap_or(u32::MAX),
+            );
+        }
     };
     let overview_mutated = if let Some(overview) = overview {
         match update_github_overview(&prepared.client, &prepared.context, overview).await {
@@ -1898,6 +2479,9 @@ async fn publish_github_review(
                     state: "failed",
                     reason: Some("overview_update_failed"),
                     actions_confirmed: evidence.actions_confirmed,
+                    published_findings: u32::try_from(report.findings.len())
+                        .unwrap_or(u32::MAX)
+                        .min(evidence.actions_confirmed),
                     mutation_attempts: evidence.mutation_attempts,
                     resolved_discussions: evidence.superseded_comments,
                 };
@@ -1913,6 +2497,7 @@ async fn publish_github_review(
         actions_confirmed: evidence
             .actions_confirmed
             .saturating_add(u32::from(overview.is_some())),
+        published_findings: u32::try_from(report.findings.len()).unwrap_or(u32::MAX),
         mutation_attempts: evidence
             .mutation_attempts
             .saturating_add(u32::from(overview_mutated)),
@@ -1922,6 +2507,7 @@ async fn publish_github_review(
 
 const fn github_publication_failure(
     failure: crate::github_review::GitHubPublicationFailure,
+    planned_findings: u32,
 ) -> CanonicalPublication {
     let state = if matches!(failure.error, GitHubReviewError::PublicationStateChanged)
         && failure.evidence.mutation_attempts == 0
@@ -1934,6 +2520,11 @@ const fn github_publication_failure(
         state,
         reason: Some(github_publication_failure_reason(failure.error)),
         actions_confirmed: failure.evidence.actions_confirmed,
+        published_findings: if failure.evidence.actions_confirmed < planned_findings {
+            failure.evidence.actions_confirmed
+        } else {
+            planned_findings
+        },
         mutation_attempts: failure.evidence.mutation_attempts,
         resolved_discussions: failure.evidence.superseded_comments,
     }
@@ -2050,6 +2641,59 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<ReviewArgs>, 
                 }
                 parsed.ci = true;
             }
+            "--preview" => {
+                if parsed.preview {
+                    return Err(diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--preview may be supplied only once",
+                    ));
+                }
+                parsed.preview = true;
+            }
+            "--effort" => {
+                let value = args.next().ok_or_else(|| {
+                    diagnostic(ErrorCode::CliInvalidArgument, "--effort requires a value")
+                })?;
+                let effort = match value.as_str() {
+                    "low" => revoot_core::ReviewEffort::Low,
+                    "medium" => revoot_core::ReviewEffort::Medium,
+                    "high" => revoot_core::ReviewEffort::High,
+                    _ => {
+                        return Err(diagnostic(
+                            ErrorCode::CliInvalidArgument,
+                            "--effort must be low, medium, or high",
+                        ));
+                    }
+                };
+                if parsed.effort.replace(effort).is_some() {
+                    return Err(diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--effort may be supplied only once",
+                    ));
+                }
+            }
+            "--max-parallel-groups" => {
+                let value = args.next().ok_or_else(|| {
+                    diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--max-parallel-groups requires a value",
+                    )
+                })?;
+                let maximum = value.parse::<u8>().map_err(|_| {
+                    diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--max-parallel-groups must be between 1 and 8",
+                    )
+                })?;
+                if !(1..=8).contains(&maximum)
+                    || parsed.max_parallel_groups.replace(maximum).is_some()
+                {
+                    return Err(diagnostic(
+                        ErrorCode::CliInvalidArgument,
+                        "--max-parallel-groups must be supplied once with a value from 1 to 8",
+                    ));
+                }
+            }
             "--base" => {
                 let value = args.next().ok_or_else(|| {
                     diagnostic(ErrorCode::CliInvalidArgument, "--base requires a Git ref")
@@ -2068,10 +2712,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<ReviewArgs>, 
                 parsed.format = match value.as_str() {
                     "human" => OutputFormat::Human,
                     "json" => OutputFormat::Json,
+                    "sarif" => OutputFormat::Sarif,
                     _ => {
                         return Err(diagnostic(
                             ErrorCode::CliInvalidArgument,
-                            "--format must be human or json",
+                            "--format must be human, json, or sarif",
                         ));
                     }
                 };
@@ -2181,6 +2826,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<ReviewArgs>, 
             "--base cannot be combined with --ci, --mr, --pr, or --repo",
         ));
     }
+    if parsed.preview && parsed.format == OutputFormat::Sarif {
+        return Err(diagnostic(
+            ErrorCode::CliInvalidArgument,
+            "review preview supports human or json output, not sarif",
+        ));
+    }
     Ok(Some(parsed))
 }
 
@@ -2212,146 +2863,47 @@ fn select_provider(
     configured: &str,
     credentials: &DiscoveredCredentials,
 ) -> Result<String, Diagnostic> {
-    match configured {
-        "anthropic" => require_credential(credentials, CredentialKind::Anthropic, "anthropic"),
-        "openai" => require_credential(credentials, CredentialKind::OpenAiCompatible, "openai"),
-        "auto" => match (
-            credentials.get(CredentialKind::Anthropic).is_some(),
-            credentials.get(CredentialKind::OpenAiCompatible).is_some(),
-        ) {
-            (true, _) => Ok("anthropic".to_owned()),
-            (false, true) => Ok("openai".to_owned()),
-            (false, false) => Err(missing_provider_credential()),
-        },
-        _ => Err(diagnostic(
-            ErrorCode::ProviderUnavailable,
-            "configured provider adapter is unsupported",
-        )),
-    }
-}
-
-fn require_credential(
-    credentials: &DiscoveredCredentials,
-    kind: CredentialKind,
-    provider: &str,
-) -> Result<String, Diagnostic> {
-    credentials
-        .get(kind)
-        .map(|_| provider.to_owned())
-        .ok_or_else(missing_provider_credential)
-}
-
-fn missing_provider_credential() -> Diagnostic {
-    diagnostic(
-        ErrorCode::ProviderUnavailable,
-        "no credential is available for the selected provider",
-    )
-    .with_remediation("provide ANTHROPIC_API_KEY or OPENAI_API_KEY")
+    crate::direct_provider::select_provider(configured, credentials)
 }
 
 fn select_model(provider: &str, configured: &str) -> Result<String, Diagnostic> {
-    if configured != "auto" {
-        return Ok(configured.to_owned());
-    }
-    let catalog: ModelCatalog = serde_json::from_str(MODEL_CATALOG)
-        .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "model catalog is invalid"))?;
-    if catalog.schema_version != MODEL_CATALOG_SCHEMA_VERSION
-        || catalog.providers.is_empty()
-        || catalog.providers.len() > 64
-    {
-        return Err(diagnostic(
-            ErrorCode::ContractInvalid,
-            "model catalog is invalid",
-        ));
-    }
-    catalog
-        .providers
-        .into_iter()
-        .find(|entry| entry.adapter == provider)
-        .filter(|entry| {
-            !entry.default_model.is_empty()
-                && entry.default_model.len() <= revoot_core::MAX_MODEL_ID_BYTES
-                && !entry
-                    .default_model
-                    .bytes()
-                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-        })
-        .map(|entry| entry.default_model)
-        .ok_or_else(|| {
-            diagnostic(
-                ErrorCode::ProviderUnavailable,
-                "the selected provider has no valid default model",
-            )
-        })
+    crate::direct_provider::select_model(provider, configured)
 }
 
 fn build_provider(
     provider: &str,
     credentials: &DiscoveredCredentials,
 ) -> Result<Box<dyn ProviderAdapter>, Diagnostic> {
-    match provider {
-        "anthropic" => {
-            let authorization =
-                authorize_standard_provider("anthropic", "https://api.anthropic.com/v1/messages")
-                    .map_err(|_| provider_setup_error())?;
-            let key = provider_key(credentials, CredentialKind::Anthropic)?;
-            let adapter = AnthropicAdapter::new(&AnthropicConfig::default(), key, &authorization)
-                .map_err(|_| provider_setup_error())?;
-            Ok(Box::new(adapter))
-        }
-        "openai" => {
-            let authorization =
-                authorize_standard_provider("openai", "https://api.openai.com/v1/responses")
-                    .map_err(|_| provider_setup_error())?;
-            let key = provider_key(credentials, CredentialKind::OpenAiCompatible)?;
-            let adapter = OpenAiAdapter::new(&OpenAiConfig::default(), key, &authorization)
-                .map_err(|_| provider_setup_error())?;
-            Ok(Box::new(adapter))
-        }
-        _ => Err(provider_setup_error()),
-    }
-}
-
-fn provider_key(
-    credentials: &DiscoveredCredentials,
-    kind: CredentialKind,
-) -> Result<ApiKey, Diagnostic> {
-    let value = credentials
-        .get(kind)
-        .ok_or_else(missing_provider_credential)?;
-    ApiKey::new(value.expose()).map_err(|_| provider_setup_error())
-}
-
-fn provider_setup_error() -> Diagnostic {
-    diagnostic(
-        ErrorCode::ProviderUnavailable,
-        "direct provider adapter setup failed",
-    )
+    crate::direct_provider::build_provider(provider, credentials)
 }
 
 fn agent_limits(
     resolution: &revoot_core::ConfigurationResolution,
+    strategy: &ReviewStrategyConfiguration,
 ) -> Result<AgentBudgetLimits, Diagnostic> {
-    let max_model_requests = u32_value(resolution, "budget.max_model_requests")?;
-    let engine_limits = ReviewEngineLimits::default();
-    let request_count = u64::from(max_model_requests);
+    let budget = &strategy.aggregate_budget;
     let max_findings = u32_value(resolution, "budget.max_findings")?;
-    let deadline_seconds = config_unsigned(resolution, "budget.deadline_seconds")?;
     Ok(AgentBudgetLimits {
-        max_turns: max_model_requests,
-        max_model_requests,
+        max_turns: budget.max_model_requests,
+        max_model_requests: budget.max_model_requests,
         max_candidate_findings: max_findings,
-        max_elapsed_millis: deadline_seconds.saturating_mul(1_000),
-        max_input_tokens: request_count.saturating_mul(engine_limits.max_conversation_bytes),
-        max_output_tokens: request_count
-            .saturating_mul(u64::from(engine_limits.max_output_tokens_per_turn)),
-        max_cost_microusd: request_count
-            .saturating_mul(engine_limits.reserved_cost_microusd_per_turn),
+        max_elapsed_millis: budget.max_elapsed_millis,
+        max_input_tokens: budget.max_model_tokens,
+        max_output_tokens: budget.max_output_tokens,
+        max_tool_calls: budget.max_tool_calls,
+        max_cost_microusd: budget.max_cost_microusd,
         ..AgentBudgetLimits::default()
     })
 }
 
-fn partition_limits(
+fn typed_review_strategy(
+    resolved: &ResolvedReviewConfiguration,
+) -> Result<ReviewStrategyConfiguration, Diagnostic> {
+    strategy_from_resolved(resolved)
+        .map_err(|error| diagnostic(ErrorCode::ContractInvalid, error.to_string()))
+}
+
+pub(crate) fn partition_limits(
     resolution: &revoot_core::ConfigurationResolution,
 ) -> Result<PartitionLimits, Diagnostic> {
     let max_files = u32_value(resolution, "budget.max_files")?;
@@ -2366,7 +2918,7 @@ fn partition_limits(
     })
 }
 
-fn selection_policy(
+pub(crate) fn selection_policy(
     resolution: &revoot_core::ConfigurationResolution,
     repository_policy: &RepositoryReviewPolicy,
 ) -> Result<ReviewSelectionPolicy, Diagnostic> {
@@ -2455,85 +3007,6 @@ fn diff_limits(
         context_radius_lines,
         ..UnifiedDiffLimits::default()
     })
-}
-
-fn review_prompt(
-    partition: &ReviewPartitionPlan,
-    change_request_label: &str,
-    attention: &ReviewAttention,
-) -> Result<String, Diagnostic> {
-    use std::fmt::Write as _;
-
-    let mut prompt = String::new();
-    if let ReviewAttention::Incremental {
-        previous_head,
-        delta_paths,
-        ..
-    } = attention
-    {
-        prompt.push_str("A prior complete review is available as a non-authoritative attention checkpoint. Start with code changed since that review, then trace its effects through callers and earlier pull-request changes. The entire authoritative change remains in scope; the checkpoint does not authorize omitting, trusting, or suppressing any code. Force a fresh conclusion from current evidence.\nPrior reviewed head: ");
-        prompt.push_str(previous_head.as_str());
-        prompt.push_str("\nPaths changed since that review:\n");
-        for path in delta_paths {
-            prompt.push_str("- ");
-            prompt.push_str(path.as_str());
-            prompt.push('\n');
-        }
-    }
-    write!(
-        prompt,
-        "Review the authoritative {change_request_label} snapshot. Spend attention in listed signal order. Start with high-value changed paths, then inspect unchanged checkout files, callers, dependencies, manifests, tests, or configuration needed to verify substantive improvements. Low-signal artifacts have a strict shared budget; inspect them only when a higher-value change depends on them or their local scan found a hazard.\nChanged paths:\n",
-    )
-    .expect("writing to a String cannot fail");
-    let mut selected = partition
-        .work_units
-        .iter()
-        .flat_map(|unit| unit.files.iter().map(move |file| (unit.id.as_str(), file)))
-        .collect::<Vec<_>>();
-    selected.sort_by(|left, right| {
-        right
-            .1
-            .review_value
-            .tier
-            .cmp(&left.1.review_value.tier)
-            .then_with(|| right.1.review_value.score.cmp(&left.1.review_value.score))
-            .then_with(|| left.1.path.cmp(&right.1.path))
-    });
-    for (work_unit_id, file) in selected {
-        prompt.push_str("- ");
-        prompt.push_str(file.path.new_path.as_str());
-        prompt.push_str(" (");
-        prompt.push_str(match file.review_value.tier {
-            ReviewValueTier::High => "high",
-            ReviewValueTier::Standard => "standard",
-            ReviewValueTier::Low => "low",
-        });
-        prompt.push_str(" signal, score ");
-        prompt.push_str(&file.review_value.score.to_string());
-        prompt.push_str(", work unit ");
-        prompt.push_str(work_unit_id);
-        prompt.push_str(")\n");
-    }
-    let deferred = partition
-        .omitted
-        .iter()
-        .filter(|file| file.reason == ReviewOmissionReason::LowSignalBudget)
-        .collect::<Vec<_>>();
-    if !deferred.is_empty() {
-        prompt.push_str("Deferred low-signal changed paths (context only):\n");
-        for file in deferred {
-            prompt.push_str("- ");
-            prompt.push_str(file.path.new_path.as_str());
-            prompt.push('\n');
-        }
-    }
-    if prompt.len() > 64 * 1024 {
-        return Err(diagnostic(
-            ErrorCode::ReviewFailed,
-            "review scope exceeds the automatic prompt bound",
-        ));
-    }
-    Ok(prompt)
 }
 
 struct CodeHostNetworkPolicy {
@@ -2816,19 +3289,38 @@ fn emit_report(
 ) -> Result<(), Diagnostic> {
     let output = match args.format {
         OutputFormat::Human => format!("{}\n", report.human_summary()),
-        OutputFormat::Json => serde_json::to_string_pretty(&ReviewOutput {
-            schema_version: REPORT_SCHEMA_VERSION,
-            provider,
-            model,
-            review: report,
-        })
-        .map(|value| format!("{value}\n"))
-        .map_err(|_| {
-            diagnostic(
-                ErrorCode::ContractInvalid,
-                "review report serialization failed",
-            )
-        })?,
+        OutputFormat::Json => {
+            if let Some(stable) = &report.stable_report {
+                String::from_utf8(stable.canonical_json().map_err(|_| {
+                    diagnostic(
+                        ErrorCode::ContractInvalid,
+                        "review report serialization failed",
+                    )
+                })?)
+                .map(|value| format!("{value}\n"))
+                .map_err(|_| {
+                    diagnostic(
+                        ErrorCode::ContractInvalid,
+                        "review report serialization failed",
+                    )
+                })?
+            } else {
+                serde_json::to_string_pretty(&ReviewOutput {
+                    schema_version: TERMINAL_REPORT_SCHEMA_VERSION,
+                    provider,
+                    model,
+                    review: report,
+                })
+                .map(|value| format!("{value}\n"))
+                .map_err(|_| {
+                    diagnostic(
+                        ErrorCode::ContractInvalid,
+                        "review report serialization failed",
+                    )
+                })?
+            }
+        }
+        OutputFormat::Sarif => render_sarif(report)?,
     };
     if let Some(path) = &args.output {
         write_report_atomically(path, output.as_bytes()).map_err(|_| {
@@ -2841,6 +3333,69 @@ fn emit_report(
         print!("{output}");
     }
     Ok(())
+}
+
+fn emit_preview(args: &ReviewArgs, preview: &ReviewPreview) -> Result<(), Diagnostic> {
+    let output = match args.format {
+        OutputFormat::Human => preview.human(),
+        OutputFormat::Json => String::from_utf8(preview.canonical_json().map_err(|_| {
+            diagnostic(
+                ErrorCode::ContractInvalid,
+                "review preview serialization failed",
+            )
+        })?)
+        .map(|value| format!("{value}\n"))
+        .map_err(|_| {
+            diagnostic(
+                ErrorCode::ContractInvalid,
+                "review preview serialization produced invalid UTF-8",
+            )
+        })?,
+        OutputFormat::Sarif => {
+            return Err(diagnostic(
+                ErrorCode::CliInvalidArgument,
+                "review preview supports human or json output, not sarif",
+            ));
+        }
+    };
+    if let Some(path) = &args.output {
+        write_report_atomically(path, output.as_bytes()).map_err(|_| {
+            diagnostic(
+                ErrorCode::RepositoryUnavailable,
+                "review preview output could not be written",
+            )
+        })?;
+    } else {
+        print!("{output}");
+    }
+    Ok(())
+}
+
+fn render_sarif(report: &CanonicalReviewReport) -> Result<String, Diagnostic> {
+    let stable = report.stable_report.as_ref().ok_or_else(|| {
+        diagnostic(
+            ErrorCode::ContractInvalid,
+            "SARIF requires a canonical exact-anchor review report",
+        )
+    })?;
+    let anchors = report.sarif_anchors.as_ref().ok_or_else(|| {
+        diagnostic(
+            ErrorCode::ContractInvalid,
+            "SARIF requires the trusted review anchor table",
+        )
+    })?;
+    let log = render_report_v3_sarif(stable, anchors).map_err(|_| {
+        diagnostic(
+            ErrorCode::ContractInvalid,
+            "SARIF exact-anchor validation failed",
+        )
+    })?;
+    String::from_utf8(
+        log.canonical_json()
+            .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "SARIF serialization failed"))?,
+    )
+    .map(|value| format!("{value}\n"))
+    .map_err(|_| diagnostic(ErrorCode::ContractInvalid, "SARIF serialization failed"))
 }
 
 fn write_report_atomically(path: &Path, output: &[u8]) -> Result<(), std::io::Error> {
@@ -2887,7 +3442,7 @@ fn diagnostic(code: ErrorCode, message: impl Into<String>) -> Diagnostic {
 
 fn print_help() {
     println!(
-        "USAGE:\n  revoot review [--base REF] [--format human|json] [--output PATH]\n  revoot review --ci [--format human|json] [--output PATH]\n  revoot review --mr IID | --pr NUMBER [--repo OWNER/REPOSITORY]"
+        "USAGE:\n  revoot review [--base REF] [--preview] [--effort low|medium|high] [--max-parallel-groups 1-8] [--format human|json|sarif] [--output PATH]\n  revoot review --ci [--preview] [--format human|json|sarif] [--output PATH]\n  revoot review --mr IID | --pr NUMBER [--repo OWNER/REPOSITORY]"
     );
 }
 
@@ -2898,11 +3453,15 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    use revoot_core::provider::{ProviderAdapter, ProviderFuture};
     use revoot_core::{
-        AgentBudgetLimits, AgentBudgetUsage, AnchorId, FindingCategory, MergeRequestIid,
-        PullRequestNumber, RankedFinding, Severity, Sha256Digest,
+        AgentBudgetLimits, AgentBudgetUsage, AnchorId, CancellationToken, ErrorCode,
+        FindingCategory, MergeRequestIid, ModelContent, ModelFinishReason, ModelRequest,
+        ModelResponse, ModelUsage, PullRequestNumber, RankedFinding, ReviewOutcome,
+        ReviewReportPhase, Severity, Sha256Digest,
     };
 
     use crate::config::{
@@ -2912,37 +3471,44 @@ mod tests {
         GitHubPublicationEvidence, GitHubPublicationFailure, GitHubReviewError,
     };
     use crate::review_overview::RiskLevel;
+    use serde_json::json;
 
     use super::{
         CanonicalPublication, CanonicalReviewReport, CanonicalSelection, OutputFormat,
-        REPORT_SCHEMA_VERSION, ReviewOutput, agent_limits, apply_repository_suppressions,
-        fork_behavior, github_publication_failure, minimum_review_risk, parse_args,
-        parse_private_cidr, partition_limits, select_model, validate_bound_job_url,
-        write_report_atomically,
+        ReviewOutput, TERMINAL_REPORT_SCHEMA_VERSION, agent_limits, apply_repository_suppressions,
+        diff_limits, fork_behavior, github_publication_failure, minimum_review_risk, parse_args,
+        parse_private_cidr, partition_limits, run_prepared_tool_first_engine, select_model,
+        selection_policy, typed_review_strategy, validate_bound_job_url, write_report_atomically,
     };
 
     static LOCAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn github_review_state_change_is_non_failing_only_before_mutation() {
-        let stopped = github_publication_failure(GitHubPublicationFailure {
-            error: GitHubReviewError::PublicationStateChanged,
-            evidence: GitHubPublicationEvidence::default(),
-        });
+        let stopped = github_publication_failure(
+            GitHubPublicationFailure {
+                error: GitHubReviewError::PublicationStateChanged,
+                evidence: GitHubPublicationEvidence::default(),
+            },
+            1,
+        );
         assert_eq!(stopped.state, "stopped");
         assert_eq!(stopped.reason, Some("github_review_state_changed"));
         assert_eq!(stopped.mutation_attempts, 0);
         assert!(!stopped.failed());
 
-        let partial = github_publication_failure(GitHubPublicationFailure {
-            error: GitHubReviewError::PublicationStateChanged,
-            evidence: GitHubPublicationEvidence {
-                actions_confirmed: 1,
-                mutation_attempts: 2,
-                superseded_comments: 1,
-                ..GitHubPublicationEvidence::default()
+        let partial = github_publication_failure(
+            GitHubPublicationFailure {
+                error: GitHubReviewError::PublicationStateChanged,
+                evidence: GitHubPublicationEvidence {
+                    actions_confirmed: 1,
+                    mutation_attempts: 2,
+                    superseded_comments: 1,
+                    ..GitHubPublicationEvidence::default()
+                },
             },
-        });
+            2,
+        );
         assert_eq!(partial.state, "failed");
         assert_eq!(partial.actions_confirmed, 1);
         assert_eq!(partial.mutation_attempts, 2);
@@ -2979,6 +3545,112 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    struct CommandToolFirstProvider {
+        calls: AtomicUsize,
+    }
+
+    impl ProviderAdapter for CommandToolFirstProvider {
+        fn adapter_id(&self) -> &'static str {
+            "command-tool-first-fake"
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _request: &'a ModelRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> ProviderFuture<'a> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Ok(ModelResponse {
+                    provider_response_id: None,
+                    model: "model-v1".to_owned(),
+                    content: vec![ModelContent::ToolUse {
+                        id: "complete-1".to_owned(),
+                        name: "complete_group".to_owned(),
+                        input: json!({
+                            "checkpoint": {
+                                "hypotheses": [],
+                                "evidence_references": [],
+                                "unresolved_coverage": []
+                            },
+                            "summary": {"text": "reviewed", "assumptions": []}
+                        }),
+                    }],
+                    finish_reason: ModelFinishReason::ToolUse,
+                    usage: ModelUsage::default(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn command_boundary_dispatches_selected_local_work_to_tool_first_engine() {
+        let repository = CleanLocalRepository::new();
+        fs::write(repository.0.join("README.md"), "# changed\n").expect("changed fixture");
+        let capture =
+            crate::local_review::capture_local_git(&repository.0, None).expect("local snapshot");
+        let base_sha = capture.identity.base_sha.clone();
+        let resolved = resolve_review_configuration(
+            &capture.root,
+            Some(&base_sha),
+            None,
+            [(
+                OsString::from("REVOOT_REVIEW_EFFORT"),
+                OsString::from("low"),
+            )],
+        )
+        .expect("configuration");
+        let strategy = typed_review_strategy(&resolved).expect("strategy");
+        let context = crate::local_review::build_local_review_context(
+            capture,
+            &crate::local_review::LocalReviewContextOptions {
+                provider_adapter: "command-tool-first-fake".to_owned(),
+                model_id: "model-v1".to_owned(),
+                agent_limits: agent_limits(&resolved.effective, &strategy).expect("agent limits"),
+                diff_limits: diff_limits(&resolved.effective).expect("diff limits"),
+                selection_policy: selection_policy(&resolved.effective, &resolved.repository)
+                    .expect("selection policy"),
+                partition_limits: partition_limits(&resolved.effective).expect("partition limits"),
+            },
+        )
+        .expect("local review context");
+        let prepared =
+            super::PreparedReview::Local(Box::new(super::PreparedLocalReview { context }));
+        assert!(!prepared.partition().work_units.is_empty());
+        let provider = Arc::new(CommandToolFirstProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let report = run_prepared_tool_first_engine(
+            &prepared,
+            &resolved,
+            &strategy,
+            "model-v1",
+            provider.clone(),
+        )
+        .await
+        .expect("tool-first command execution");
+        assert_eq!(report.group_count, 1);
+        assert!(matches!(
+            report.result.outcome,
+            ReviewOutcome::NoFindings { .. }
+        ));
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            report
+                .phase_usage
+                .iter()
+                .map(|usage| usage.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ReviewReportPhase::Grouping,
+                ReviewReportPhase::Planning,
+                ReviewReportPhase::Review,
+                ReviewReportPhase::Verification,
+                ReviewReportPhase::Adjudication,
+            ]
+        );
     }
 
     fn git(root: &Path, arguments: &[&str]) {
@@ -3041,7 +3713,8 @@ mod tests {
         assert_eq!(selection.max_files, 1);
         assert_eq!(selection.max_total_bytes, 1);
 
-        let exploration = agent_limits(&resolved.effective).expect("agent limits");
+        let strategy = typed_review_strategy(&resolved).expect("strategy");
+        let exploration = agent_limits(&resolved.effective, &strategy).expect("agent limits");
         let defaults = AgentBudgetLimits::default();
         assert_eq!(
             exploration.max_repository_files,
@@ -3051,10 +3724,12 @@ mod tests {
             exploration.max_repository_bytes,
             defaults.max_repository_bytes
         );
+        assert_eq!(exploration.max_input_tokens, 300_000);
+        assert_eq!(exploration.max_output_tokens, 64 * 4_096);
     }
 
     #[test]
-    fn parser_exposes_output_controls_but_no_review_strategy() {
+    fn parser_exposes_output_and_bounded_review_strategy() {
         let parsed = parse_args(
             [
                 "--ci",
@@ -3064,6 +3739,11 @@ mod tests {
                 "json",
                 "--output",
                 "report.json",
+                "--preview",
+                "--effort",
+                "high",
+                "--max-parallel-groups",
+                "8",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -3072,6 +3752,9 @@ mod tests {
         .expect("not help");
         assert_eq!(parsed.format, OutputFormat::Json);
         assert!(parsed.output.is_some());
+        assert!(parsed.preview);
+        assert_eq!(parsed.effort, Some(revoot_core::ReviewEffort::High));
+        assert_eq!(parsed.max_parallel_groups, Some(8));
         assert_eq!(parsed.merge_request_iid.map(MergeRequestIid::get), Some(17));
         assert!(parsed.pull_request_number.is_none());
         let github = parse_args(["--pr", "9"].into_iter().map(str::to_owned))
@@ -3093,6 +3776,15 @@ mod tests {
             "getrevoot/revoot"
         );
         assert!(parse_args(["--depth".to_owned()].into_iter()).is_err());
+        assert!(parse_args(["--effort", "extreme"].into_iter().map(str::to_owned)).is_err());
+        assert!(
+            parse_args(
+                ["--max-parallel-groups", "9"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
         let local = parse_args(["--base", "origin/release"].into_iter().map(str::to_owned))
             .expect("local arguments")
             .expect("not help");
@@ -3113,6 +3805,44 @@ mod tests {
     }
 
     #[test]
+    fn clean_local_review_emits_valid_v3_json_and_empty_exact_anchor_sarif() {
+        let repository = CleanLocalRepository::new();
+        let outputs = tempfile::tempdir().expect("output directory");
+        let json_output = outputs.path().join("review.json");
+        let sarif_output = outputs.path().join("review.sarif");
+        for (format, output) in [("json", &json_output), ("sarif", &sarif_output)] {
+            let exit = super::run(
+                [
+                    "--format".to_owned(),
+                    format.to_owned(),
+                    "--output".to_owned(),
+                    output.to_string_lossy().into_owned(),
+                ]
+                .into_iter(),
+                std::iter::empty::<(OsString, OsString)>(),
+                &repository.0,
+            )
+            .expect("clean local report");
+            assert_eq!(exit, 0);
+        }
+
+        let report: revoot_core::ReviewReportV3 =
+            serde_json::from_slice(&fs::read(json_output).expect("JSON report"))
+                .expect("version-3 report");
+        report.validate().expect("valid report");
+        assert_eq!(report.state, revoot_core::ReviewReportState::NoFindings);
+        assert!(report.findings.is_empty());
+        let sarif: serde_json::Value =
+            serde_json::from_slice(&fs::read(sarif_output).expect("SARIF report"))
+                .expect("SARIF JSON");
+        assert_eq!(sarif["version"], "2.1.0");
+        assert_eq!(
+            sarif["runs"][0]["results"].as_array().map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn binary_only_local_review_uses_no_provider_credential() {
         let repository = CleanLocalRepository::new();
         fs::write(repository.0.join("artifact.bin"), [0_u8, 1, 2, 3]).expect("binary fixture");
@@ -3123,6 +3853,54 @@ mod tests {
         )
         .expect("binary-only review succeeds");
         assert_eq!(exit, 0);
+    }
+
+    #[test]
+    fn local_preview_needs_no_selected_provider_credential() {
+        let repository = CleanLocalRepository::new();
+        fs::write(
+            repository.0.join("README.md"),
+            "# changed without a provider credential\n",
+        )
+        .expect("changed fixture");
+        let output = repository.0.join("preview.json");
+        let exit = super::run(
+            [
+                "--preview".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+                "--output".to_owned(),
+                output.to_string_lossy().into_owned(),
+            ]
+            .into_iter(),
+            [(OsString::from("REVOOT_PROVIDER"), OsString::from("openai"))],
+            &repository.0,
+        )
+        .expect("preview returns before provider credential discovery");
+        assert_eq!(exit, 0);
+
+        let preview: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).expect("preview output"))
+                .expect("preview json");
+        assert_eq!(
+            preview["schema_version"],
+            revoot_core::ReviewPreview::SCHEMA_VERSION
+        );
+        assert_eq!(preview["grouping_source"], "deterministic_fallback");
+        assert_eq!(preview["groups"].as_array().map(Vec::len), Some(1));
+        assert!(preview.get("provider").is_none());
+        assert!(preview.get("model").is_none());
+    }
+
+    #[test]
+    fn parser_rejects_sarif_preview_before_review_preparation() {
+        let error = parse_args(
+            ["--preview", "--format", "sarif"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("SARIF preview is unsupported");
+        assert_eq!(error.code, ErrorCode::CliInvalidArgument);
     }
 
     #[test]
@@ -3150,10 +3928,13 @@ mod tests {
         )
         .expect("default fork policy skips before external acquisition");
         assert_eq!(exit, 0);
-        let report = fs::read_to_string(&output).expect("skipped report");
-        assert!(report.contains("\"provider\": \"not_used\""));
-        assert!(report.contains("\"state\": \"skipped\""));
-        assert!(report.contains("\"reason\": \"fork_policy\""));
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).expect("skipped report"))
+                .expect("terminal JSON");
+        assert_eq!(report["schema_version"], TERMINAL_REPORT_SCHEMA_VERSION);
+        assert_eq!(report["provider"], "not_used");
+        assert_eq!(report["review"]["state"], "skipped");
+        assert_eq!(report["review"]["publication"]["reason"], "fork_policy");
         fs::remove_file(output).expect("remove skipped report");
     }
 
@@ -3201,6 +3982,8 @@ mod tests {
     #[test]
     fn canonical_silent_report_omits_a_findings_payload() {
         let review = CanonicalReviewReport {
+            stable_report: None,
+            sarif_anchors: None,
             state: "no_findings",
             overview: None,
             summary: Some("No supported defects found.".to_owned()),
@@ -3213,12 +3996,14 @@ mod tests {
             tool_calls: 3,
             admitted_candidates: 0,
             suppressed_candidates: 0,
+            strategy: None,
+            coverage: None,
             selection: CanonicalSelection::default(),
             publication: CanonicalPublication::terminal("not_needed", Some("no_findings")),
             finding_locations: BTreeMap::new(),
         };
         let encoded = serde_json::to_string(&ReviewOutput {
-            schema_version: REPORT_SCHEMA_VERSION,
+            schema_version: TERMINAL_REPORT_SCHEMA_VERSION,
             provider: "anthropic",
             model: "model",
             review: &review,
@@ -3227,6 +4012,7 @@ mod tests {
         assert!(!encoded.contains("\"findings\":"));
         assert!(encoded.contains("no_findings"));
         assert!(encoded.contains("\"selection\":"));
+        assert!(super::render_sarif(&review).is_err());
     }
 
     #[test]

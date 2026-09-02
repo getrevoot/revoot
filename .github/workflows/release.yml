@@ -95,25 +95,35 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14
+        with:
+          version: 2026.8.5
+          install: true
+          cache: true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: linux-release
           path: release-input
-      - name: Publish architecture image
+      - name: Smoke-test and publish architecture image
         env:
           GHCR_TOKEN: ${{ github.token }}
           IMAGE: ghcr.io/${{ github.repository }}
           IMAGE_TAG: ${{ github.ref_name }}-${{ matrix.architecture }}
+          REVOOT_OCI_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          REVOOT_OCI_REVISION: ${{ github.sha }}
         run: |
-          mkdir image-context
-          tar -xOzf "release-input/${{ matrix.archive }}" revoot > image-context/revoot
-          chmod 0555 image-context/revoot
-          cp packaging/oci/Dockerfile image-context/Dockerfile
+          case "${{ matrix.architecture }}" in
+            amd64) target=x86_64-unknown-linux-musl ;;
+            arm64) target=aarch64-unknown-linux-musl ;;
+            *) exit 2 ;;
+          esac
+          mkdir -p "target/$target/release"
+          tar -xOzf "release-input/${{ matrix.archive }}" revoot \
+            > "target/$target/release/revoot"
+          chmod 0555 "target/$target/release/revoot"
+          export REVOOT_OCI_TAG="$IMAGE:$IMAGE_TAG"
+          mise run "package:oci:${{ matrix.architecture }}"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
-          docker build --platform "linux/${{ matrix.architecture }}" \
-            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
-            --label "org.opencontainers.image.revision=${{ github.sha }}" \
-            --tag "$IMAGE:$IMAGE_TAG" image-context
           docker push "$IMAGE:$IMAGE_TAG"
 
   publish-image:

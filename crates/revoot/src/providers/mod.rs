@@ -257,20 +257,29 @@ impl DirectHttp {
                 () = wait_for_cancellation(cancellation) => return Err(cancelled()),
             };
             let Some(chunk) = chunk else { break };
-            let next = body
-                .len()
-                .checked_add(chunk.len())
-                .ok_or_else(response_too_large)?;
-            if next > self.limits.max_response_body_bytes {
-                return Err(response_too_large());
-            }
-            body.extend_from_slice(&chunk);
+            append_bounded_body(&mut body, &chunk, self.limits.max_response_body_bytes)?;
         }
         if expected_length.is_some_and(|expected| expected != body.len()) {
             return Err(json_error());
         }
         Ok(HttpResponse { status, body })
     }
+}
+
+fn append_bounded_body(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), ProviderError> {
+    let next = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(response_too_large)?;
+    if next > max_bytes {
+        return Err(response_too_large());
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 async fn wait_for_cancellation(cancellation: &CancellationToken) {
@@ -417,6 +426,70 @@ mod tests {
                 .expect_err("invalid media type")
                 .kind(),
             ProviderErrorKind::Protocol
+        );
+    }
+
+    #[test]
+    fn oversized_and_ambiguous_response_metadata_fail_payload_free() {
+        let limits = ProviderHttpLimits {
+            max_response_body_bytes: 16,
+            max_response_headers: 2,
+            max_response_header_bytes: 128,
+            ..ProviderHttpLimits::default()
+        };
+        let mut oversized = HeaderMap::new();
+        oversized.insert(CONTENT_LENGTH, HeaderValue::from_static("17"));
+        let error = validate_headers(&oversized, limits).expect_err("body limit");
+        assert_eq!(error.kind(), ProviderErrorKind::ResponseTooLarge);
+
+        let mut excessive = HeaderMap::new();
+        excessive.insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        excessive.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        excessive.insert("x-extra", HeaderValue::from_static("SENSITIVE_MARKER"));
+        let error = validate_headers(&excessive, limits).expect_err("header count");
+        assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+        assert!(!format!("{error:?}").contains("SENSITIVE_MARKER"));
+
+        let mut ambiguous = HeaderMap::new();
+        ambiguous.append(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        ambiguous.append(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        assert_eq!(
+            validate_headers(&ambiguous, limits)
+                .expect_err("duplicate content lengths")
+                .kind(),
+            ProviderErrorKind::Protocol
+        );
+    }
+
+    #[test]
+    fn chunked_response_body_is_bounded_without_content_length() {
+        let mut body = Vec::new();
+        append_bounded_body(&mut body, b"12345678", 12).expect("first chunk");
+        let error = append_bounded_body(&mut body, b"SENSITIVE", 12).expect_err("body limit");
+        assert_eq!(error.kind(), ProviderErrorKind::ResponseTooLarge);
+        assert_eq!(body, b"12345678");
+        assert!(!format!("{error:?}").contains("SENSITIVE"));
+    }
+
+    #[test]
+    fn timeout_cancellation_and_response_loss_are_classified_without_payloads() {
+        let timeout = classify_status(StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(timeout.kind(), ProviderErrorKind::Timeout);
+        assert!(timeout.retryable());
+
+        let cancellation = cancelled();
+        assert_eq!(cancellation.kind(), ProviderErrorKind::Cancelled);
+        assert!(!cancellation.retryable());
+
+        // A transport loss after dispatch cannot prove whether the provider
+        // accepted the request. It is retryable but carries no response body;
+        // the engine conservatively settles the corresponding reservation.
+        let response_loss = ProviderError::new(ProviderErrorKind::Unavailable, None, true);
+        assert!(response_loss.retryable());
+        assert_eq!(response_loss.status_code(), None);
+        assert_eq!(
+            response_loss.to_string(),
+            "provider request failed: Unavailable"
         );
     }
 }

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.revoot.dev/coverage-v1.schema.json",
+  "title": "Revoot risk-adaptive coverage v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "policy_version",
+    "high_risk_files",
+    "standard_risk_files",
+    "low_risk_files",
+    "fully_read_files",
+    "sampled_files",
+    "manifest_only_files",
+    "delivered_high_risk_hunks",
+    "required_high_risk_hunks",
+    "explicit_deferrals",
+    "failed_groups"
+  ],
+  "properties": {
+    "policy_version": { "const": "revoot.risk-adaptive-coverage/v1" },
+    "high_risk_files": { "$ref": "#/$defs/count" },
+    "standard_risk_files": { "$ref": "#/$defs/count" },
+    "low_risk_files": { "$ref": "#/$defs/count" },
+    "fully_read_files": { "$ref": "#/$defs/count" },
+    "sampled_files": { "$ref": "#/$defs/count" },
+    "manifest_only_files": { "$ref": "#/$defs/count" },
+    "delivered_high_risk_hunks": { "$ref": "#/$defs/count" },
+    "required_high_risk_hunks": { "$ref": "#/$defs/count" },
+    "explicit_deferrals": { "$ref": "#/$defs/count" },
+    "failed_groups": { "$ref": "#/$defs/count" }
+  },
+  "$defs": {
+    "count": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+  }
+}

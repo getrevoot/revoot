@@ -7,7 +7,7 @@ default-members = ["crates/revoot"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 publish = false
@@ -17,8 +17,13 @@ license = "Apache-2.0"
 gix = { version = "0.87", default-features = false, features = ["revision", "sha1", "dirwalk"] }
 similar = "2.7"
 libc = "0.2"
-revoot-core = { version = "0.2.0", path = "crates/revoot-core" }
+revoot-core = { version = "0.3.0", path = "crates/revoot-core" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+httpdate = "1"
+globset = "0.4"
+getrandom = "0.3"
+regex = "1"
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +32,7 @@ sha2 = "0.10"
 sha1 = "0.10"
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+tempfile = "3"
 webpki-roots = "1"
 
 [profile.release]

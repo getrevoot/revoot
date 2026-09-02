@@ -289,11 +289,12 @@ pub fn decode_sse_fixture(input: &[u8]) -> Result<Vec<ModelStreamEvent>, Provide
     let mut events = Vec::new();
     let mut started = false;
     let mut completed = false;
-    for record in text
+    for (record_index, record) in text
         .split("\n\n")
         .filter(|record| !record.trim().is_empty())
+        .enumerate()
     {
-        if record.len() > MAX_SSE_EVENT_BYTES || events.len() >= MAX_SSE_EVENTS {
+        if record.len() > MAX_SSE_EVENT_BYTES || record_index >= MAX_SSE_EVENTS || completed {
             return Err(json_error());
         }
         let data = record
@@ -315,10 +316,16 @@ pub fn decode_sse_fixture(input: &[u8]) -> Result<Vec<ModelStreamEvent>, Provide
                 started = true;
             }
             "response.output_text.delta" => {
+                if !started {
+                    return Err(json_error());
+                }
                 let text = bounded_string(root, "delta", revoot_core::MAX_TEXT_BYTES)?;
                 events.push(ModelStreamEvent::TextDelta { text });
             }
             "response.output_item.added" => {
+                if !started {
+                    return Err(json_error());
+                }
                 let item = object(required(root, "item")?)?;
                 if string(item, "type")? == "function_call" {
                     events.push(ModelStreamEvent::ToolUseStart {
@@ -329,12 +336,18 @@ pub fn decode_sse_fixture(input: &[u8]) -> Result<Vec<ModelStreamEvent>, Provide
                 }
             }
             "response.function_call_arguments.delta" => {
+                if !started {
+                    return Err(json_error());
+                }
                 events.push(ModelStreamEvent::ToolInputDelta {
                     index: u32_field(root, "output_index")?,
                     partial_json: bounded_string(root, "delta", revoot_core::MAX_TOOL_JSON_BYTES)?,
                 });
             }
             "response.completed" | "response.incomplete" => {
+                if !started {
+                    return Err(json_error());
+                }
                 let response = object(required(root, "response")?)?;
                 let used_tool = array(response, "output")?.iter().any(|item| {
                     item.as_object()
@@ -451,6 +464,37 @@ mod tests {
         assert_eq!(encoded["tools"][0]["name"], "read_file");
         assert_eq!(encoded["store"], false);
         assert!(encoded.get("authorization").is_none());
+        assert!(encoded.get("previous_response_id").is_none());
+        assert!(encoded.get("stream").is_none());
+    }
+
+    #[test]
+    fn request_fixture_preserves_batched_tool_result_ids_in_order() {
+        let request = ModelRequest {
+            model: "openai-test".to_owned(),
+            system: Some("Review code".to_owned()),
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                content: vec![
+                    ModelContent::ToolResult {
+                        tool_use_id: "call_01".to_owned(),
+                        content: "first".to_owned(),
+                        is_error: false,
+                    },
+                    ModelContent::ToolResult {
+                        tool_use_id: "call_02".to_owned(),
+                        content: "second".to_owned(),
+                        is_error: false,
+                    },
+                ],
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 512,
+            temperature: None,
+        };
+        let encoded = encode_request(&request);
+        assert_eq!(encoded["input"][0]["call_id"], "call_01");
+        assert_eq!(encoded["input"][1]["call_id"], "call_02");
     }
 
     #[test]
@@ -467,6 +511,28 @@ mod tests {
         assert_eq!(response.finish_reason, ModelFinishReason::ToolUse);
         assert_eq!(response.usage.cached_input_tokens, 4);
         assert!(matches!(response.content[0], ModelContent::ToolUse { .. }));
+    }
+
+    #[test]
+    fn recorded_response_preserves_parallel_tool_call_ids_in_order() {
+        let fixture = br#"{
+          "id":"resp-01","object":"response","status":"completed","model":"openai-test",
+          "output":[
+            {"type":"function_call","call_id":"call_01","name":"read_file","arguments":"{\"path\":\"src/a.rs\"}"},
+            {"type":"function_call","call_id":"call_02","name":"read_file","arguments":"{\"path\":\"src/b.rs\"}"}
+          ],
+          "usage":{"input_tokens":20,"output_tokens":7}
+        }"#;
+        let response = decode_response(fixture).expect("valid recorded fixture");
+        let ids = response
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                ModelContent::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["call_01", "call_02"]);
     }
 
     #[test]
@@ -492,6 +558,38 @@ data: {"type":"response.completed","sequence_number":2,"response":{"id":"resp-01
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn recorded_sse_rejects_incomplete_out_of_order_and_oversized_events() {
+        let incomplete =
+            br#"data: {"type":"response.created","response":{"id":"resp-01","model":"openai-test"}}
+
+"#;
+        assert_eq!(
+            decode_sse_fixture(incomplete)
+                .expect_err("completion is mandatory")
+                .kind(),
+            ProviderErrorKind::Protocol
+        );
+
+        let out_of_order = br#"data: {"type":"response.output_text.delta","delta":"secret"}
+
+"#;
+        let error = decode_sse_fixture(out_of_order).expect_err("start is mandatory");
+        assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+        assert!(!format!("{error:?}").contains("secret"));
+
+        let oversized = format!(
+            "data: {{\"type\":\"ping\",\"padding\":\"{}\"}}\n\n",
+            "x".repeat(MAX_SSE_EVENT_BYTES)
+        );
+        assert_eq!(
+            decode_sse_fixture(oversized.as_bytes())
+                .expect_err("event is bounded")
+                .kind(),
+            ProviderErrorKind::Protocol
+        );
     }
 
     #[test]

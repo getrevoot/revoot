@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.revoot.dev/review-group-plan-v1.schema.json",
+  "title": "Revoot review group plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "partition_sha256", "source", "limits", "groups", "plan_sha256"],
+  "properties": {
+    "schema_version": { "const": "revoot.review-group-plan/v1" },
+    "partition_sha256": { "$ref": "#/$defs/digest" },
+    "source": { "enum": ["deterministic", "semantic", "deterministic_fallback"] },
+    "limits": { "$ref": "#/$defs/limits" },
+    "groups": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/group" }
+    },
+    "plan_sha256": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "anchor": { "type": "string", "pattern": "^ga1_[0-9a-f]{64}$" },
+    "workUnit": { "type": "string", "pattern": "^wu2_[0-9a-f]{64}$" },
+    "path": { "type": "string", "minLength": 1 },
+    "changedPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["old_path", "new_path", "kind"],
+      "properties": {
+        "old_path": { "$ref": "#/$defs/path" },
+        "new_path": { "$ref": "#/$defs/path" },
+        "kind": { "enum": ["modified", "renamed", "added", "deleted"] }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_files", "max_input_bytes", "max_anchors"],
+      "properties": {
+        "max_files": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "max_input_bytes": { "type": "integer", "minimum": 1, "maximum": 524288 },
+        "max_anchors": { "type": "integer", "minimum": 1, "maximum": 10000 }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "tier", "input_bytes", "anchor_ids", "work_unit_id"],
+      "properties": {
+        "path": { "$ref": "#/$defs/changedPath" },
+        "tier": { "enum": ["low", "standard", "high"] },
+        "input_bytes": { "type": "integer", "minimum": 0, "maximum": 524288 },
+        "anchor_ids": {
+          "type": "array",
+          "maxItems": 10000,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/anchor" }
+        },
+        "work_unit_id": { "$ref": "#/$defs/workUnit" }
+      }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "files", "input_bytes", "anchor_count"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^rg-[0-9a-f]{64}$" },
+        "files": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/$defs/file" } },
+        "input_bytes": { "type": "integer", "minimum": 1, "maximum": 524288 },
+        "anchor_count": { "type": "integer", "minimum": 0, "maximum": 10000 }
+      }
+    }
+  }
+}

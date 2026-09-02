@@ -619,6 +619,7 @@ pub enum AgentOmissionReason {
     UnsupportedEncoding,
     SearchTruncated,
     DiffUnavailable,
+    CoverageIncomplete,
     BudgetExhausted,
     LowSignalDeferred,
     HistoryUnavailable,

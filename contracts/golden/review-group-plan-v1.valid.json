@@ -1,0 +1,46 @@
+{
+  "schema_version": "revoot.review-group-plan/v1",
+  "partition_sha256": "6bc6c10844a608ef06ec4a05d62fd6d5f4160fe11cfec032622e20b69ef126ff",
+  "source": "deterministic",
+  "limits": {
+    "max_files": 10,
+    "max_input_bytes": 524288,
+    "max_anchors": 10000
+  },
+  "groups": [
+    {
+      "id": "rg-cc94b7d87d22d012d02ec717cd4444f47e6cc511eee5bef22415e40cbc1427d1",
+      "files": [
+        {
+          "path": {
+            "old_path": "src/high.rs",
+            "new_path": "src/high.rs",
+            "kind": "modified"
+          },
+          "tier": "high",
+          "input_bytes": 40,
+          "anchor_ids": [
+            "ga1_1111111111111111111111111111111111111111111111111111111111111111"
+          ],
+          "work_unit_id": "wu2_f01c336a566bfa6f43b8b0cace203b94785d661d01a06d5df9044478ec93a534"
+        },
+        {
+          "path": {
+            "old_path": "tests/standard.rs",
+            "new_path": "tests/standard.rs",
+            "kind": "modified"
+          },
+          "tier": "standard",
+          "input_bytes": 40,
+          "anchor_ids": [
+            "ga1_2222222222222222222222222222222222222222222222222222222222222222"
+          ],
+          "work_unit_id": "wu2_f01c336a566bfa6f43b8b0cace203b94785d661d01a06d5df9044478ec93a534"
+        }
+      ],
+      "input_bytes": 80,
+      "anchor_count": 2
+    }
+  ],
+  "plan_sha256": "ca37d74d0962e999c24ba10464cee15a3f1d0eb215c1eb39ede6815a4d594f4a"
+}

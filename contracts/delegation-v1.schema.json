@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.revoot.dev/delegation-v1.schema.json",
+  "title": "Revoot delegation manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "snapshot", "partition_sha256", "policy_digests", "files", "exclusions", "rule_groups", "manifest_sha256"],
+  "properties": {
+    "schema_version": { "const": "revoot.delegation/v1" },
+    "snapshot": { "$ref": "#/$defs/snapshot" },
+    "partition_sha256": { "$ref": "#/$defs/digest" },
+    "policy_digests": { "$ref": "#/$defs/policyDigests" },
+    "files": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/file" } },
+    "exclusions": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/exclusion" } },
+    "rule_groups": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/ruleGroup" } },
+    "manifest_sha256": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "gitSha": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$" },
+    "path": { "type": "string", "minLength": 1 },
+    "identifier": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.:/-]+$" },
+    "changedPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["old_path", "new_path", "kind"],
+      "properties": {
+        "old_path": { "$ref": "#/$defs/path" },
+        "new_path": { "$ref": "#/$defs/path" },
+        "kind": { "enum": ["modified", "renamed", "added", "deleted"] }
+      }
+    },
+    "localSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_identity_sha256", "base_sha", "head_sha", "working_tree_sha256", "exact_diff_manifest_sha256"],
+      "properties": {
+        "repository_identity_sha256": { "$ref": "#/$defs/digest" },
+        "base_sha": { "$ref": "#/$defs/gitSha" },
+        "head_sha": { "$ref": "#/$defs/gitSha" },
+        "working_tree_sha256": { "$ref": "#/$defs/digest" },
+        "exact_diff_manifest_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "githubSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_origin_digest", "repository_id", "pull_request_number", "base_sha", "head_sha", "exact_diff_manifest_sha256"],
+      "properties": {
+        "api_origin_digest": { "$ref": "#/$defs/digest" },
+        "repository_id": { "type": "integer", "minimum": 1 },
+        "pull_request_number": { "type": "integer", "minimum": 1 },
+        "base_sha": { "$ref": "#/$defs/gitSha" },
+        "head_sha": { "$ref": "#/$defs/gitSha" },
+        "exact_diff_manifest_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "gitlabSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "exact_diff_manifest_sha256"],
+      "properties": {
+        "version": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope", "diff_version"],
+          "properties": {
+            "scope": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["instance_origin_digest", "project_id", "merge_request_iid"],
+              "properties": {
+                "instance_origin_digest": { "$ref": "#/$defs/digest" },
+                "project_id": { "type": "integer", "minimum": 1 },
+                "merge_request_iid": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "diff_version": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "refs"],
+              "properties": {
+                "id": { "type": "integer", "minimum": 1 },
+                "refs": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["base_sha", "start_sha", "head_sha"],
+                  "properties": {
+                    "base_sha": { "$ref": "#/$defs/gitSha" },
+                    "start_sha": { "$ref": "#/$defs/gitSha" },
+                    "head_sha": { "$ref": "#/$defs/gitSha" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "exact_diff_manifest_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "snapshot": { "oneOf": [{ "$ref": "#/$defs/localSnapshot" }, { "$ref": "#/$defs/githubSnapshot" }, { "$ref": "#/$defs/gitlabSnapshot" }] },
+    "policyDigests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selection_policy_sha256", "repository_policy_sha256", "rule_set_sha256"],
+      "properties": {
+        "selection_policy_sha256": { "$ref": "#/$defs/digest" },
+        "repository_policy_sha256": { "$ref": "#/$defs/digest" },
+        "rule_set_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "class", "tier", "selected_input_bytes", "anchor_count", "work_unit_id", "rule_group_ids"],
+      "properties": {
+        "path": { "$ref": "#/$defs/changedPath" },
+        "class": { "enum": ["text", "generated", "binary", "unsupported_encoding"] },
+        "tier": { "enum": ["low", "standard", "high"] },
+        "selected_input_bytes": { "type": "integer", "minimum": 0 },
+        "anchor_count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "work_unit_id": { "type": "string", "pattern": "^wu2_[0-9a-f]{64}$" },
+        "rule_group_ids": { "type": "array", "maxItems": 1024, "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } }
+      }
+    },
+    "exclusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "reason"],
+      "properties": {
+        "path": { "$ref": "#/$defs/changedPath" },
+        "reason": { "enum": ["not_included_policy", "exact_path_policy", "prefix_policy", "suffix_policy", "generated_policy", "binary", "unsupported_encoding", "file_too_large", "missing_exact_diff", "empty_object_set", "duplicate_object_role", "duplicate_anchor", "input_byte_overflow", "file_budget", "total_byte_budget", "low_signal_budget", "work_unit_budget", "work_unit_file_capacity", "work_unit_byte_capacity", "work_unit_anchor_capacity"] }
+      }
+    },
+    "ruleGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "rule_ids", "matched_paths"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "rule_ids": { "type": "array", "maxItems": 1024, "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } },
+        "matched_paths": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/path" } }
+      }
+    }
+  }
+}

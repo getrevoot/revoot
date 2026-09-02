@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.revoot.dev/review-report-v3.schema.json",
+  "title": "Revoot review report v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "state", "snapshot_sha256", "partition_sha256", "findings", "overview", "lineage", "publication", "selection", "strategy", "coverage", "usage", "report_sha256"],
+  "properties": {
+    "schema_version": { "const": "revoot.review-report/v3" },
+    "state": { "enum": ["complete", "partial", "no_findings", "blocked", "failed", "cancelled"] },
+    "snapshot_sha256": { "$ref": "#/$defs/digest" },
+    "partition_sha256": { "$ref": "#/$defs/digest" },
+    "findings": { "type": "array", "maxItems": 25, "items": { "$ref": "#/$defs/finding" } },
+    "overview": { "$ref": "#/$defs/overview" },
+    "lineage": { "type": "array", "items": { "$ref": "#/$defs/lineage" } },
+    "publication": { "$ref": "#/$defs/publication" },
+    "selection": { "$ref": "#/$defs/selection" },
+    "strategy": { "$ref": "#/$defs/strategy" },
+    "coverage": { "$ref": "coverage-v1.schema.json" },
+    "usage": { "$ref": "#/$defs/usage" },
+    "report_sha256": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "anchor": { "type": "string", "pattern": "^ga1_[0-9a-f]{64}$" },
+    "path": { "type": "string", "minLength": 1 },
+    "count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["work_unit_id", "anchor_id", "coordinate", "finding_key", "content_sha256", "severity", "confidence_percent", "category", "title", "explanation", "evidence", "rendered_body"],
+      "properties": {
+        "work_unit_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "anchor_id": { "$ref": "#/$defs/anchor" },
+        "coordinate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "side", "line"],
+          "properties": {
+            "path": { "$ref": "#/$defs/path" },
+            "side": { "enum": ["old", "new"] },
+            "line": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+          }
+        },
+        "finding_key": { "$ref": "#/$defs/digest" },
+        "content_sha256": { "$ref": "#/$defs/digest" },
+        "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
+        "confidence_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "category": { "enum": ["correctness", "security", "reliability", "performance", "maintainability"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "explanation": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "evidence": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "suggested_replacement": { "type": "string", "minLength": 1, "maxLength": 8000 },
+        "rendered_body": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "lineage_id": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "overview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "content_sha256"],
+      "properties": {
+        "text": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "content_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lineage_id", "disposition", "evidence_sha256"],
+      "properties": {
+        "lineage_id": { "$ref": "#/$defs/digest" },
+        "disposition": { "enum": ["still_present", "fixed", "uncertain"] },
+        "evidence_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "publication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planned_findings", "published_findings", "suppressed_findings", "publication_complete"],
+      "properties": {
+        "planned_findings": { "$ref": "#/$defs/count" },
+        "published_findings": { "$ref": "#/$defs/count" },
+        "suppressed_findings": { "$ref": "#/$defs/count" },
+        "publication_complete": { "type": "boolean" }
+      }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["changed_files", "selected_files", "omitted_files", "selected_diff_bytes", "omission_reasons"],
+      "properties": {
+        "changed_files": { "$ref": "#/$defs/count" },
+        "selected_files": { "$ref": "#/$defs/count" },
+        "omitted_files": { "$ref": "#/$defs/count" },
+        "selected_diff_bytes": { "type": "integer", "minimum": 0 },
+        "omission_reasons": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "not_included_policy": { "$ref": "#/$defs/count" },
+            "exact_path_policy": { "$ref": "#/$defs/count" },
+            "prefix_policy": { "$ref": "#/$defs/count" },
+            "suffix_policy": { "$ref": "#/$defs/count" },
+            "generated_policy": { "$ref": "#/$defs/count" },
+            "binary": { "$ref": "#/$defs/count" },
+            "unsupported_encoding": { "$ref": "#/$defs/count" },
+            "file_too_large": { "$ref": "#/$defs/count" },
+            "missing_exact_diff": { "$ref": "#/$defs/count" },
+            "empty_object_set": { "$ref": "#/$defs/count" },
+            "duplicate_object_role": { "$ref": "#/$defs/count" },
+            "duplicate_anchor": { "$ref": "#/$defs/count" },
+            "input_byte_overflow": { "$ref": "#/$defs/count" },
+            "file_budget": { "$ref": "#/$defs/count" },
+            "total_byte_budget": { "$ref": "#/$defs/count" },
+            "low_signal_budget": { "$ref": "#/$defs/count" },
+            "work_unit_budget": { "$ref": "#/$defs/count" },
+            "work_unit_file_capacity": { "$ref": "#/$defs/count" },
+            "work_unit_byte_capacity": { "$ref": "#/$defs/count" },
+            "work_unit_anchor_capacity": { "$ref": "#/$defs/count" }
+          }
+        }
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effort", "grouping_source", "group_count", "max_parallel_groups"],
+      "properties": {
+        "effort": { "enum": ["low", "medium", "high"] },
+        "grouping_source": { "enum": ["deterministic", "semantic", "deterministic_fallback"] },
+        "group_count": { "$ref": "#/$defs/count" },
+        "max_parallel_groups": { "type": "integer", "minimum": 1, "maximum": 8 }
+      }
+    },
+    "phaseUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "model_requests", "input_tokens", "output_tokens", "tool_calls", "cost_microusd"],
+      "properties": {
+        "phase": { "enum": ["grouping", "planning", "review", "verification", "adjudication"] },
+        "model_requests": { "$ref": "#/$defs/count" },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "tool_calls": { "$ref": "#/$defs/count" },
+        "cost_microusd": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "usageTotals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_requests", "input_tokens", "output_tokens", "tool_calls", "cost_microusd"],
+      "properties": {
+        "model_requests": { "$ref": "#/$defs/count" },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "tool_calls": { "$ref": "#/$defs/count" },
+        "cost_microusd": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phases", "totals"],
+      "properties": {
+        "phases": { "type": "array", "minItems": 5, "maxItems": 5, "items": { "$ref": "#/$defs/phaseUsage" } },
+        "totals": { "$ref": "#/$defs/usageTotals" }
+      }
+    }
+  }
+}
