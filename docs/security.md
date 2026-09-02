@@ -78,7 +78,7 @@ model never receives an artifact filesystem path. RAII cleanup removes the
 store on success, error, or cancellation.
 
 Groups no larger than 16 KiB may receive their complete diff once when the
-whole request remains inside the 32,000-token target. Larger groups receive
+whole request remains inside the 96,000-token target. Larger groups receive
 only file and hunk metadata initially. Workers fetch exact bounded hunk pages
 with `read_diff` or search the private artifacts with `search_diff`; no large
 group is partially inlined. Tool results are deterministically paginated and

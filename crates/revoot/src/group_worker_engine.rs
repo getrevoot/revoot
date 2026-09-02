@@ -46,8 +46,8 @@ const WORKER_PAGE_BYTES: u32 = 8 * 1024;
 const DEFAULT_SEARCH_RESULTS: u32 = 200;
 const MAX_SEARCH_RESULTS: u32 = 500;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024;
-const MAX_REQUEST_BYTES: usize = 32_000;
-const MAX_REQUEST_INPUT_TOKENS: u64 = 32_000;
+const MAX_REQUEST_BYTES: usize = 96_000;
+const MAX_REQUEST_INPUT_TOKENS: u64 = 96_000;
 const MAX_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_SUMMARY_ASSUMPTIONS: usize = 64;
 const MAX_SUMMARY_ASSUMPTION_BYTES: usize = 512;
@@ -3055,7 +3055,11 @@ mod tests {
             }),
             token_estimates: ReviewPacketTokenEstimates {
                 manifest_request_tokens: 400,
-                inline_request_tokens: Some(if inline { 600 } else { 32_001 }),
+                inline_request_tokens: Some(if inline {
+                    600
+                } else {
+                    MAX_REQUEST_INPUT_TOKENS + 1
+                }),
             },
         };
         let request = GroupWorkerRequest {

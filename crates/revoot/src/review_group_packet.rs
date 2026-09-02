@@ -20,7 +20,7 @@ use crate::diff_artifact::{
 };
 use crate::review_group_inputs::{TrustedGroupFileInput, TrustedReviewGroupInput};
 
-const MAX_REQUEST_INPUT_TOKENS: u64 = 32_000;
+const MAX_REQUEST_INPUT_TOKENS: u64 = 96_000;
 const CONSERVATIVE_PACKET_OVERHEAD_TOKENS: u64 = 16_384;
 
 /// Trusted snapshot, plan, and policy identities expected by packet assembly.

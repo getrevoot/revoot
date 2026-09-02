@@ -15,7 +15,7 @@ use crate::{
 };
 
 const MAX_INLINE_DIFF_BYTES: u64 = 16_384;
-const MAX_REQUEST_INPUT_TOKENS: u64 = 32_000;
+const MAX_REQUEST_INPUT_TOKENS: u64 = 96_000;
 const MAX_GROUP_FILES: usize = 10;
 const MAX_HUNKS_PER_FILE: usize = 4_096;
 const MAX_ANCHORS_PER_GROUP: usize = 10_000;
@@ -853,7 +853,7 @@ mod tests {
     fn token_pressure_uses_manifest_and_mandatory_overflow_is_partial() {
         let mut composer = new_composer();
         let ReviewPacketComposition::Ready(packet) = composer
-            .compose(input("small complete diff", 32_001))
+            .compose(input("small complete diff", 96_001))
             .unwrap()
         else {
             panic!("expected manifest fallback");
@@ -864,8 +864,8 @@ mod tests {
         ));
 
         let mut composer = new_composer();
-        let mut oversized = input("small complete diff", 32_001);
-        oversized.token_estimates.manifest_request_tokens = 32_001;
+        let mut oversized = input("small complete diff", 96_001);
+        oversized.token_estimates.manifest_request_tokens = 96_001;
         assert_eq!(
             composer.compose(oversized).unwrap(),
             ReviewPacketComposition::Partial(ReviewPacketPartialFailure::MandatoryContextTooLarge)

@@ -28,7 +28,7 @@ const DEFAULT_INLINE_DIFF_BYTES: u64 = 16_384;
 const MIN_PARALLEL_GROUPS: u64 = 1;
 const DEFAULT_PARALLEL_GROUPS: u64 = 4;
 const MAX_PARALLEL_GROUPS: u64 = 8;
-const TARGET_REQUEST_INPUT_TOKENS: u64 = 32_000;
+const TARGET_REQUEST_INPUT_TOKENS: u64 = 96_000;
 const MAX_REQUEST_OUTPUT_TOKENS: u64 = 4_096;
 const STRATEGY_VERSION: &str = "tool-first-v1";
 
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(strategy.aggregate_budget.max_tool_calls, 256);
         assert_eq!(strategy.aggregate_budget.max_elapsed_millis, 600_000);
         assert_eq!(strategy.max_inline_diff_bytes, 16_384);
-        assert_eq!(strategy.target_request_input_tokens, 32_000);
+        assert_eq!(strategy.target_request_input_tokens, 96_000);
         assert_eq!(strategy.max_request_output_tokens, 4_096);
         assert_eq!(strategy.strategy_version, "tool-first-v1");
     }

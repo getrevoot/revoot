@@ -18,7 +18,7 @@ const MAX_HUNK_ID_BYTES: usize = 128;
 const MAX_PAGES_PER_HUNK: u32 = 4_096;
 const MAX_CHANGED_LINES_PER_HUNK: u32 = 1_000_000;
 const MAX_INLINE_DIFF_BYTES: u64 = 16 * 1_024;
-const MAX_REQUEST_INPUT_TOKENS: u64 = 32_000;
+const MAX_REQUEST_INPUT_TOKENS: u64 = 96_000;
 const FILE_PLANNING_THRESHOLD: u32 = 50;
 const GROUP_PLANNING_THRESHOLD: u32 = 100;
 const MAX_METRICS_JSON_BYTES: usize = 1024 * 1024;
@@ -601,7 +601,7 @@ mod tests {
             manifests,
             hazards,
             GroupMetricsPolicy {
-                fixed_context_tokens: 20_000,
+                fixed_context_tokens: 90_000,
                 ..GroupMetricsPolicy::default()
             },
         )

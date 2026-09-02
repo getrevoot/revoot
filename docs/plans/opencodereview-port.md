@@ -31,7 +31,7 @@ and Anthropic Messages remain the only direct model providers.
    or failure. An in-memory index records stable hunk IDs, ranges, anchors,
    changed-line counts, and local hazard signals.
 4. Inline a group's complete diff only when it is at most 16,384 bytes and the
-   request remains below the 32,000-token input target. Larger groups start
+   request remains below the 96,000-token input target. Larger groups start
    with file and hunk metadata and obtain bodies through bounded tools.
 5. Expose `diff_manifest`, `read_diff`, `search_diff`, `read_file`,
    `find_files`, `search_code`, history and prior-review tools,
@@ -70,7 +70,7 @@ and Anthropic Messages remain the only direct model providers.
 - Combined model tokens: 300,000, range 1-2,000,000.
 - Local tool calls: 256, range 1-2,048.
 - Deadline: 600 seconds.
-- Per-request input target: 32,000 tokens.
+- Per-request input target: 96,000 tokens.
 - Per-request output maximum: 4,096 tokens.
 - Selected diff maximum: 1,000,000 bytes.
 - Published findings maximum: 25.
@@ -131,7 +131,7 @@ terminology remain Revoot-native.
   prior finding.
 - On a deterministic 1 MiB/100-file fixture, grouping and large-group initial
   prompts contain no diff bodies, tool results stay below 32 KiB, no request
-  exceeds the 32,000-token target, and medium-effort serialized model input is
+  exceeds the 96,000-token target, and medium-effort serialized model input is
   at most 40% of repeatedly inlining each complete group diff.
 - Security tests cover path traversal, symlinks, hardlinks, stale handles,
   cursor tampering, prompt injection, binary/invalid text, permissions,

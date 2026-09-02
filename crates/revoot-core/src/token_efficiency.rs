@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ReviewEffort, Sha256Digest};
 
-const DEFAULT_REQUEST_TOKEN_TARGET: u64 = 32_000;
+const DEFAULT_REQUEST_TOKEN_TARGET: u64 = 96_000;
 const MAX_TOOL_RESULT_BYTES: u32 = 32 * 1024;
 const MAX_GROUPS: usize = 128;
 const MAX_REQUESTS: usize = 256;
@@ -632,7 +632,7 @@ mod tests {
         );
         let report = measure_token_efficiency(
             ReviewEffort::Medium,
-            32_000,
+            96_000,
             groups.clone(),
             synthetic_requests(&groups),
         )
@@ -644,7 +644,7 @@ mod tests {
             report
                 .requests
                 .iter()
-                .all(|request| request.estimated_input_tokens <= 32_000)
+                .all(|request| request.estimated_input_tokens <= 96_000)
         );
         assert!(
             report
@@ -673,7 +673,7 @@ mod tests {
         requests[0].diff_body_bytes = 1;
         requests[0].diff_body_estimated_tokens = 1;
         assert_eq!(
-            measure_token_efficiency(ReviewEffort::Medium, 32_000, groups.clone(), requests),
+            measure_token_efficiency(ReviewEffort::Medium, 96_000, groups.clone(), requests),
             Err(TokenEfficiencyError::DiffInGrouping)
         );
 
@@ -685,7 +685,7 @@ mod tests {
         initial.diff_body_bytes = 1;
         initial.diff_body_estimated_tokens = 1;
         assert_eq!(
-            measure_token_efficiency(ReviewEffort::Medium, 32_000, groups, requests),
+            measure_token_efficiency(ReviewEffort::Medium, 96_000, groups, requests),
             Err(TokenEfficiencyError::DiffInLargeInitialRequest)
         );
     }
@@ -700,14 +700,14 @@ mod tests {
             .unwrap()
             .bytes = 32 * 1024 + 1;
         assert_eq!(
-            measure_token_efficiency(ReviewEffort::Medium, 32_000, groups.clone(), requests),
+            measure_token_efficiency(ReviewEffort::Medium, 96_000, groups.clone(), requests),
             Err(TokenEfficiencyError::ToolResultTooLarge)
         );
 
         let mut requests = synthetic_requests(&groups);
-        requests[1].estimated_input_tokens = 32_001;
+        requests[1].estimated_input_tokens = 96_001;
         assert_eq!(
-            measure_token_efficiency(ReviewEffort::Medium, 32_000, groups.clone(), requests),
+            measure_token_efficiency(ReviewEffort::Medium, 96_000, groups.clone(), requests),
             Err(TokenEfficiencyError::RequestTokenTarget)
         );
 
@@ -723,7 +723,7 @@ mod tests {
             bytes: 1,
         });
         assert_eq!(
-            measure_token_efficiency(ReviewEffort::Medium, 32_000, groups, requests),
+            measure_token_efficiency(ReviewEffort::Medium, 96_000, groups, requests),
             Err(TokenEfficiencyError::RepeatedHunkDelivery)
         );
     }
@@ -733,7 +733,7 @@ mod tests {
         let groups = synthetic_groups();
         let report = measure_token_efficiency(
             ReviewEffort::Medium,
-            32_000,
+            96_000,
             groups.clone(),
             synthetic_requests(&groups),
         )

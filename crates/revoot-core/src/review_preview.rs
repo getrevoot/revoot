@@ -18,7 +18,7 @@ use crate::{
 
 const MAX_PARALLEL_GROUPS: u8 = 8;
 const MAX_INLINE_DIFF_BYTES: u64 = 16 * 1024;
-const MAX_REQUEST_INPUT_TOKENS: u64 = 32_000;
+const MAX_REQUEST_INPUT_TOKENS: u64 = 96_000;
 const MAX_REQUEST_OUTPUT_TOKENS: u64 = 4_096;
 const MAX_RULES: usize = 4_096;
 const MAX_RULE_ID_BYTES: usize = 128;
