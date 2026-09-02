@@ -2163,9 +2163,11 @@ fn execute_checkpoint(
                 .map_err(|_| recoverable("transition"))?;
         }
         ReviewWorkerPhase::Reviewing { round } if usize::from(round) < plan.rounds.len() => {
-            if args.plan_summary.is_some() {
-                return Err(recoverable("plan_summary"));
-            }
+            // A review-round packet echoes the group's plan_summary from
+            // planning as read-only context, so the model may reasonably
+            // include the same field back on checkpoint_review. It carries no
+            // authority here (only Planning ever assigns runtime.plan_summary),
+            // so accept and ignore it rather than rejecting the whole call.
             state
                 .finish_round(args.checkpoint.clone())
                 .map_err(|_| recoverable("transition"))?;
@@ -3385,6 +3387,27 @@ mod tests {
         assert_eq!(second["review_round"], 2);
         assert_eq!(second["review_rounds_total"], 2);
         assert_eq!(second["required_terminal_tool"], "complete_group");
+    }
+
+    #[tokio::test]
+    async fn review_round_checkpoint_ignores_a_superfluous_plan_summary() {
+        // A review-round packet echoes the group's plan_summary from planning
+        // as read-only context, so the model may reasonably send the same
+        // field back on checkpoint_review. It must not be rejected for that.
+        let budgeted = fixture(
+            ReviewEffort::Medium,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let provider = FakeProvider::new(vec![
+            tool_response(1, "checkpoint_review", checkpoint_call(true)),
+            tool_response(2, "complete_group", complete_call()),
+        ]);
+        let output = run(budgeted, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        assert_eq!(output.provider_turns, 2);
     }
 
     #[tokio::test]
