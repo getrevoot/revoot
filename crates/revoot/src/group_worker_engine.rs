@@ -436,11 +436,27 @@ pub async fn run_group_worker(
         let delivers_initial_inline_diff = initial;
         initial = false;
 
+        // A packet whose diff field is InlineComplete carries the group's
+        // full body right there and will satisfy every coverage requirement
+        // as soon as it is dispatched; showing them as still outstanding
+        // would directly contradict that same field. The coverage gate
+        // itself is only updated after settlement (below), preserving the
+        // existing "credit only a request actually sent" boundary - this
+        // only adjusts what this one packet displays.
+        let displayed_coverage_requirements = if delivers_initial_inline_diff
+            && matches!(
+                packet.diff_context,
+                ReviewPacketDiffContext::InlineComplete { .. }
+            ) {
+            Vec::new()
+        } else {
+            coverage_requirements(&runtime)?
+        };
         let model_request = compose_model_request(
             &request.model,
             &request.system_policy,
             &packet,
-            coverage_requirements(&runtime)?,
+            displayed_coverage_requirements,
             WorkerTurnContext {
                 phase: state.phase(),
                 phase_turn: state.phase_provider_turns(),
@@ -3516,6 +3532,27 @@ mod tests {
         assert_eq!(output.candidates.candidates.len(), 1);
         assert_eq!(output.evidence.len(), 1);
         assert_eq!(output.tool_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn inline_delivery_clears_coverage_requirements_on_the_first_packet() {
+        // The first packet's diff field and its coverage_requirements must
+        // not contradict each other: a hunk delivered inline right there is
+        // already satisfied and must not also be listed as still required.
+        let fixture = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let provider = FakeProvider::new(vec![tool_response(1, "complete_group", complete_call())]);
+        let output = run(fixture, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        let requests = provider.requests.lock().expect("requests");
+        let packet = request_packet(&requests[0]);
+        assert_eq!(packet["diff"]["mode"], "inline_complete");
+        assert_eq!(packet["coverage_requirements"], json!([]));
     }
 
     #[tokio::test]
