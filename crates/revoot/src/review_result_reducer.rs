@@ -164,7 +164,7 @@ pub fn reduce_review_result(
         &fixed_authorizations,
         !partial,
     )?;
-    let overview = project_overview(adjudication, partial, &findings)?;
+    let overview = project_overview(adjudication, partial, &findings, &coverage)?;
     let summary = overview.summary.clone();
     let outcome = if partial {
         revoot_core::ReviewOutcome::Partial {
@@ -677,6 +677,7 @@ fn project_overview(
     adjudication: &AdjudicationOutcome,
     partial: bool,
     findings: &[FindingsEnvelope],
+    coverage: &ReviewCoverage,
 ) -> Result<ReviewOverview, ReviewResultReducerError> {
     let summary = bounded_line(&adjudication.overview.summary, MAX_OVERVIEW_SUMMARY_BYTES)
         .ok_or(ReviewResultReducerError::Overview)?;
@@ -705,9 +706,29 @@ fn project_overview(
     let mut assumptions = Vec::new();
     let mut seen = BTreeSet::new();
     if partial {
-        let gap = "Some selected review work was incomplete; no prior lineage was auto-resolved without complete exact evidence.".to_owned();
-        seen.insert(gap.to_ascii_lowercase());
-        assumptions.push(gap);
+        let total_selected = coverage
+            .fully_read_files
+            .checked_add(coverage.sampled_files)
+            .and_then(|value| value.checked_add(coverage.manifest_only_files))
+            .ok_or(ReviewResultReducerError::Overview)?;
+        let coverage_gap = format!(
+            "Read {} of {total_selected} selected files in full ({} sampled, {} manifest-only); delivered {} of {} required high-risk hunks; {} review group(s) failed; {} hunks explicitly deferred.",
+            coverage.fully_read_files,
+            coverage.sampled_files,
+            coverage.manifest_only_files,
+            coverage.delivered_high_risk_hunks,
+            coverage.required_high_risk_hunks,
+            coverage.failed_groups,
+            coverage.explicit_deferrals,
+        );
+        let coverage_gap = bounded_line(&coverage_gap, MAX_OVERVIEW_ITEM_BYTES)
+            .ok_or(ReviewResultReducerError::Overview)?;
+        seen.insert(coverage_gap.to_ascii_lowercase());
+        assumptions.push(coverage_gap);
+        let lineage_gap =
+            "No prior lineage was auto-resolved without complete exact evidence.".to_owned();
+        seen.insert(lineage_gap.to_ascii_lowercase());
+        assumptions.push(lineage_gap);
     }
     for assumption in &adjudication.overview.assumptions {
         if assumptions.len() == MAX_OVERVIEW_ITEMS {
