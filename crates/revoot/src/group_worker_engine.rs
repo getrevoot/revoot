@@ -1440,7 +1440,7 @@ fn tool_description(name: &str) -> &'static str {
             "List assigned files, hunk IDs, page counts, risks, rules, and trusted coverage state without diff bodies."
         }
         "read_diff" => {
-            "Read up to 32 exact assigned hunk pages in one call, but the combined result is capped at 32 KiB. If the requested pages do not all fit, the ones that do are still delivered and the rest are listed under undelivered for a later call; only an empty result means none fit at all. Returned pages include citeable evidence_id values and exact anchor IDs."
+            "Read up to 32 exact assigned hunk pages in one call, but the combined result is capped at 32 KiB. If the requested pages do not all fit, the ones that do are still delivered and the rest are listed under undelivered for a later call; only an empty result means none fit at all. A page already delivered - inline in the initial packet's diff field, or by an earlier call - returns error already_delivered instead of the body; use the evidence_id already provided for it. Returned pages include citeable evidence_id values and exact anchor IDs."
         }
         "search_diff" => {
             "Search assigned diff artifacts with bounded, cursor-paginated results and citeable evidence IDs."
@@ -1805,9 +1805,27 @@ fn execute_read_diff(
         .as_mut()
         .ok_or_else(|| recoverable("coverage"))?
         .record_hunk_pages(&deliveries)
-        .map_err(|_| recoverable("coverage"))?;
+        .map_err(|error| {
+            if matches!(error, revoot_core::CoverageGateError::PageAlreadyDelivered) {
+                ToolExecutionError::Recoverable(already_delivered_error())
+            } else {
+                recoverable("coverage")
+            }
+        })?;
     runtime.delivered_anchor_ids.extend(delivered_anchor_ids);
     Ok(commit_evidence(prepared_evidence, runtime))
+}
+
+/// A page requested by `read_diff` was already delivered earlier in this
+/// group - either inline in the initial packet's diff field or by a prior
+/// `read_diff` call - and does not need to be, and cannot be, read again.
+fn already_delivered_error() -> String {
+    json!({
+        "error": "already_delivered",
+        "message": "this exact page was already delivered earlier in this group; check the initial packet's diff field (diff.mode inline_complete) or a prior read_diff result and cite its existing evidence_id instead of reading it again",
+        "retryable": false,
+    })
+    .to_string()
 }
 
 fn read_diff_batch_fits(pages: &[Value]) -> bool {
@@ -3902,7 +3920,7 @@ mod tests {
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(output.evidence.len(), 1);
         assert_eq!(delivered_page_count(&output), 1);
-        assert!(provider_request_contains(&provider, 2, "coverage"));
+        assert!(provider_request_contains(&provider, 2, "already_delivered"));
     }
 
     #[tokio::test]
