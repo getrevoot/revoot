@@ -433,23 +433,40 @@ fn required_verifier_evidence(worker: &GroupWorkerOutput) -> Vec<VerifierEvidenc
 fn verification_status(outcome: ReviewVerifierOutcome) -> (GroupVerificationStatus, bool) {
     match outcome {
         ReviewVerifierOutcome::NoCandidates => (GroupVerificationStatus::NoCandidates, false),
-        ReviewVerifierOutcome::Verified(outcome) => (
-            GroupVerificationStatus::Verified {
-                accepted: outcome.accepted,
-                suppressed: outcome.suppressed,
-            },
-            false,
-        ),
+        ReviewVerifierOutcome::Verified(outcome) => {
+            eprintln!(
+                "revoot_diag verification accepted={} suppressed={:?}",
+                outcome.accepted.len(),
+                outcome
+                    .suppressed
+                    .iter()
+                    .map(|candidate| candidate.reason)
+                    .collect::<Vec<_>>()
+            );
+            (
+                GroupVerificationStatus::Verified {
+                    accepted: outcome.accepted,
+                    suppressed: outcome.suppressed,
+                },
+                false,
+            )
+        }
         ReviewVerifierOutcome::Partial(PartialVerifierSuppression {
             reason,
             suppressed_candidate_ids,
-        }) => (
-            GroupVerificationStatus::UnverifiedPartial {
-                reason,
-                candidate_ids: suppressed_candidate_ids,
-            },
-            true,
-        ),
+        }) => {
+            eprintln!(
+                "revoot_diag verification_partial reason={reason:?} suppressed_count={}",
+                suppressed_candidate_ids.len()
+            );
+            (
+                GroupVerificationStatus::UnverifiedPartial {
+                    reason,
+                    candidate_ids: suppressed_candidate_ids,
+                },
+                true,
+            )
+        }
     }
 }
 
