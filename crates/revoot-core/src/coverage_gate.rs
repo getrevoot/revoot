@@ -329,6 +329,13 @@ fn validate_disposition(
     {
         return Err(CoverageGateError::InvalidDisposition);
     }
+    // A high-risk file or a hazardous hunk requires its body to actually be
+    // read; neither shortcut disposition may close it without that read.
+    if disposition.kind == UnreadHunkDispositionKind::RedundantPattern
+        && (file.tier == crate::ReviewValueTier::High || hazardous)
+    {
+        return Err(CoverageGateError::InvalidDisposition);
+    }
     Ok(())
 }
 
