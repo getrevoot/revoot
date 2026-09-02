@@ -39,6 +39,7 @@ use revoot_core::review_packet::{ReviewPacketAnchorBrief, ReviewPacketCompleteDi
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 32;
 const MAX_PLANNING_TURNS: u32 = 2;
+const MAX_REVIEW_TURNS_PER_ROUND: u32 = 4;
 const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 const WORKER_PAGE_BYTES: u32 = 8 * 1024;
 const DEFAULT_SEARCH_RESULTS: u32 = 200;
@@ -386,6 +387,17 @@ pub async fn run_group_worker(
                 .map_err(|_| GroupWorkerError::Packet)?;
             continue;
         }
+        if let ReviewWorkerPhase::Reviewing { round } = state.phase()
+            && state.phase_provider_turns() >= MAX_REVIEW_TURNS_PER_ROUND
+        {
+            if usize::from(round) < request.plan.rounds.len() {
+                state
+                    .finish_round(runtime.checkpoint.clone())
+                    .map_err(|_| GroupWorkerError::Packet)?;
+                continue;
+            }
+            return partial_output(&mut state, &runtime, GroupWorkerPartialReason::TurnBudget);
+        }
         if let Err(error) = state.reserve_provider_turn() {
             let reason = if error == ReviewWorkerError::TurnBudget {
                 GroupWorkerPartialReason::TurnBudget
@@ -423,6 +435,8 @@ pub async fn run_group_worker(
             &request.system_policy,
             &packet,
             state.phase(),
+            state.phase_provider_turns(),
+            &request.plan,
             request.limits.max_output_tokens,
         )
         .map_err(|()| GroupWorkerError::Packet)?;
@@ -875,9 +889,11 @@ fn compose_model_request(
     system_policy: &str,
     packet: &ReviewPacket,
     phase: ReviewWorkerPhase,
+    phase_turn: u32,
+    plan: &ReviewWorkerPlan,
     max_output_tokens: u32,
 ) -> Result<ModelRequest, ()> {
-    let message = render_packet(packet, phase)?;
+    let message = render_packet(packet, phase, phase_turn, plan)?;
     let request = ModelRequest {
         model: model.to_owned(),
         system: Some(system_policy.to_owned()),
@@ -898,6 +914,8 @@ struct PacketWire<'a> {
     purpose: &'static str,
     worker_phase: &'static str,
     phase_instructions: &'static str,
+    #[serde(flatten)]
+    lifecycle: WorkerLifecycleWire,
     group_id: &'a str,
     snapshot_sha256: &'a Sha256Digest,
     partition_sha256: &'a Sha256Digest,
@@ -912,6 +930,15 @@ struct PacketWire<'a> {
     files: Vec<FileBriefWire<'a>>,
     diff: DiffContextWire<'a>,
     recent_exchange: Option<ExchangeWire<'a>>,
+}
+
+#[derive(Serialize)]
+struct WorkerLifecycleWire {
+    phase_turn: u32,
+    phase_turn_limit: u32,
+    review_round: Option<u8>,
+    review_rounds_total: u8,
+    required_terminal_tool: &'static str,
 }
 
 #[derive(Serialize)]
@@ -986,7 +1013,12 @@ struct ToolResultWire<'a> {
     truncated: bool,
 }
 
-fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<String, ()> {
+fn render_packet(
+    packet: &ReviewPacket,
+    phase: ReviewWorkerPhase,
+    phase_turn: u32,
+    plan: &ReviewWorkerPlan,
+) -> Result<String, ()> {
     let purpose = packet_purpose_name(packet.purpose);
     let worker_phase = worker_phase_name(phase);
     let plan_summary = packet.plan_summary.as_ref().map(|plan| PlanSummaryWire {
@@ -1069,7 +1101,8 @@ fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<Stri
     serde_json::to_string(&PacketWire {
         purpose,
         worker_phase,
-        phase_instructions: phase_instructions(phase),
+        phase_instructions: phase_instructions(phase, plan.rounds.len()),
+        lifecycle: worker_lifecycle(phase, phase_turn, plan.rounds.len())?,
         group_id: &packet.group_brief.group_id,
         snapshot_sha256: &packet.group_brief.snapshot_sha256,
         partition_sha256: &packet.group_brief.partition_sha256,
@@ -1088,17 +1121,60 @@ fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<Stri
     .map_err(|_| ())
 }
 
-const fn phase_instructions(phase: ReviewWorkerPhase) -> &'static str {
+fn worker_lifecycle(
+    phase: ReviewWorkerPhase,
+    phase_turn: u32,
+    total_rounds: usize,
+) -> Result<WorkerLifecycleWire, ()> {
+    Ok(WorkerLifecycleWire {
+        phase_turn,
+        phase_turn_limit: phase_turn_limit(phase),
+        review_round: match phase {
+            ReviewWorkerPhase::Reviewing { round } => Some(round),
+            _ => None,
+        },
+        review_rounds_total: u8::try_from(total_rounds).map_err(|_| ())?,
+        required_terminal_tool: required_terminal_tool(phase, total_rounds),
+    })
+}
+
+fn phase_instructions(phase: ReviewWorkerPhase, total_rounds: usize) -> &'static str {
     match phase {
         ReviewWorkerPhase::Planning => {
-            "Planning has at most two turns. Read only essential evidence, then call checkpoint_review with a bounded plan_summary."
+            "Planning has at most two turns. Batch essential evidence reads, then call checkpoint_review with a bounded plan_summary no later than the final turn."
+        }
+        ReviewWorkerPhase::Reviewing { round } if usize::from(round) < total_rounds => {
+            "This review round has at most four turns. Batch all required evidence reads, submit evidenced findings, then call checkpoint_review no later than the final turn."
         }
         ReviewWorkerPhase::Reviewing { .. } => {
-            "Inspect assigned risk-adaptive coverage, submit only evidenced findings, checkpoint between rounds, and call complete_group in the final round."
+            "This is the final review round and it has at most four turns. Batch all remaining evidence reads, submit evidenced findings, then call complete_group no later than the final turn."
         }
         ReviewWorkerPhase::Verifying => "Complete the required deterministic coverage transition.",
         ReviewWorkerPhase::Complete | ReviewWorkerPhase::Partial => {
             "No further provider action is allowed."
+        }
+    }
+}
+
+const fn phase_turn_limit(phase: ReviewWorkerPhase) -> u32 {
+    match phase {
+        ReviewWorkerPhase::Planning => MAX_PLANNING_TURNS,
+        ReviewWorkerPhase::Reviewing { .. } => MAX_REVIEW_TURNS_PER_ROUND,
+        ReviewWorkerPhase::Verifying | ReviewWorkerPhase::Complete | ReviewWorkerPhase::Partial => {
+            0
+        }
+    }
+}
+
+fn required_terminal_tool(phase: ReviewWorkerPhase, total_rounds: usize) -> &'static str {
+    match phase {
+        ReviewWorkerPhase::Planning => "checkpoint_review",
+        ReviewWorkerPhase::Reviewing { round } if usize::from(round) < total_rounds => {
+            "checkpoint_review"
+        }
+        ReviewWorkerPhase::Reviewing { .. } => "complete_group",
+        ReviewWorkerPhase::Verifying | ReviewWorkerPhase::Complete | ReviewWorkerPhase::Partial => {
+            "none"
         }
     }
 }
@@ -2960,6 +3036,49 @@ mod tests {
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(output.provider_turns, 2);
         assert_eq!(provider.calls(), 2);
+
+        let requests = provider.requests.lock().expect("requests");
+        let first = request_packet(&requests[0]);
+        let second = request_packet(&requests[1]);
+        assert_eq!(first["review_round"], 1);
+        assert_eq!(first["review_rounds_total"], 2);
+        assert_eq!(first["phase_turn"], 1);
+        assert_eq!(first["phase_turn_limit"], MAX_REVIEW_TURNS_PER_ROUND);
+        assert_eq!(first["required_terminal_tool"], "checkpoint_review");
+        assert_eq!(second["review_round"], 2);
+        assert_eq!(second["review_rounds_total"], 2);
+        assert_eq!(second["required_terminal_tool"], "complete_group");
+    }
+
+    #[tokio::test]
+    async fn review_round_cannot_monopolize_the_group_turn_budget() {
+        let budgeted = fixture(
+            ReviewEffort::Low,
+            10,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let responses = (1..=MAX_REVIEW_TURNS_PER_ROUND + 1)
+            .map(|id| {
+                tool_response(
+                    usize::try_from(id).expect("tool ID"),
+                    "read_file",
+                    json!({"reads":[{"path":"src/helper.rs","start_line":1,"end_line":1}]}),
+                )
+            })
+            .collect();
+        let provider = FakeProvider::new(responses);
+        let output = run(budgeted, &provider).await;
+        assert_eq!(
+            output.status,
+            GroupWorkerStatus::Partial(GroupWorkerPartialReason::TurnBudget)
+        );
+        assert_eq!(output.provider_turns, MAX_REVIEW_TURNS_PER_ROUND);
+        assert_eq!(
+            provider.calls(),
+            usize::try_from(MAX_REVIEW_TURNS_PER_ROUND).expect("turn limit")
+        );
     }
 
     #[test]
@@ -3951,5 +4070,13 @@ mod tests {
             .get(index)
             .and_then(|request| serde_json::to_string(request).ok())
             .is_some_and(|request| request.contains(needle))
+    }
+
+    fn request_packet(request: &ModelRequest) -> Value {
+        let message = request.messages.first().expect("request message");
+        let [ModelContent::Text { text }] = message.content.as_slice() else {
+            panic!("single text packet");
+        };
+        serde_json::from_str(text).expect("packet JSON")
     }
 }
