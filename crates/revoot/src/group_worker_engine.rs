@@ -425,7 +425,11 @@ pub async fn run_group_worker(
             .map_err(|_error| GroupWorkerError::Packet)?
         {
             ReviewPacketComposition::Ready(packet) => packet,
-            ReviewPacketComposition::Partial(_) => {
+            ReviewPacketComposition::Partial(reason) => {
+                eprintln!(
+                    "revoot_diag group={} context_overflow stage=compose reason={reason:?}",
+                    request.plan.group_id
+                );
                 return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Context);
             }
         };
@@ -448,12 +452,22 @@ pub async fn run_group_worker(
         let encoded_request =
             serde_json::to_vec(&model_request).map_err(|_| GroupWorkerError::Packet)?;
         if encoded_request.len() > request.limits.max_request_bytes {
+            eprintln!(
+                "revoot_diag group={} context_overflow stage=encoded_bytes encoded={} limit={}",
+                request.plan.group_id,
+                encoded_request.len(),
+                request.limits.max_request_bytes
+            );
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Context);
         }
         let estimated_input_tokens = packet
             .estimated_input_tokens
             .max(estimate_wire_tokens(encoded_request.len()));
         if estimated_input_tokens > request.limits.max_input_tokens {
+            eprintln!(
+                "revoot_diag group={} context_overflow stage=estimated_tokens estimated={} limit={}",
+                request.plan.group_id, estimated_input_tokens, request.limits.max_input_tokens
+            );
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Context);
         }
         let reservation = ReviewModelReservation {
@@ -466,17 +480,25 @@ pub async fn run_group_worker(
         } else {
             revoot_core::ReviewBudgetPhase::Review
         };
-        let Ok(permit) = aggregate_budget.reserve_model_request_for_phase(
+        let permit = match aggregate_budget.reserve_model_request_for_phase(
             budget_phase,
             reservation,
             clock.now_millis(),
-        ) else {
-            return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Budget);
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                eprintln!(
+                    "revoot_diag group={} budget_exhausted stage=reserve error={error:?}",
+                    request.plan.group_id
+                );
+                return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Budget);
+            }
         };
         runtime.provider_usage.turns = runtime.provider_usage.turns.saturating_add(1);
         runtime.provider_usage.model_requests =
             runtime.provider_usage.model_requests.saturating_add(1);
-        let Ok(response) = adapter.complete(&model_request, cancellation).await else {
+        let complete_result = adapter.complete(&model_request, cancellation).await;
+        let Ok(response) = complete_result else {
             drop(permit);
             record_provider_usage(&mut runtime, reservation);
             record_phase_call(
@@ -489,6 +511,11 @@ pub async fn run_group_worker(
             } else {
                 GroupWorkerPartialReason::Provider
             };
+            eprintln!(
+                "revoot_diag group={} provider_error={:?}",
+                request.plan.group_id,
+                complete_result.unwrap_err()
+            );
             return partial_output(&mut state, &runtime, reason);
         };
         let reported = (response.usage.input_tokens != 0 || response.usage.output_tokens != 0)
@@ -499,6 +526,11 @@ pub async fn run_group_worker(
             });
         let settlement = permit.commit(reported, clock.now_millis());
         let Ok(settlement) = settlement else {
+            eprintln!(
+                "revoot_diag group={} budget_exhausted stage=settle error={:?}",
+                request.plan.group_id,
+                settlement.unwrap_err()
+            );
             record_provider_usage(&mut runtime, reservation);
             record_phase_call(
                 &mut runtime,
@@ -515,6 +547,10 @@ pub async fn run_group_worker(
         );
         if delivers_initial_inline_diff && register_inline_delivery(&mut runtime, &packet).is_err()
         {
+            eprintln!(
+                "revoot_diag group={} context_overflow stage=register_inline_delivery",
+                request.plan.group_id
+            );
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Context);
         }
         let offered_tools = model_request
@@ -524,6 +560,10 @@ pub async fn run_group_worker(
             .collect::<BTreeSet<_>>();
         let Ok(tool_calls) = validate_provider_response(&response, &request.model, &offered_tools)
         else {
+            eprintln!(
+                "revoot_diag group={} provider_contract_violation=invalid_response",
+                request.plan.group_id
+            );
             return partial_output(
                 &mut state,
                 &runtime,
@@ -531,6 +571,10 @@ pub async fn run_group_worker(
             );
         };
         if tool_calls.is_empty() {
+            eprintln!(
+                "revoot_diag group={} provider_contract_violation=no_tool_calls",
+                request.plan.group_id
+            );
             return partial_output(
                 &mut state,
                 &runtime,
@@ -538,6 +582,10 @@ pub async fn run_group_worker(
             );
         }
         if terminal_tool_is_not_last(&tool_calls) {
+            eprintln!(
+                "revoot_diag group={} provider_contract_violation=terminal_tool_not_last",
+                request.plan.group_id
+            );
             return partial_output(
                 &mut state,
                 &runtime,
@@ -554,6 +602,10 @@ pub async fn run_group_worker(
                 return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Cancelled);
             }
             if !seen_tool_call_ids.insert(id.clone()) {
+                eprintln!(
+                    "revoot_diag group={} provider_contract_violation=repeated_tool_call_id",
+                    request.plan.group_id
+                );
                 return partial_output(
                     &mut state,
                     &runtime,
@@ -585,9 +637,12 @@ pub async fn run_group_worker(
                     }
                 }
             };
-            if name == "submit_candidate_finding" {
-                log_candidate_submission_outcome(&body);
-            }
+            log_tool_call_outcome(
+                &request.plan.group_id,
+                state.phase_provider_turns(),
+                &name,
+                &body,
+            );
             exchange_calls.push(ReviewPacketToolCall {
                 call_id: id.clone(),
                 tool_name: name.clone(),
@@ -2462,8 +2517,9 @@ fn tool_error(code: &str) -> String {
 }
 
 /// Temporary payload-free diagnostic for the dogfood zero-findings gap: emits
-/// only the bounded error code (or "accepted"), never candidate content.
-fn log_candidate_submission_outcome(body: &str) {
+/// only the tool name and its bounded error code (or "accepted"/"ok"), never
+/// call arguments or result content.
+fn log_tool_call_outcome(group_id: &str, phase_turn: u32, name: &str, body: &str) {
     let outcome = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|value| {
@@ -2472,8 +2528,8 @@ fn log_candidate_submission_outcome(body: &str) {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-        .unwrap_or_else(|| "accepted".to_owned());
-    eprintln!("revoot_diag tool=submit_candidate_finding outcome={outcome}");
+        .unwrap_or_else(|| "ok".to_owned());
+    eprintln!("revoot_diag group={group_id} turn={phase_turn} tool={name} outcome={outcome}");
 }
 
 fn prepare_candidates(

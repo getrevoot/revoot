@@ -209,10 +209,14 @@ where
             let config = worker_config.clone();
             async move {
                 let Some(input) = take_group_input(&inputs, &scheduled.group.id) else {
+                    eprintln!(
+                        "revoot_diag group={} preparation_failed=missing_input",
+                        scheduled.group.id.as_str()
+                    );
                     return GroupWorkerResult::Failed(GroupFailureReason::PreparationFailed);
                 };
                 let worker_request = worker_request(input, history, &config);
-                let Ok(worker) = run_group_worker(
+                let worker_result = run_group_worker(
                     provider.as_ref(),
                     worker_request,
                     toolbox.as_ref(),
@@ -221,8 +225,13 @@ where
                     &task_cancellation,
                     clock.as_ref(),
                 )
-                .await
-                else {
+                .await;
+                let Ok(worker) = worker_result else {
+                    eprintln!(
+                        "revoot_diag group={} preparation_failed=worker_error error={:?}",
+                        scheduled.group.id.as_str(),
+                        worker_result.unwrap_err()
+                    );
                     return GroupWorkerResult::Failed(GroupFailureReason::PreparationFailed);
                 };
                 finish_worker(
