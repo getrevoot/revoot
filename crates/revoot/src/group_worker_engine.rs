@@ -585,6 +585,9 @@ pub async fn run_group_worker(
                     }
                 }
             };
+            if name == "submit_candidate_finding" {
+                log_candidate_submission_outcome(&body);
+            }
             exchange_calls.push(ReviewPacketToolCall {
                 call_id: id.clone(),
                 tool_name: name.clone(),
@@ -2456,6 +2459,21 @@ fn recoverable(code: &str) -> ToolExecutionError {
 
 fn tool_error(code: &str) -> String {
     json!({"error":code,"retryable":true}).to_string()
+}
+
+/// Temporary payload-free diagnostic for the dogfood zero-findings gap: emits
+/// only the bounded error code (or "accepted"), never candidate content.
+fn log_candidate_submission_outcome(body: &str) {
+    let outcome = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "accepted".to_owned());
+    eprintln!("revoot_diag tool=submit_candidate_finding outcome={outcome}");
 }
 
 fn prepare_candidates(
