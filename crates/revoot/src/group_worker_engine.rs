@@ -38,6 +38,7 @@ use crate::diff_artifact::MAX_INLINE_GROUP_DIFF_BYTES;
 use revoot_core::review_packet::{ReviewPacketAnchorBrief, ReviewPacketCompleteDiff};
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 32;
+const MAX_PLANNING_TURNS: u32 = 2;
 const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 const WORKER_PAGE_BYTES: u32 = 8 * 1024;
 const DEFAULT_SEARCH_RESULTS: u32 = 200;
@@ -373,6 +374,17 @@ pub async fn run_group_worker(
     loop {
         if cancellation.is_cancelled() {
             return partial_output(&mut state, &runtime, GroupWorkerPartialReason::Cancelled);
+        }
+        if state.phase() == ReviewWorkerPhase::Planning
+            && state.phase_provider_turns() >= MAX_PLANNING_TURNS
+        {
+            runtime
+                .plan_summary
+                .get_or_insert_with(ReviewPacketPlanSummary::default);
+            state
+                .finish_planning(runtime.checkpoint.clone())
+                .map_err(|_| GroupWorkerError::Packet)?;
+            continue;
         }
         if let Err(error) = state.reserve_provider_turn() {
             let reason = if error == ReviewWorkerError::TurnBudget {
@@ -885,6 +897,7 @@ fn compose_model_request(
 struct PacketWire<'a> {
     purpose: &'static str,
     worker_phase: &'static str,
+    phase_instructions: &'static str,
     group_id: &'a str,
     snapshot_sha256: &'a Sha256Digest,
     partition_sha256: &'a Sha256Digest,
@@ -1056,6 +1069,7 @@ fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<Stri
     serde_json::to_string(&PacketWire {
         purpose,
         worker_phase,
+        phase_instructions: phase_instructions(phase),
         group_id: &packet.group_brief.group_id,
         snapshot_sha256: &packet.group_brief.snapshot_sha256,
         partition_sha256: &packet.group_brief.partition_sha256,
@@ -1072,6 +1086,21 @@ fn render_packet(packet: &ReviewPacket, phase: ReviewWorkerPhase) -> Result<Stri
         recent_exchange,
     })
     .map_err(|_| ())
+}
+
+const fn phase_instructions(phase: ReviewWorkerPhase) -> &'static str {
+    match phase {
+        ReviewWorkerPhase::Planning => {
+            "Planning has at most two turns. Read only essential evidence, then call checkpoint_review with a bounded plan_summary."
+        }
+        ReviewWorkerPhase::Reviewing { .. } => {
+            "Inspect assigned risk-adaptive coverage, submit only evidenced findings, checkpoint between rounds, and call complete_group in the final round."
+        }
+        ReviewWorkerPhase::Verifying => "Complete the required deterministic coverage transition.",
+        ReviewWorkerPhase::Complete | ReviewWorkerPhase::Partial => {
+            "No further provider action is allowed."
+        }
+    }
 }
 
 const fn packet_purpose_name(purpose: ReviewPacketPurpose) -> &'static str {
@@ -3290,6 +3319,35 @@ mod tests {
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(output.provider_turns, 4);
         assert_eq!(provider.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn planning_cannot_consume_the_review_turn_budget() {
+        let budgeted = fixture(
+            ReviewEffort::Low,
+            50,
+            ReviewValueTier::High,
+            true,
+            generous_budget(),
+        );
+        let provider = FakeProvider::new(vec![
+            tool_response(
+                1,
+                "read_file",
+                json!({"reads":[{"path":"src/helper.rs","start_line":1,"end_line":1}]}),
+            ),
+            tool_response(
+                2,
+                "read_file",
+                json!({"reads":[{"path":"src/helper.rs","start_line":1,"end_line":1}]}),
+            ),
+            tool_response(3, "complete_group", complete_call()),
+        ]);
+        let output = run(budgeted, &provider).await;
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
+        assert_eq!(output.phase_usage.planning.model_requests, 2);
+        assert_eq!(output.phase_usage.review.model_requests, 1);
+        assert_eq!(provider.calls(), 3);
     }
 
     #[tokio::test]

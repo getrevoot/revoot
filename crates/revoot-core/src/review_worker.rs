@@ -150,6 +150,7 @@ pub struct ReviewWorkerState {
     plan: ReviewWorkerPlan,
     phase: ReviewWorkerPhase,
     provider_turns: u32,
+    phase_provider_turns: u32,
     checkpoint: ReviewWorkerCheckpoint,
 }
 
@@ -166,6 +167,7 @@ impl ReviewWorkerState {
             plan,
             phase,
             provider_turns: 0,
+            phase_provider_turns: 0,
             checkpoint: ReviewWorkerCheckpoint::default(),
         }
     }
@@ -178,6 +180,11 @@ impl ReviewWorkerState {
     #[must_use]
     pub const fn provider_turns(&self) -> u32 {
         self.provider_turns
+    }
+
+    #[must_use]
+    pub const fn phase_provider_turns(&self) -> u32 {
+        self.phase_provider_turns
     }
 
     #[must_use]
@@ -202,6 +209,7 @@ impl ReviewWorkerState {
             return Err(ReviewWorkerError::TurnBudget);
         }
         self.provider_turns += 1;
+        self.phase_provider_turns += 1;
         Ok(())
     }
 
@@ -220,6 +228,7 @@ impl ReviewWorkerState {
         checkpoint.validate()?;
         self.checkpoint = checkpoint;
         self.phase = ReviewWorkerPhase::Reviewing { round: 1 };
+        self.phase_provider_turns = 0;
         Ok(())
     }
 
@@ -242,6 +251,7 @@ impl ReviewWorkerState {
         } else {
             self.phase = ReviewWorkerPhase::Verifying;
         }
+        self.phase_provider_turns = 0;
         Ok(())
     }
 
@@ -329,14 +339,19 @@ mod tests {
         assert_eq!(plan.max_provider_turns, 32);
         let mut state = ReviewWorkerState::new(plan);
         assert_eq!(state.phase(), ReviewWorkerPhase::Planning);
+        state.reserve_provider_turn().unwrap();
+        assert_eq!(state.phase_provider_turns(), 1);
         state
             .finish_planning(ReviewWorkerCheckpoint::default())
             .unwrap();
+        assert_eq!(state.phase_provider_turns(), 0);
         for round in 1..=3 {
             assert_eq!(state.phase(), ReviewWorkerPhase::Reviewing { round });
+            state.reserve_provider_turn().unwrap();
             state
                 .finish_round(ReviewWorkerCheckpoint::default())
                 .unwrap();
+            assert_eq!(state.phase_provider_turns(), 0);
         }
         assert_eq!(state.phase(), ReviewWorkerPhase::Verifying);
         state.finish_verification().unwrap();
