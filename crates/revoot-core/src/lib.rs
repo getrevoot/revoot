@@ -38,6 +38,7 @@ pub mod review_worker;
 pub mod sarif;
 pub mod scan;
 pub mod snapshot;
+pub mod synthetic_dogfood_check;
 pub mod token_efficiency;
 pub mod tool_cursor;
 
