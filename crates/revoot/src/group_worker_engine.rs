@@ -16,15 +16,15 @@ use revoot_core::review_packet::{
 use revoot_core::{
     AgentBudget, AgentBudgetLimits, AgentBudgetUsage, AnchorId, AnchorTable, CancellationToken,
     CandidateForVerification, ChangedPath, CodeSearchRequest, CompleteGroupRejection,
-    CoverageCompletionGate, CursorTool, GroupCompletion, GroupCoverageLedger, GroupPartialCause,
-    LineRange, ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRole, ModelTool,
-    PreparedVerificationBatch, PriorReviewContext, ProviderAdapter, RepositoryPath,
-    RepositoryRelativePath, RepositoryToolbox, ReviewBudgetBroker, ReviewBudgetUsage,
-    ReviewCallUsage, ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
-    ReviewWorkerCheckpoint, ReviewWorkerError, ReviewWorkerPhase, ReviewWorkerPlan,
-    ReviewWorkerState, Sha256Digest, ToolCursorBinding, ToolCursorStore, ToolPageRequest,
-    ToolResultLimits, UnreadHunkDisposition, UnreadHunkDispositionKind, WorkUnitId,
-    prepare_verification_batch,
+    CoverageCompletionGate, CoverageRequirementKind, CursorTool, GroupCompletion,
+    GroupCoverageLedger, GroupPartialCause, LineRange, ModelContent, ModelFinishReason,
+    ModelMessage, ModelRequest, ModelRole, ModelTool, PreparedVerificationBatch,
+    PriorReviewContext, ProviderAdapter, RepositoryPath, RepositoryRelativePath, RepositoryToolbox,
+    ReviewBudgetBroker, ReviewBudgetUsage, ReviewCallUsage, ReviewModelReservation,
+    ReviewModelSettlement, ReviewModelUsage, ReviewValueTier, ReviewWorkerCheckpoint,
+    ReviewWorkerError, ReviewWorkerPhase, ReviewWorkerPlan, ReviewWorkerState, Sha256Digest,
+    ToolCursorBinding, ToolCursorStore, ToolPageRequest, ToolResultLimits, UnreadHunkDisposition,
+    UnreadHunkDispositionKind, WorkUnitId, prepare_verification_batch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -369,6 +369,7 @@ pub async fn run_group_worker(
         request.initial_packet.group_brief.group_plan_sha256.clone(),
     );
     let mut base_packet = request.initial_packet;
+    base_packet.unresolved_coverage_ids = actionable_coverage_ids(&runtime)?;
     let mut initial = true;
     let mut recent_exchange = None;
     let mut seen_tool_call_ids = BTreeSet::new();
@@ -871,24 +872,66 @@ fn rebase_packet(
             })
         })
         .collect::<Result<Vec<_>, GroupWorkerError>>()?;
-    let mut unresolved_coverage_ids: Vec<String> = runtime
-        .coverage_gate
-        .as_ref()
-        .map(|gate| gate.ledger().missing_requirements())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|requirement| {
-            let encoded = serde_json::to_vec(&requirement).unwrap_or_default();
-            format!("coverage:{}", Sha256Digest::of_bytes(&encoded).as_str())
-        })
-        .collect();
-    unresolved_coverage_ids.sort();
-    unresolved_coverage_ids.dedup();
-    input.unresolved_coverage_ids = unresolved_coverage_ids;
+    input.unresolved_coverage_ids = actionable_coverage_ids(runtime)?;
     input.recent_exchange = recent_exchange;
     input.complete_diff = None;
     input.token_estimates.inline_request_tokens = None;
     Ok(input)
+}
+
+fn actionable_coverage_ids(runtime: &WorkerRuntime<'_>) -> Result<Vec<String>, GroupWorkerError> {
+    let ledger = runtime
+        .coverage_gate
+        .as_ref()
+        .ok_or(GroupWorkerError::CoverageBinding)?
+        .ledger();
+    let mut ids = Vec::new();
+    for requirement in ledger.missing_requirements() {
+        let file = ledger
+            .files
+            .get(&requirement.path)
+            .ok_or(GroupWorkerError::CoverageBinding)?;
+        let id = match requirement.kind {
+            CoverageRequirementKind::Manifest => {
+                format!(
+                    "manifest:{}",
+                    Sha256Digest::of_bytes(requirement.path.as_str().as_bytes()).as_str()
+                )
+            }
+            CoverageRequirementKind::Sample => {
+                let hunk = file
+                    .hunks
+                    .first()
+                    .ok_or(GroupWorkerError::CoverageBinding)?;
+                format!("sample_one_hunk:{}", hunk.hunk_id)
+            }
+            CoverageRequirementKind::HunkBody => format!(
+                "read_all_pages:{}",
+                requirement
+                    .hunk_id
+                    .as_deref()
+                    .ok_or(GroupWorkerError::CoverageBinding)?
+            ),
+            CoverageRequirementKind::Disposition if file.tier == ReviewValueTier::Low => format!(
+                "manifest_low_risk:{}",
+                requirement
+                    .hunk_id
+                    .as_deref()
+                    .ok_or(GroupWorkerError::CoverageBinding)?
+            ),
+            CoverageRequirementKind::Disposition => format!(
+                "read_or_redundant:{}",
+                requirement
+                    .hunk_id
+                    .as_deref()
+                    .ok_or(GroupWorkerError::CoverageBinding)?
+            ),
+        };
+        ids.push(id);
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 fn compose_model_request(
@@ -1151,10 +1194,10 @@ fn phase_instructions(phase: ReviewWorkerPhase, total_rounds: usize) -> &'static
             "Planning has at most two turns. Batch essential evidence reads, then call checkpoint_review with a bounded plan_summary no later than the final turn."
         }
         ReviewWorkerPhase::Reviewing { round } if usize::from(round) < total_rounds => {
-            "This review round has at most four turns. Batch all required evidence reads, submit evidenced findings, then call checkpoint_review no later than the final turn."
+            "This review round has at most four turns. unresolved_coverage_ids name the exact hunk action still required; use files to map each hunk ID to its path and diff_manifest for page counts. Batch all required evidence reads, submit evidenced findings, then call checkpoint_review no later than the final turn."
         }
         ReviewWorkerPhase::Reviewing { .. } => {
-            "This is the final review round and it has at most four turns. Batch all remaining evidence reads, submit evidenced findings, then call complete_group no later than the final turn."
+            "This is the final review round and it has at most four turns. unresolved_coverage_ids name the exact hunk action still required; use files to map each hunk ID to its path and diff_manifest for page counts. Batch all remaining evidence reads, submit evidenced findings, then call complete_group no later than the final turn."
         }
         ReviewWorkerPhase::Verifying => "Complete the required deterministic coverage transition.",
         ReviewWorkerPhase::Complete | ReviewWorkerPhase::Partial => {
@@ -3587,6 +3630,16 @@ mod tests {
         assert_eq!(output.provider_turns, 2);
         assert_eq!(output.tool_calls, 3);
         assert_eq!(output.evidence.len(), 1);
+        assert!(provider_request_contains(
+            &provider,
+            0,
+            &format!("read_all_pages:{hunk_id}")
+        ));
+        assert!(provider_request_contains(
+            &provider,
+            1,
+            &format!("read_all_pages:{hunk_id}")
+        ));
     }
 
     #[tokio::test]
@@ -3615,6 +3668,11 @@ mod tests {
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(output.evidence.len(), 1);
         assert!(provider_request_contains(&provider, 1, "evidence:0001"));
+        let requests = provider.requests.lock().expect("requests");
+        assert_eq!(
+            request_packet(&requests[1])["unresolved_coverage_ids"],
+            json!([])
+        );
     }
 
     #[tokio::test]
