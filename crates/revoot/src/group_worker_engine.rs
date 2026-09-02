@@ -369,7 +369,7 @@ pub async fn run_group_worker(
         request.initial_packet.group_brief.group_plan_sha256.clone(),
     );
     let mut base_packet = request.initial_packet;
-    base_packet.unresolved_coverage_ids = actionable_coverage_ids(&runtime)?;
+    base_packet.unresolved_coverage_ids = coverage_requirement_ids(&runtime)?;
     let mut initial = true;
     let mut recent_exchange = None;
     let mut seen_tool_call_ids = BTreeSet::new();
@@ -436,9 +436,12 @@ pub async fn run_group_worker(
             &request.model,
             &request.system_policy,
             &packet,
-            state.phase(),
-            state.phase_provider_turns(),
-            &request.plan,
+            coverage_requirements(&runtime)?,
+            WorkerTurnContext {
+                phase: state.phase(),
+                phase_turn: state.phase_provider_turns(),
+                total_rounds: request.plan.rounds.len(),
+            },
             request.limits.max_output_tokens,
         )
         .map_err(|()| GroupWorkerError::Packet)?;
@@ -872,78 +875,142 @@ fn rebase_packet(
             })
         })
         .collect::<Result<Vec<_>, GroupWorkerError>>()?;
-    input.unresolved_coverage_ids = actionable_coverage_ids(runtime)?;
+    input.unresolved_coverage_ids = coverage_requirement_ids(runtime)?;
     input.recent_exchange = recent_exchange;
     input.complete_diff = None;
     input.token_estimates.inline_request_tokens = None;
     Ok(input)
 }
 
-fn actionable_coverage_ids(runtime: &WorkerRuntime<'_>) -> Result<Vec<String>, GroupWorkerError> {
+fn coverage_requirement_ids(runtime: &WorkerRuntime<'_>) -> Result<Vec<String>, GroupWorkerError> {
     let ledger = runtime
         .coverage_gate
         .as_ref()
         .ok_or(GroupWorkerError::CoverageBinding)?
         .ledger();
-    let mut ids = Vec::new();
-    for requirement in ledger.missing_requirements() {
+    let mut ids = ledger
+        .missing_requirements()
+        .into_iter()
+        .map(|requirement| {
+            serde_json::to_vec(&requirement)
+                .map(|encoded| format!("coverage:{}", Sha256Digest::of_bytes(&encoded).as_str()))
+                .map_err(|_| GroupWorkerError::CoverageBinding)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn coverage_requirements(
+    runtime: &WorkerRuntime<'_>,
+) -> Result<Vec<CoverageRequirementWire>, GroupWorkerError> {
+    let ledger = runtime
+        .coverage_gate
+        .as_ref()
+        .ok_or(GroupWorkerError::CoverageBinding)?
+        .ledger();
+    let missing = ledger.missing_requirements();
+    let mut sample_hunks = BTreeMap::new();
+    for requirement in &missing {
+        if requirement.kind != CoverageRequirementKind::Sample {
+            continue;
+        }
         let file = ledger
             .files
             .get(&requirement.path)
             .ok_or(GroupWorkerError::CoverageBinding)?;
-        let id = match requirement.kind {
-            CoverageRequirementKind::Manifest => {
-                format!(
-                    "manifest:{}",
-                    Sha256Digest::of_bytes(requirement.path.as_str().as_bytes()).as_str()
-                )
-            }
-            CoverageRequirementKind::Sample => {
-                let hunk = file
-                    .hunks
-                    .first()
-                    .ok_or(GroupWorkerError::CoverageBinding)?;
-                format!("sample_one_hunk:{}", hunk.hunk_id)
-            }
-            CoverageRequirementKind::HunkBody => format!(
-                "read_all_pages:{}",
-                requirement
-                    .hunk_id
-                    .as_deref()
-                    .ok_or(GroupWorkerError::CoverageBinding)?
+        let hunk = file
+            .hunks
+            .iter()
+            .min_by(|left, right| {
+                (left.total_pages, left.hunk_id.as_str())
+                    .cmp(&(right.total_pages, right.hunk_id.as_str()))
+            })
+            .ok_or(GroupWorkerError::CoverageBinding)?;
+        sample_hunks.insert(requirement.path.clone(), hunk.hunk_id.clone());
+    }
+
+    let mut requirements = Vec::new();
+    for requirement in missing {
+        let file = ledger
+            .files
+            .get(&requirement.path)
+            .ok_or(GroupWorkerError::CoverageBinding)?;
+        let (action, hunk_id) = match requirement.kind {
+            CoverageRequirementKind::Manifest => ("manifest", None),
+            CoverageRequirementKind::Sample => (
+                "sample_one_hunk",
+                Some(
+                    sample_hunks
+                        .get(&requirement.path)
+                        .ok_or(GroupWorkerError::CoverageBinding)?
+                        .clone(),
+                ),
             ),
-            CoverageRequirementKind::Disposition if file.tier == ReviewValueTier::Low => format!(
-                "manifest_low_risk:{}",
-                requirement
-                    .hunk_id
-                    .as_deref()
-                    .ok_or(GroupWorkerError::CoverageBinding)?
+            CoverageRequirementKind::HunkBody => (
+                "read_all_pages",
+                Some(
+                    requirement
+                        .hunk_id
+                        .ok_or(GroupWorkerError::CoverageBinding)?,
+                ),
             ),
-            CoverageRequirementKind::Disposition => format!(
-                "read_or_redundant:{}",
-                requirement
-                    .hunk_id
-                    .as_deref()
-                    .ok_or(GroupWorkerError::CoverageBinding)?
+            CoverageRequirementKind::Disposition
+                if sample_hunks.get(&requirement.path) == requirement.hunk_id.as_ref() =>
+            {
+                continue;
+            }
+            CoverageRequirementKind::Disposition if file.tier == ReviewValueTier::Low => (
+                "manifest_low_risk",
+                Some(
+                    requirement
+                        .hunk_id
+                        .ok_or(GroupWorkerError::CoverageBinding)?,
+                ),
+            ),
+            CoverageRequirementKind::Disposition => (
+                "read_or_redundant",
+                Some(
+                    requirement
+                        .hunk_id
+                        .ok_or(GroupWorkerError::CoverageBinding)?,
+                ),
             ),
         };
-        ids.push(id);
+        let missing_pages = hunk_id
+            .as_ref()
+            .map(|hunk_id| {
+                let hunk = file
+                    .hunks
+                    .iter()
+                    .find(|hunk| &hunk.hunk_id == hunk_id)
+                    .ok_or(GroupWorkerError::CoverageBinding)?;
+                Ok((1..=hunk.total_pages)
+                    .filter(|page| !hunk.delivered_pages.contains(page))
+                    .collect::<Vec<_>>())
+            })
+            .transpose()?
+            .unwrap_or_default();
+        requirements.push(CoverageRequirementWire {
+            action,
+            path: requirement.path.as_str().to_owned(),
+            hunk_id,
+            missing_pages,
+        });
     }
-    ids.sort();
-    ids.dedup();
-    Ok(ids)
+    Ok(requirements)
 }
 
 fn compose_model_request(
     model: &str,
     system_policy: &str,
     packet: &ReviewPacket,
-    phase: ReviewWorkerPhase,
-    phase_turn: u32,
-    plan: &ReviewWorkerPlan,
+    coverage_requirements: Vec<CoverageRequirementWire>,
+    turn: WorkerTurnContext,
     max_output_tokens: u32,
 ) -> Result<ModelRequest, ()> {
-    let message = render_packet(packet, phase, phase_turn, plan)?;
+    let message = render_packet(packet, coverage_requirements, turn)?;
     let request = ModelRequest {
         model: model.to_owned(),
         system: Some(system_policy.to_owned()),
@@ -951,12 +1018,19 @@ fn compose_model_request(
             role: ModelRole::User,
             content: vec![ModelContent::Text { text: message }],
         }],
-        tools: model_tools_for_turn(phase, phase_turn, plan.rounds.len()),
+        tools: model_tools_for_turn(turn.phase, turn.phase_turn, turn.total_rounds),
         max_output_tokens,
         temperature: None,
     };
     request.validate().map_err(|_| ())?;
     Ok(request)
+}
+
+#[derive(Clone, Copy)]
+struct WorkerTurnContext {
+    phase: ReviewWorkerPhase,
+    phase_turn: u32,
+    total_rounds: usize,
 }
 
 #[derive(Serialize)]
@@ -976,10 +1050,18 @@ struct PacketWire<'a> {
     checkpoint: &'a ReviewWorkerCheckpoint,
     plan_summary: Option<PlanSummaryWire<'a>>,
     accepted_findings: Vec<FindingSummaryWire<'a>>,
-    unresolved_coverage_ids: &'a [String],
+    coverage_requirements: Vec<CoverageRequirementWire>,
     files: Vec<FileBriefWire<'a>>,
     diff: DiffContextWire<'a>,
     recent_exchange: Option<ExchangeWire<'a>>,
+}
+
+#[derive(Serialize)]
+struct CoverageRequirementWire {
+    action: &'static str,
+    path: String,
+    hunk_id: Option<String>,
+    missing_pages: Vec<u32>,
 }
 
 #[derive(Serialize)]
@@ -1065,12 +1147,11 @@ struct ToolResultWire<'a> {
 
 fn render_packet(
     packet: &ReviewPacket,
-    phase: ReviewWorkerPhase,
-    phase_turn: u32,
-    plan: &ReviewWorkerPlan,
+    coverage_requirements: Vec<CoverageRequirementWire>,
+    turn: WorkerTurnContext,
 ) -> Result<String, ()> {
     let purpose = packet_purpose_name(packet.purpose);
-    let worker_phase = worker_phase_name(phase);
+    let worker_phase = worker_phase_name(turn.phase);
     let plan_summary = packet.plan_summary.as_ref().map(|plan| PlanSummaryWire {
         focus_area_ids: &plan.focus_area_ids,
         hunk_ids: &plan.hunk_ids,
@@ -1151,8 +1232,8 @@ fn render_packet(
     serde_json::to_string(&PacketWire {
         purpose,
         worker_phase,
-        phase_instructions: phase_instructions(phase, plan.rounds.len()),
-        lifecycle: worker_lifecycle(phase, phase_turn, plan.rounds.len())?,
+        phase_instructions: phase_instructions(turn.phase, turn.total_rounds),
+        lifecycle: worker_lifecycle(turn.phase, turn.phase_turn, turn.total_rounds)?,
         group_id: &packet.group_brief.group_id,
         snapshot_sha256: &packet.group_brief.snapshot_sha256,
         partition_sha256: &packet.group_brief.partition_sha256,
@@ -1163,7 +1244,7 @@ fn render_packet(
         checkpoint: &packet.checkpoint,
         plan_summary,
         accepted_findings,
-        unresolved_coverage_ids: &packet.unresolved_coverage_ids,
+        coverage_requirements,
         files,
         diff,
         recent_exchange,
@@ -1194,10 +1275,10 @@ fn phase_instructions(phase: ReviewWorkerPhase, total_rounds: usize) -> &'static
             "Planning has at most two turns. Batch essential evidence reads, then call checkpoint_review with a bounded plan_summary no later than the final turn."
         }
         ReviewWorkerPhase::Reviewing { round } if usize::from(round) < total_rounds => {
-            "This review round has at most four turns. unresolved_coverage_ids name the exact hunk action still required; use files to map each hunk ID to its path and diff_manifest for page counts. Batch all required evidence reads, submit evidenced findings, then call checkpoint_review no later than the final turn."
+            "This review round has at most four turns. coverage_requirements gives the exact action, path, hunk_id, and missing_pages still required. Batch those read_diff pages, submit evidenced findings, then call checkpoint_review no later than the final turn."
         }
         ReviewWorkerPhase::Reviewing { .. } => {
-            "This is the final review round and it has at most four turns. unresolved_coverage_ids name the exact hunk action still required; use files to map each hunk ID to its path and diff_manifest for page counts. Batch all remaining evidence reads, submit evidenced findings, then call complete_group no later than the final turn."
+            "This is the final review round and it has at most four turns. coverage_requirements gives the exact action, path, hunk_id, and missing_pages still required. Batch those read_diff pages, submit evidenced findings, then call complete_group no later than the final turn."
         }
         ReviewWorkerPhase::Verifying => "Complete the required deterministic coverage transition.",
         ReviewWorkerPhase::Complete | ReviewWorkerPhase::Partial => {
@@ -3630,16 +3711,16 @@ mod tests {
         assert_eq!(output.provider_turns, 2);
         assert_eq!(output.tool_calls, 3);
         assert_eq!(output.evidence.len(), 1);
-        assert!(provider_request_contains(
-            &provider,
-            0,
-            &format!("read_all_pages:{hunk_id}")
-        ));
-        assert!(provider_request_contains(
-            &provider,
-            1,
-            &format!("read_all_pages:{hunk_id}")
-        ));
+        let requests = provider.requests.lock().expect("requests");
+        for request in [&requests[0], &requests[1]] {
+            let packet = request_packet(request);
+            let requirement = &packet["coverage_requirements"][0];
+            assert_eq!(requirement["action"], "read_all_pages");
+            assert_eq!(requirement["path"], "src/lib.rs");
+            assert_eq!(requirement["hunk_id"], hunk_id);
+            assert_eq!(requirement["missing_pages"], json!([1]));
+            assert!(packet.get("unresolved_coverage_ids").is_none());
+        }
     }
 
     #[tokio::test]
@@ -3670,7 +3751,7 @@ mod tests {
         assert!(provider_request_contains(&provider, 1, "evidence:0001"));
         let requests = provider.requests.lock().expect("requests");
         assert_eq!(
-            request_packet(&requests[1])["unresolved_coverage_ids"],
+            request_packet(&requests[1])["coverage_requirements"],
             json!([])
         );
     }
