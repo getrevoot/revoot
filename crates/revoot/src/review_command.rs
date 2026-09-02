@@ -90,7 +90,9 @@ use crate::review_overview::{
     ReviewOverview, ReviewRunMetadata, RiskLevel, render_review_overview,
 };
 use crate::review_sarif::render_report_v3_sarif;
-use crate::review_strategy_config::{ReviewStrategyConfiguration, strategy_from_resolved};
+use crate::review_strategy_config::{
+    ReviewStrategyConfiguration, escalate_effort_for_large_diff, strategy_from_resolved,
+};
 use crate::review_verifier::ReviewVerifierClock;
 use crate::reviewer_policy::{REVIEWER_POLICY_VERSION, tool_first_reviewer_system_policy};
 use crate::rule_diagnostics::{
@@ -1195,6 +1197,12 @@ async fn execute_prepared_review(
 ) -> Result<(String, String, CanonicalReviewReport), Diagnostic> {
     let resolution = &resolved.effective;
     let strategy = typed_review_strategy(&resolved)?;
+    let strategy = escalate_effort_for_large_diff(
+        strategy,
+        resolution,
+        prepared.partition().coverage.included_files,
+        prepared.partition().coverage.included_bytes,
+    );
     if prepared.partition().work_units.is_empty() {
         let mut report = no_model_review_report(&prepared);
         attach_no_model_stable_report(&mut report, &prepared, &strategy)?;

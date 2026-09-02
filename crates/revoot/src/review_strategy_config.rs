@@ -119,6 +119,41 @@ impl fmt::Display for ReviewStrategyConfigError {
 
 impl std::error::Error for ReviewStrategyConfigError {}
 
+/// Selected-file count above which an unconfigured effort escalates.
+pub const LARGE_DIFF_ESCALATION_FILES: u32 = 40;
+/// Selected-byte count above which an unconfigured effort escalates.
+pub const LARGE_DIFF_ESCALATION_BYTES: u64 = 512 * 1024;
+
+/// Escalate an unconfigured medium effort to high for a large selected diff.
+///
+/// Only the compiled default is ever escalated; an effort the operator, CI
+/// variable, or command line explicitly selected is always left untouched,
+/// preserving the existing operator-only authority over effort.
+#[must_use]
+pub fn escalate_effort_for_large_diff(
+    mut strategy: ReviewStrategyConfiguration,
+    resolution: &ConfigurationResolution,
+    selected_files: u32,
+    selected_bytes: u64,
+) -> ReviewStrategyConfiguration {
+    let large = selected_files > LARGE_DIFF_ESCALATION_FILES
+        || selected_bytes > LARGE_DIFF_ESCALATION_BYTES;
+    if strategy.effort == ReviewEffort::Medium && large && effort_is_compiled_default(resolution) {
+        strategy.effort = ReviewEffort::High;
+    }
+    strategy
+}
+
+fn effort_is_compiled_default(resolution: &ConfigurationResolution) -> bool {
+    resolution
+        .explain()
+        .iter()
+        .find(|record| record.key.as_str() == "review.effort")
+        .is_some_and(|record| {
+            record.requested.provenance().source() == ConfigSource::CompiledDefault
+        })
+}
+
 /// Resolve all trusted operator sources and the immutable base-repository
 /// configuration, then construct the typed strategy contract.
 ///
@@ -528,6 +563,58 @@ mod tests {
         assert_eq!(strategy.aggregate_budget.max_tool_calls, 512);
         assert_eq!(strategy.aggregate_budget.max_elapsed_millis, 600_000);
         assert_eq!(strategy.max_inline_diff_bytes, 16_384);
+    }
+
+    #[test]
+    fn large_diff_escalates_unconfigured_medium_to_high() {
+        let root = tempfile::tempdir().expect("root");
+        let resolved = resolve_review_configuration(root.path(), None, None, []).expect("config");
+        let strategy = strategy_from_resolved(&resolved).expect("strategy");
+        assert_eq!(strategy.effort, ReviewEffort::Medium);
+        let escalated = escalate_effort_for_large_diff(
+            strategy,
+            &resolved.effective,
+            LARGE_DIFF_ESCALATION_FILES + 1,
+            0,
+        );
+        assert_eq!(escalated.effort, ReviewEffort::High);
+    }
+
+    #[test]
+    fn small_diff_stays_at_the_default_medium_effort() {
+        let root = tempfile::tempdir().expect("root");
+        let resolved = resolve_review_configuration(root.path(), None, None, []).expect("config");
+        let strategy = strategy_from_resolved(&resolved).expect("strategy");
+        let unescalated = escalate_effort_for_large_diff(
+            strategy,
+            &resolved.effective,
+            LARGE_DIFF_ESCALATION_FILES,
+            LARGE_DIFF_ESCALATION_BYTES,
+        );
+        assert_eq!(unescalated.effort, ReviewEffort::Medium);
+    }
+
+    #[test]
+    fn operator_specified_effort_is_never_escalated() {
+        let root = tempfile::tempdir().expect("root");
+        let resolved = resolve_review_configuration(
+            root.path(),
+            None,
+            None,
+            [(
+                OsString::from("REVOOT_REVIEW_EFFORT"),
+                OsString::from("medium"),
+            )],
+        )
+        .expect("config");
+        let strategy = strategy_from_resolved(&resolved).expect("strategy");
+        let unescalated = escalate_effort_for_large_diff(
+            strategy,
+            &resolved.effective,
+            LARGE_DIFF_ESCALATION_FILES + 1,
+            LARGE_DIFF_ESCALATION_BYTES + 1,
+        );
+        assert_eq!(unescalated.effort, ReviewEffort::Medium);
     }
 
     fn resolve<const N: usize>(
