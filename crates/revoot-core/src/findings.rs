@@ -588,6 +588,16 @@ fn code_fence(value: &str) -> String {
     "`".repeat(longest.saturating_add(1).max(3))
 }
 
+/// Render a short single-line preview of `explanation` for compact summaries,
+/// truncating with an ellipsis when it exceeds `max_bytes`.
+#[must_use]
+pub fn explanation_preview(explanation: &str, max_bytes: usize) -> String {
+    if explanation.len() <= max_bytes {
+        return explanation.to_owned();
+    }
+    format!("{}…", &explanation[..max_bytes])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +823,12 @@ mod tests {
             envelope.validate(),
             Err(FindingsValidationError::SchemaVersion)
         );
+    }
+
+    #[test]
+    fn explanation_preview_truncates_long_text() {
+        let long = "x".repeat(200);
+        let preview = explanation_preview(&long, 80);
+        assert!(preview.ends_with('…'));
     }
 }
