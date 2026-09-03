@@ -1107,7 +1107,7 @@ fn compose_model_request(
             role: ModelRole::User,
             content: vec![ModelContent::Text { text: message }],
         }],
-        tools: model_tools_for_turn(turn.phase, turn.phase_turn, turn.total_rounds),
+        tools: model_tools(),
         max_output_tokens,
         temperature: None,
     };
@@ -1419,6 +1419,13 @@ const fn worker_phase_name(phase: ReviewWorkerPhase) -> &'static str {
     }
 }
 
+/// The full tool set offered on every turn, including the last allowed turn
+/// of a phase. It used to narrow to only the required terminal tool on that
+/// turn, which silently withheld `submit_candidate_finding` from a model
+/// that located a real issue only on its final turn - structurally
+/// preventing it from being reported at all. `required_terminal_tool` is
+/// still surfaced to the model as a hint in the packet's lifecycle wire; it
+/// is no longer enforced by narrowing what tools are callable.
 fn model_tools() -> Vec<ModelTool> {
     let checkpoint = json!({"type":"object","required":["hypotheses","evidence_references","unresolved_coverage"],"properties":{"hypotheses":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}},"evidence_references":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":128}},"unresolved_coverage":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":512}}},"additionalProperties":false});
     let plan_id =
@@ -1450,19 +1457,6 @@ fn model_tools() -> Vec<ModelTool> {
         input_schema,
     })
     .collect()
-}
-
-fn model_tools_for_turn(
-    phase: ReviewWorkerPhase,
-    phase_turn: u32,
-    total_rounds: usize,
-) -> Vec<ModelTool> {
-    let mut tools = model_tools();
-    if phase_turn == phase_turn_limit(phase) && phase_turn != 0 {
-        let required = required_terminal_tool(phase, total_rounds);
-        tools.retain(|tool| tool.name == required);
-    }
-    tools
 }
 
 fn tool_description(name: &str) -> &'static str {
@@ -3451,7 +3445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_review_turn_exposes_only_the_required_terminal_tool() {
+    async fn final_review_turn_still_offers_the_full_tool_set() {
         let budgeted = fixture(
             ReviewEffort::Low,
             10,
@@ -3482,12 +3476,18 @@ mod tests {
             usize::try_from(MAX_REVIEW_TURNS_PER_ROUND).expect("turn limit")
         );
         let requests = provider.requests.lock().expect("requests");
-        assert_eq!(
-            requests.last().expect("terminal request").tools,
-            [model_tools()
-                .into_iter()
-                .find(|tool| tool.name == "complete_group")
-                .expect("completion tool")]
+        let terminal_tools = &requests.last().expect("terminal request").tools;
+        assert_eq!(terminal_tools.len(), model_tools().len());
+        assert!(
+            terminal_tools
+                .iter()
+                .any(|tool| tool.name == "submit_candidate_finding"),
+            "the final turn must still let the model report a finding it just found"
+        );
+        assert!(
+            terminal_tools
+                .iter()
+                .any(|tool| tool.name == "complete_group")
         );
     }
 
@@ -3895,14 +3895,7 @@ mod tests {
         assert_eq!(output.phase_usage.review.model_requests, 1);
         assert_eq!(provider.calls(), 3);
         let requests = provider.requests.lock().expect("requests");
-        assert_eq!(
-            requests[1]
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            ["checkpoint_review"]
-        );
+        assert_eq!(requests[1].tools.len(), model_tools().len());
     }
 
     #[tokio::test]
