@@ -23,7 +23,6 @@ pub mod gitlab_wire;
 pub mod group_metrics;
 pub mod lineage_coverage;
 pub mod partition;
-pub mod phase_budget;
 pub mod provider;
 pub mod publication;
 pub mod repository;
@@ -41,7 +40,6 @@ pub mod scan;
 pub mod snapshot;
 pub mod token_efficiency;
 pub mod tool_cursor;
-pub mod worker_transcript;
 
 pub use adjudication_fallback::{
     AdjudicationFallbackCoverage, AdjudicationFallbackError, deterministic_adjudication_fallback,
@@ -141,12 +139,6 @@ pub use partition::{
     ReviewSelectionPolicy, ReviewValue, ReviewValueReason, ReviewValueTier, ReviewWorkUnit,
     WorkUnitFile, WorkUnitId, build_partition_plan, classify_review_value,
     is_sensitive_model_context_path,
-};
-pub use phase_budget::{
-    AllocatedRequestPhase, DispatchSignal, DispatchedPhaseGroup, GlobalRequestPhase,
-    GroupDispatchCandidate, GroupDispatchResult, GroupRequestPhase, PhaseBudgetAllocator,
-    PhaseBudgetError, PhaseBudgetLimits, PhaseBudgetSnapshot, PhaseBudgetUsage, PhaseGroupHandle,
-    PhaseRequestAllocation,
 };
 pub use provider::ProviderErrorKind as DirectProviderErrorKind;
 pub use provider::{
@@ -251,11 +243,6 @@ pub use token_efficiency::{
 pub use tool_cursor::{
     CursorTool, ToolCursorBinding, ToolCursorError, ToolCursorStore, ToolPageRequest,
     ToolResultLimits, ToolResultLimitsError, ToolResultPage,
-};
-pub use worker_transcript::{
-    TranscriptModelPhase, TranscriptPartialReason, TranscriptTerminalOutcome, TranscriptTool,
-    WorkerTranscript, WorkerTranscriptError, WorkerTranscriptEvent, WorkerTranscriptPlan,
-    WorkerTranscriptUsage, build_worker_transcript,
 };
 
 /// The schema version for machine-readable doctor output.
