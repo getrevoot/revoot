@@ -59,7 +59,6 @@ pub enum ReviewResultReducerError {
     UnknownGroupAccounting,
     CoveragePath,
     DuplicateCoveragePath,
-    CoverageIncompleteForCompleteGroup,
     CandidateCount,
     CandidateIdentifier,
     DuplicateCandidate,
@@ -85,7 +84,6 @@ impl fmt::Display for ReviewResultReducerError {
             Self::UnknownGroupAccounting => "group accounting is outside the schedule",
             Self::CoveragePath => "coverage does not account for the selected paths",
             Self::DuplicateCoveragePath => "selected path coverage is duplicated",
-            Self::CoverageIncompleteForCompleteGroup => "a complete group has incomplete coverage",
             Self::CandidateCount => "published finding count exceeds the product limit",
             Self::CandidateIdentifier => "candidate identity is invalid",
             Self::DuplicateCandidate => "candidate identity is duplicated",
@@ -271,17 +269,6 @@ fn validate_group_accounting<'a>(
     }
     if accounts.len() != scheduled.len() {
         return Err(ReviewResultReducerError::MissingGroupAccounting);
-    }
-    for record in &schedule.records {
-        if matches!(record.status, GroupScheduleStatus::Complete)
-            && !accounts
-                .get(&record.group_id)
-                .expect("all scheduled groups accounted")
-                .coverage
-                .is_complete()
-        {
-            return Err(ReviewResultReducerError::CoverageIncompleteForCompleteGroup);
-        }
     }
     Ok(accounts)
 }

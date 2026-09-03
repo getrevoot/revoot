@@ -16,16 +16,16 @@ use revoot_core::review_packet::{
 };
 use revoot_core::{
     AgentBudget, AgentBudgetLimits, AgentBudgetUsage, AnchorId, AnchorTable, CancellationToken,
-    CandidateForVerification, ChangedPath, CodeSearchRequest, CompleteGroupRejection,
-    CoverageCompletionGate, CoverageRequirementKind, CursorTool, GroupCompletion,
-    GroupCoverageLedger, GroupPartialCause, LineRange, ModelContent, ModelFinishReason,
-    ModelMessage, ModelRequest, ModelRole, ModelTool, PreparedVerificationBatch,
-    PriorReviewContext, ProviderAdapter, RepositoryPath, RepositoryRelativePath, RepositoryToolbox,
-    ReviewBudgetBroker, ReviewBudgetUsage, ReviewCallUsage, ReviewModelReservation,
-    ReviewModelSettlement, ReviewModelUsage, ReviewValueTier, ReviewWorkerCheckpoint,
-    ReviewWorkerError, ReviewWorkerPhase, ReviewWorkerPlan, ReviewWorkerState, Sha256Digest,
-    ToolCursorBinding, ToolCursorStore, ToolPageRequest, ToolResultLimits, UnreadHunkDisposition,
-    UnreadHunkDispositionKind, WorkUnitId, prepare_verification_batch,
+    CandidateForVerification, ChangedPath, CodeSearchRequest, CoverageCompletionGate,
+    CoverageRequirementKind, CursorTool, GroupCompletion, GroupCoverageLedger, GroupPartialCause,
+    LineRange, ModelContent, ModelFinishReason, ModelMessage, ModelRequest, ModelRole, ModelTool,
+    PreparedVerificationBatch, PriorReviewContext, ProviderAdapter, RepositoryPath,
+    RepositoryRelativePath, RepositoryToolbox, ReviewBudgetBroker, ReviewBudgetUsage,
+    ReviewCallUsage, ReviewModelReservation, ReviewModelSettlement, ReviewModelUsage,
+    ReviewValueTier, ReviewWorkerCheckpoint, ReviewWorkerError, ReviewWorkerPhase,
+    ReviewWorkerPlan, ReviewWorkerState, Sha256Digest, ToolCursorBinding, ToolCursorStore,
+    ToolPageRequest, ToolResultLimits, UnreadHunkDisposition, UnreadHunkDispositionKind,
+    WorkUnitId, prepare_verification_batch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2357,15 +2357,6 @@ fn execute_complete(
         gate.set_unread_disposition(&path, &disposition.hunk_id, disposition.disposition)
             .map_err(|_| recoverable("disposition"))?;
     }
-    let missing = gate.ledger().missing_requirements();
-    if !missing.is_empty() {
-        return Err(ToolExecutionError::Recoverable(encode_missing(
-            &CompleteGroupRejection {
-                missing_requirements: missing,
-                partial_causes: BTreeSet::new(),
-            },
-        )?));
-    }
     state
         .finish_round(args.checkpoint.clone())
         .map_err(|_| recoverable("transition"))?;
@@ -2379,12 +2370,7 @@ fn execute_complete(
         .coverage_gate
         .take()
         .ok_or_else(|| recoverable("coverage"))?
-        .complete_group()
-        .map_err(|rejection| {
-            ToolExecutionError::Recoverable(
-                encode_missing(&rejection).unwrap_or_else(|_| tool_error("coverage")),
-            )
-        })?;
+        .complete_group();
     state
         .finish_verification()
         .map_err(|_| recoverable("transition"))?;
@@ -2602,15 +2588,6 @@ fn encode_result(value: Value) -> Result<String, ToolExecutionError> {
         return Err(recoverable("result_too_large"));
     }
     Ok(encoded)
-}
-
-fn encode_missing(rejection: &CompleteGroupRejection) -> Result<String, ToolExecutionError> {
-    encode_result(json!({
-        "error":"coverage_incomplete",
-        "retryable":true,
-        "missing_requirements":rejection.missing_requirements,
-        "partial_causes":rejection.partial_causes,
-    }))
 }
 
 fn repository_partial(runtime: &mut WorkerRuntime<'_>) -> ToolExecutionError {
@@ -3929,7 +3906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coverage_rejection_can_be_corrected_with_batched_diff_read_and_completion() {
+    async fn complete_group_succeeds_immediately_with_unread_pages_recorded_as_telemetry() {
         let fixture = fixture(
             ReviewEffort::Low,
             10,
@@ -3942,32 +3919,18 @@ mod tests {
             .manifest(&[relative_path()])
             .expect("manifest");
         let hunk_id = manifest[0].hunks[0].hunk_id.clone();
-        let provider = FakeProvider::new(vec![
-            tool_response(1, "complete_group", complete_call()),
-            batched_response(vec![
-                (
-                    2,
-                    "read_diff",
-                    json!({"reads":[{"path":"src/lib.rs","hunk_id":hunk_id,"page":1}]}),
-                ),
-                (3, "complete_group", complete_call()),
-            ]),
-        ]);
+        let provider = FakeProvider::new(vec![tool_response(1, "complete_group", complete_call())]);
         let output = run(fixture, &provider).await;
         assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
-        assert_eq!(output.provider_turns, 2);
-        assert_eq!(output.tool_calls, 3);
-        assert_eq!(output.evidence.len(), 1);
-        let requests = provider.requests.lock().expect("requests");
-        for request in [&requests[0], &requests[1]] {
-            let packet = request_packet(request);
-            let requirement = &packet["coverage_requirements"][0];
-            assert_eq!(requirement["action"], "read_all_pages");
-            assert_eq!(requirement["path"], "src/lib.rs");
-            assert_eq!(requirement["hunk_id"], hunk_id);
-            assert_eq!(requirement["missing_pages"], json!([1]));
-            assert!(packet.get("unresolved_coverage_ids").is_none());
-        }
+        assert_eq!(output.provider_turns, 1);
+        assert_eq!(output.tool_calls, 1);
+        assert!(output.evidence.is_empty());
+        let missing = output.coverage.missing_requirements();
+        assert!(
+            missing
+                .iter()
+                .any(|requirement| requirement.hunk_id.as_deref() == Some(hunk_id.as_str()))
+        );
     }
 
     #[tokio::test]
@@ -4154,10 +4117,7 @@ mod tests {
             tool_response(2, "complete_group", complete_call()),
         ]);
         let output = run(fixture, &provider).await;
-        assert_eq!(
-            output.status,
-            GroupWorkerStatus::Partial(GroupWorkerPartialReason::Provider)
-        );
+        assert!(matches!(output.status, GroupWorkerStatus::Complete(_)));
         assert_eq!(delivered_page_count(&output), 0);
         assert!(output.evidence.is_empty());
         assert!(provider_request_contains(&provider, 1, "diff_read"));

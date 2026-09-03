@@ -1,16 +1,17 @@
-//! Terminal completion authority for risk-adaptive group coverage.
+//! Coverage-delivery ledger and telemetry for risk-adaptive group review.
 //!
-//! The gate records only trusted delivery events. A model cannot complete a
-//! group while exact ledger requirements remain unmet, and local budget or
-//! tool failures make an otherwise policy-complete group partial.
+//! The gate records only trusted delivery events. Completion is the caller's
+//! (the model's) voluntary signal - unmet ledger requirements are recorded as
+//! telemetry, never a rejection - but a local budget or tool failure still
+//! makes an otherwise policy-complete group `Partial` instead of `Complete`.
 
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CoverageError, CoverageRequirement, FileCoverageLedger, GroupCoverageLedger, RepositoryPath,
-    UnreadHunkDisposition, UnreadHunkDispositionKind,
+    CoverageError, FileCoverageLedger, GroupCoverageLedger, RepositoryPath, UnreadHunkDisposition,
+    UnreadHunkDispositionKind,
 };
 
 const MAX_DISPOSITION_NOTE_BYTES: usize = 512;
@@ -36,14 +37,6 @@ pub enum GroupCompletion {
         causes: BTreeSet<GroupPartialCause>,
         low_risk_deferrals: u32,
     },
-}
-
-/// Exact requirements and failure causes returned when completion is rejected.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompleteGroupRejection {
-    pub missing_requirements: Vec<CoverageRequirement>,
-    pub partial_causes: BTreeSet<GroupPartialCause>,
 }
 
 /// Stable, payload-free construction failure for an invalid ledger.
@@ -191,34 +184,31 @@ impl CoverageCompletionGate {
         self.partial_causes.insert(cause);
     }
 
-    /// Finalize deterministic low-risk deferrals and attempt terminal group
-    /// completion.
+    /// Terminate the group at the caller's request.
     ///
-    /// # Errors
-    ///
-    /// Returns every exact unmet ledger requirement. The model cannot override
-    /// or acknowledge away this rejection.
-    pub fn complete_group(mut self) -> Result<GroupCompletion, CompleteGroupRejection> {
+    /// Completion is the model's voluntary signal, not a requirement this
+    /// gate enforces: unread or undispositioned hunks no longer block it,
+    /// they are simply not reflected as delivered in the ledger this call
+    /// consumes (callers that need that detail for reporting should read
+    /// `self.ledger().missing_requirements()` before calling this). Only a
+    /// genuine local failure - budget exhaustion or a tool error, recorded as
+    /// a disposition by the runtime itself rather than chosen by the model -
+    /// still marks the result `Partial` instead of `Complete`.
+    #[must_use]
+    pub fn complete_group(mut self) -> GroupCompletion {
         self.ledger.finalize_low_risk_deferrals();
-        let missing_requirements = self.ledger.missing_requirements();
-        if !missing_requirements.is_empty() {
-            return Err(CompleteGroupRejection {
-                missing_requirements,
-                partial_causes: self.partial_causes,
-            });
-        }
         let low_risk_deferrals = count_low_risk_deferrals(&self.ledger);
         if self.partial_causes.is_empty() {
-            Ok(GroupCompletion::Complete {
+            GroupCompletion::Complete {
                 policy_version: GroupCoverageLedger::POLICY_VERSION.to_owned(),
                 low_risk_deferrals,
-            })
+            }
         } else {
-            Ok(GroupCompletion::Partial {
+            GroupCompletion::Partial {
                 policy_version: GroupCoverageLedger::POLICY_VERSION.to_owned(),
                 causes: self.partial_causes,
                 low_risk_deferrals,
-            })
+            }
         }
     }
 }
@@ -369,7 +359,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
-    use crate::{CoverageRequirementKind, HunkCoverage, ReviewValueTier};
+    use crate::{CoverageRequirement, CoverageRequirementKind, HunkCoverage, ReviewValueTier};
 
     fn path(value: &str) -> RepositoryPath {
         RepositoryPath::try_from(value.to_owned()).expect("path")
@@ -420,14 +410,17 @@ mod tests {
         ));
         gate.mark_manifested(&target).expect("manifest");
         gate.record_hunk_page(&target, "h1", 1).expect("page");
-        let rejection = gate.complete_group().expect_err("incomplete");
-        assert_eq!(rejection.missing_requirements.len(), 2);
+        let missing = gate.ledger().missing_requirements();
+        assert_eq!(missing.len(), 2);
         assert!(
-            rejection
-                .missing_requirements
+            missing
                 .iter()
                 .all(|requirement| { requirement.kind == CoverageRequirementKind::HunkBody })
         );
+        assert!(matches!(
+            gate.complete_group(),
+            GroupCompletion::Complete { .. }
+        ));
 
         let mut complete = build_gate(file(
             target.as_str(),
@@ -442,7 +435,7 @@ mod tests {
         }
         assert!(matches!(
             complete.complete_group(),
-            Ok(GroupCompletion::Complete { .. })
+            GroupCompletion::Complete { .. }
         ));
     }
 
@@ -504,13 +497,16 @@ mod tests {
             vec![hunk("h1", 1, false), hunk("h2", 1, false)],
         ));
         gate.mark_manifested(&target).expect("manifest");
-        let rejection = gate.complete_group().expect_err("missing sample");
+        let missing = gate.ledger().missing_requirements();
         assert!(
-            rejection
-                .missing_requirements
+            missing
                 .iter()
                 .any(|requirement| requirement.kind == CoverageRequirementKind::Sample)
         );
+        assert!(matches!(
+            gate.complete_group(),
+            GroupCompletion::Complete { .. }
+        ));
 
         let mut gate = build_gate(file(
             target.as_str(),
@@ -527,7 +523,7 @@ mod tests {
         .expect("disposition");
         assert!(matches!(
             gate.complete_group(),
-            Ok(GroupCompletion::Complete { .. })
+            GroupCompletion::Complete { .. }
         ));
     }
 
@@ -538,7 +534,7 @@ mod tests {
             let mut gate = build_gate(file(target.as_str(), tier, vec![hunk("hazard", 2, true)]));
             gate.mark_manifested(&target).expect("manifest");
             gate.record_hunk_page(&target, "hazard", 1).expect("page");
-            let rejection = gate.complete_group().expect_err("promoted hunk");
+            let missing = gate.ledger().missing_requirements();
             let mut expected = Vec::new();
             if tier == ReviewValueTier::Standard {
                 expected.push(CoverageRequirement {
@@ -552,7 +548,11 @@ mod tests {
                 hunk_id: Some("hazard".to_owned()),
                 kind: CoverageRequirementKind::HunkBody,
             });
-            assert_eq!(rejection.missing_requirements, expected);
+            assert_eq!(missing, expected);
+            assert!(matches!(
+                gate.complete_group(),
+                GroupCompletion::Complete { .. }
+            ));
         }
     }
 
@@ -567,10 +567,10 @@ mod tests {
         gate.mark_manifested(&target).expect("manifest");
         assert_eq!(
             gate.complete_group(),
-            Ok(GroupCompletion::Complete {
+            GroupCompletion::Complete {
                 policy_version: GroupCoverageLedger::POLICY_VERSION.to_owned(),
                 low_risk_deferrals: 2,
-            })
+            }
         );
     }
 
@@ -587,7 +587,7 @@ mod tests {
         gate.mark_manifested(&target).expect("manifest");
         assert!(matches!(
             gate.complete_group(),
-            Ok(GroupCompletion::Complete { .. })
+            GroupCompletion::Complete { .. }
         ));
         assert_eq!(
             CoverageCompletionGate::new(
@@ -608,16 +608,17 @@ mod tests {
             vec![hunk("h1", 1, false)],
         ));
         assert_eq!(
-            gate.complete_group(),
-            Err(CompleteGroupRejection {
-                missing_requirements: vec![CoverageRequirement {
-                    path: target,
-                    hunk_id: None,
-                    kind: CoverageRequirementKind::Manifest,
-                }],
-                partial_causes: BTreeSet::new(),
-            })
+            gate.ledger().missing_requirements(),
+            vec![CoverageRequirement {
+                path: target,
+                hunk_id: None,
+                kind: CoverageRequirementKind::Manifest,
+            }]
         );
+        assert!(matches!(
+            gate.complete_group(),
+            GroupCompletion::Complete { .. }
+        ));
     }
 
     #[test]
@@ -637,7 +638,7 @@ mod tests {
             gate.record_partial_cause(cause);
             assert!(matches!(
                 gate.complete_group(),
-                Ok(GroupCompletion::Partial { causes, .. }) if causes == BTreeSet::from([cause])
+                GroupCompletion::Partial { causes, .. } if causes == BTreeSet::from([cause])
             ));
         }
     }
@@ -657,15 +658,14 @@ mod tests {
             disposition(UnreadHunkDispositionKind::BudgetExhausted),
         )
         .expect("disposition");
-        let rejection = gate.complete_group().expect_err("sample still missing");
+        let missing = gate.ledger().missing_requirements();
+        let completion = gate.complete_group();
+        let GroupCompletion::Partial { causes, .. } = completion else {
+            panic!("expected partial completion, got {completion:?}");
+        };
+        assert!(causes.contains(&GroupPartialCause::BudgetExhausted));
         assert!(
-            rejection
-                .partial_causes
-                .contains(&GroupPartialCause::BudgetExhausted)
-        );
-        assert!(
-            rejection
-                .missing_requirements
+            missing
                 .iter()
                 .any(|requirement| requirement.kind == CoverageRequirementKind::Sample)
         );

@@ -61,8 +61,7 @@ pub use config::{
     SourceProvenance, ValueConstraint, ValueViolation,
 };
 pub use coverage_gate::{
-    CompleteGroupRejection, CoverageCompletionGate, CoverageGateError, GroupCompletion,
-    GroupPartialCause,
+    CoverageCompletionGate, CoverageGateError, GroupCompletion, GroupPartialCause,
 };
 pub use delegation::{
     DelegationCanonicalError, DelegationError, DelegationExclusion, DelegationFile,
